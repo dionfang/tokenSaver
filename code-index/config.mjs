@@ -21,11 +21,17 @@ export function isInsideNodeModules(dir) {
   return String(dir || '').split(path.sep).includes('node_modules');
 }
 
+/** 已存在的路径收成同一条(Windows 短路径 vs 长路径),不存在则 path.resolve */
+function realpathOr(p) {
+  const abs = path.resolve(p || '.');
+  try { return fs.realpathSync.native(abs); } catch { return abs; }
+}
+
 /** 从 start 向上找 .git。找不到返回 null */
 export function findGitRoot(start) {
   let dir = path.resolve(start || '.');
   for (let i = 0; i < 16; i++) {
-    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    if (fs.existsSync(path.join(dir, '.git'))) return realpathOr(dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -47,9 +53,9 @@ export function resolveLayout({
 } = {}) {
   const packed = isInsideNodeModules(moduleDir);
   const dataFromEnv = env.CODE_INDEX_DATA_DIR && String(env.CODE_INDEX_DATA_DIR).trim();
-  const root = path.resolve(gitRoot || findGitRoot(cwd) || findGitRoot(moduleDir) || cwd || '.');
-  const moduleAbs = path.resolve(moduleDir);
-  // 独立仓库(模块即 git 根)用 ./data;复制到 scripts/code-index 仍用平行 ../data
+  const root = realpathOr(gitRoot || findGitRoot(cwd) || findGitRoot(moduleDir) || cwd || '.');
+  const moduleAbs = realpathOr(moduleDir);
+  // 本仓库 code-index/ 的 git 根在上一级,data 落在仓库根 ./data;复制到目标项目 scripts/code-index 用平行 ../data
   const dataDir = dataFromEnv
     ? path.resolve(dataFromEnv)
     : packed
@@ -59,7 +65,7 @@ export function resolveLayout({
         : path.resolve(moduleAbs, '..', 'data');
   const hfCacheDir = packed
     ? path.join(homedir, '.tokensaver', 'hf-cache')
-    : path.join(moduleDir, 'hf-cache');
+    : path.join(moduleAbs, 'hf-cache');
   return { dataDir, hfCacheDir, packed };
 }
 
@@ -140,7 +146,7 @@ export function loadConfig() {
   };
   const hiddenDeployKeys = ['models', 'ollamaBase', 'gpu'].filter((k) => fileCfg[k] != null);
   if (hiddenDeployKeys.length) {
-    console.error(`[warn] ${hiddenDeployKeys.join('/')} 只认 scripts/code-index/config.mjs(入库,协作可见);data/code-index.config.json 中的同名键已忽略`);
+    console.error(`[warn] ${hiddenDeployKeys.join('/')} 只认本目录 config.mjs(入库,协作可见);data/code-index.config.json 中的同名键已忽略`);
   }
   // env 覆盖层(机器/CI 临时场景)
   if (process.env.CODE_INDEX_ROOTS) {

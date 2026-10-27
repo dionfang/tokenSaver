@@ -1,40 +1,31 @@
-TokenSaver 部署
+TokenSaver 直接部署
 
 前提: Node.js >= 18、git。
 用 ollama 时,本机需已安装并自行启动 Ollama,并先手工 pull 模型。本工具不拉起服务,也不自动 pull。
-用 local 时不需要 Ollama。模型名改包内 config.mjs。
-Ollama 模型和 transformers.js 权重都不打进 npm 包。
+用 local 时不需要 Ollama。模型名改本目录 config.mjs。
+Ollama 模型不随本目录复制。transformers.js 两个 local 模型在本目录 hf-cache(约 439MB),请一起复制。
 
-安装(推荐)
-
-  npm i -D @dionfang/tokensaver
-  npx tokensaver init [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local]
-  npx tokensaver status
-
-从 GitCode 拉源码开发/自用:
-  git clone https://gitcode.com/dionfang/TokenSaver.git
-  cd TokenSaver
-  npm install --ignore-scripts
+复制本目录到目标项目 scripts\code-index,在该目录执行:
   node init.mjs
-  node status.mjs
+默认嵌入路径 local。改走 Ollama:
+  node init.mjs --model-in ollama
 
-尚未发布到 npm 时,在本仓库根目录:
-  npm publish --access public
-或只打本地包:
-  npm pack
-然后在目标项目:
-  npm i -D ./dionfang-tokensaver-1.0.0.tgz
-  npx tokensaver init
+init 会安装依赖、写配置、接线 hook,并后台建索引+预热。确认就绪: node status.mjs
 
-复制目录(旧方式)
+从 GitCode 拉源码后同样只跑 init:
+  git clone https://gitcode.com/dionfang/TokenSaver.git
+  cd TokenSaver/code-index
+  node init.mjs
 
-1. 把 code-index 目录复制到目标项目,建议放在 scripts\code-index。
-   可带上 hf-cache。不要带 node_modules,不要带外面的 data\。
+复制细节
+
+1. 复制的是本目录(到目标项目建议放在 scripts\code-index)。
+   必须带上 hf-cache(两个 local 模型)。不要带 node_modules,不要带 data\。
 2. 在该目录执行:
    node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local]
 3. 确认是否就绪: node status.mjs
 
-init 会写配置并(复制目录时)安装依赖。
+init 会写配置并安装依赖。
 参数名写错、缺少取值,或 --model-in 不是 ollama/local 时,报错退出且不改配置。
 --roots=路径 与 --model-in=local 这种写法也可以。
 
@@ -51,12 +42,11 @@ init 会写配置并(复制目录时)安装依赖。
     ollama pull qwen3-embedding:0.6b
     ollama pull sam860/qwen3-reranker:0.6b-F16
   模型名若在 config.mjs 里改过,pull 改为改后的名字。
-  local 的模型首次使用会下载到 hf-cache。
-  npm 安装时 hf-cache 在用户主目录 .tokensaver/hf-cache;复制目录时在模块内 hf-cache。
+  local 的两个模型已放在本目录 hf-cache;缺失时才下载。
 
 配置
 
-模型部署只改包内 config.mjs。data JSON 里的同名项无效。
+模型部署只改本目录 config.mjs。data JSON 里的同名项无效。
   models.embedding        默认 qwen3-embedding:0.6b
   models.reranker         默认 sam860/qwen3-reranker:0.6b-F16
   models.localEmbedding   默认 Xenova/jina-embeddings-v2-base-zh

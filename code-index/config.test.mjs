@@ -18,8 +18,8 @@ assert.equal(copied.dataDir, path.resolve(path.join('D:', 'proj', 'scripts', 'da
 assert.equal(copied.hfCacheDir, path.join('D:', 'proj', 'scripts', 'code-index', 'hf-cache'));
 
 const standalone = resolveLayout({
-  moduleDir: path.join('D:', 'HbuilderX-Project', 'TokenSaver'),
-  cwd: path.join('D:', 'HbuilderX-Project', 'TokenSaver'),
+  moduleDir: path.join('D:', 'HbuilderX-Project', 'TokenSaver', 'code-index'),
+  cwd: path.join('D:', 'HbuilderX-Project', 'TokenSaver', 'code-index'),
   env: {},
   homedir: path.join('C:', 'Users', 'me'),
   gitRoot: path.join('D:', 'HbuilderX-Project', 'TokenSaver'),

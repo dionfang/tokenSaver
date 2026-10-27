@@ -1,0 +1,36 @@
+{
+  "name": "@dionfang/tokensaver",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "TokenSaver 本地语义代码索引。Ollama 或 transformers.js,模型权重需本机自备。",
+  "bin": {
+    "tokensaver": "cli.mjs"
+  },
+  "files": [
+    "*.mjs",
+    "ponytail.md",
+    "README.md",
+    "部署使用说明.txt"
+  ],
+  "scripts": {
+    "prepack": "node ../sync-npm.mjs",
+    "test": "node ../code-index/config.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitcode.com/dionfang/TokenSaver.git",
+    "directory": "npm"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
+    "token-estimator": "^1.0.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,30 +1,18 @@
 {
-  "name": "@dionfang/tokensaver",
+  "name": "tokensaver-deploy",
   "version": "1.0.0",
-  "private": false,
+  "private": true,
   "type": "module",
-  "description": "TokenSaver 本地语义代码索引。Ollama 或 transformers.js,模型权重需本机自备。",
-  "bin": {
-    "tokensaver": "cli.mjs"
-  },
-  "files": [
-    "*.mjs",
-    "ponytail.md",
-    "README.md",
-    "部署使用说明.txt"
-  ],
+  "description": "TokenSaver 直接部署目录。复制到目标项目 scripts/code-index 后运行 node init.mjs。",
   "scripts": {
     "build": "node build.mjs",
     "embed": "node embed.mjs",
     "search": "node search.mjs",
-    "test": "node config.test.mjs"
+    "test": "node config.test.mjs && node init.test.mjs"
   },
   "repository": {
     "type": "git",
     "url": "git+https://gitcode.com/dionfang/TokenSaver.git"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "license": "MIT",
   "dependencies": {

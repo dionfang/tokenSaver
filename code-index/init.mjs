@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 /**
- * 新项目初始化。npm 安装后在仓库根执行:
- *   npx tokensaver init [--roots "D:/repoA,D:/repoB"] [--model-in ollama|local]
- * 复制目录部署则在模块目录运行:
+ * 新项目初始化。在本目录运行:
  *   node init.mjs [--roots "D:/repoA,D:/repoB"] [--model-in ollama|local]
  *
  * --model-in 决定嵌入路径,写入 data/code-index.config.json 的 modelIn:
@@ -22,7 +20,7 @@
  *      JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段,没有则追加;文件不存在则新建。
  *      再追加或替换末尾的 Ponytail 段(<!-- ponytail -->),不改纪律段和其他原文。
- *      补 .gitignore(依赖、data、hf-cache、.zcode)。hf-cache 权重超过远程单文件限制,不入库。
+ *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor 与 .zcode 始终忽略。
  *      不存在 CODE_MAP.md 时写一份空模板,已有则不动。
  * 依赖安装与索引构建均不可跳过。
  */
@@ -30,7 +28,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_CONFIG, DATA_DIR, HF_CACHE_DIR, PACKED_INSTALL, findGitRoot } from './config.mjs';
+import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot } from './config.mjs';
+import { localOnnxCached } from './localRerank.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -149,7 +148,7 @@ if (configExisted) {
   if (!Array.isArray(roots)) roots = [hostRoot]; // 无 --roots 时 roots 尚未赋值 → 宿主根(rootsArg 分支已提前 split,不会走到这)
   const desc = '项目配置。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 默认 < 本文件 < CODE_INDEX_ROOTS < --roots。modelIn: --model-in > 本文件 > local。不传 --model-in 不改已有 modelIn。skipDirs 整表替换。';
   // 新项目部署:显式写出 skipDirs(内置默认 + 排除部署单元自身及其 hooks 转发器)
-  const skipDirs = [...DEFAULT_CONFIG.skipDirs, 'code-index', '.cursor', '.zcode'];
+  const skipDirs = [...new Set([...DEFAULT_CONFIG.skipDirs, path.basename(here), 'code-index', '.cursor', '.zcode'])];
   fs.writeFileSync(configPath, JSON.stringify({
     $说明: desc,
     roots,
@@ -161,9 +160,15 @@ if (configExisted) {
 }
 if (!configExisted || modelInArg) {
   if (chosenBackend === 'local') {
-    console.error(`  [注意] 嵌入路径为 local:transformers.js 由常驻进程加载,不依赖 Ollama。常驻不在时当次进程内加载。首次使用下载到 hf-cache。`);
-    console.error(`        嵌入 ${DEFAULT_CONFIG.models.localEmbedding}`);
-    console.error(`        精排 ${DEFAULT_CONFIG.models.localReranker}(q8)`);
+    const embId = DEFAULT_CONFIG.models.localEmbedding;
+    const rrId = DEFAULT_CONFIG.models.localReranker;
+    const bundled = localOnnxCached(embId) && localOnnxCached(rrId);
+    console.error(`  [注意] 嵌入路径为 local:transformers.js 由常驻进程加载,不依赖 Ollama。常驻不在时当次进程内加载。`);
+    console.error(bundled
+      ? '        本目录 hf-cache 已含两个模型权重,无需下载。'
+      : '        hf-cache 缺权重,首次使用会下载。');
+    console.error(`        嵌入 ${embId}`);
+    console.error(`        精排 ${rrId}(q8)`);
   } else {
     console.error('  [注意] 嵌入路径为 ollama。目标电脑需已安装 Ollama 客户端,并**手工** pull(本模块不自动拉取):');
     console.error(`        ollama pull ${DEFAULT_CONFIG.models.embedding}`);
@@ -177,8 +182,11 @@ if (PACKED_INSTALL) {
   ok('npm 包已安装,跳过模块目录 npm install');
 } else {
   const r = spawnSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: here, stdio: 'inherit', shell: true });
-  if (r.status !== 0) console.error('  [warn] npm install 失败(可试 --registry=https://registry.npmmirror.com 后重跑)');
-  else ok('依赖就绪');
+  if (r.status !== 0) {
+    console.error('  [err] npm install 失败(可试 --registry=https://registry.npmmirror.com 后重跑)');
+    process.exit(1);
+  }
+  ok('依赖就绪');
 }
 
 log(`\n[3/5] 后台启动首版索引构建(不等待)`);
@@ -198,6 +206,32 @@ log(`\n[3/5] 后台启动首版索引构建(不等待)`);
 }
 }
 
+/** 仓库根到目标的 gitignore 路径(/scripts/code-index/)。目标在仓外则返回 null。 */
+export function toGitignorePath(repoRoot, target) {
+  let from = repoRoot;
+  let to = target;
+  try { from = fs.realpathSync.native(repoRoot); } catch { from = path.resolve(repoRoot); }
+  try { to = fs.realpathSync.native(target); } catch { to = path.resolve(target); }
+  let rel = path.relative(from, to).split(path.sep).join('/');
+  if (!rel || rel === '.' || rel.startsWith('..')) return null;
+  if (!rel.startsWith('/')) rel = '/' + rel;
+  return rel.endsWith('/') ? rel : rel + '/';
+}
+
+const EDITOR_IGNORE = ['/.zcode/', '/.cursor/'];
+
+/** 本地复制部署:忽略整个模块目录和平行 data。npm 安装只忽略 data。.cursor/.zcode 始终忽略。 */
+export function gitignoreEntries({ packed, repoRoot, moduleDir, dataDir }) {
+  const out = [...EDITOR_IGNORE];
+  const data = toGitignorePath(repoRoot, dataDir);
+  if (data) out.push(data);
+  if (!packed) {
+    const mod = toGitignorePath(repoRoot, moduleDir);
+    if (mod) out.push(mod);
+  }
+  return [...new Set(out)];
+}
+
 /** 确保 .gitignore 含指定行(精确匹配,幂等);有新增时附一行注释标记 */
 function ensureGitignore(root, entries) {
   const giPath = path.join(root, '.gitignore');
@@ -207,17 +241,21 @@ function ensureGitignore(root, entries) {
   const missing = entries.map(e => e.startsWith('/') ? e : '/' + e).filter(e => !have.has(e));
   if (!missing.length) { ok(`[${path.basename(root)}] .gitignore 已覆盖所需条目`); return; }
   if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
-  lines.push('# code-index(依赖、data 索引产物、hf-cache 权重、.zcode 不入库)');
+  lines.push('# code-index(部署目录、data、.cursor/.zcode 钩子不入库)');
   lines.push(...missing);
   fs.writeFileSync(giPath, lines.join('\n') + '\n');
   ok(`[${path.basename(root)}] .gitignore 已追加:${missing.join(', ')}`);
 }
 
-/** 只认本模块的脚本。项目里别的 auto.mjs / warm.mjs 不碰。 */
+/** 只认本模块的脚本。项目里别的 auto.mjs / warm.mjs 不碰。目录名不限(复制部署常用 code-index)。 */
 export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
   if (/(?:^|\/)(?:warm-code-index|output-savings)\.mjs$/.test(s)) return true;
-  return /(?:^|\/)(?:code-index|tokensaver)\/(?:auto|commit-refresh|prompt-guard|warm|output-savings)\.mjs$/.test(s);
+  const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const names = 'auto|commit-refresh|prompt-guard|warm|output-savings';
+  if (new RegExp(`(?:^|/)(?:code-index|tokensaver|${dir})/(?:${names})\\.mjs$`).test(s)) return true;
+  const herePosix = here.replace(/\\/g, '/');
+  return s.includes(herePosix + '/') || s.endsWith(herePosix);
 }
 
 function cursorHookEntry(root, scriptName) {
@@ -355,7 +393,7 @@ function wireRepo(root) {
   const embedCmd = PACKED_INSTALL ? 'npx tokensaver embed' : 'node embed.mjs';
   const pathHint = PACKED_INSTALL
     ? '命令在仓库根执行(`npx tokensaver ...`),不要 cd 进 node_modules'
-    : '派单/命令里的路径必须用正斜杠+引号(`cd "' + path.dirname(here).split(path.sep).join('/') + '/code-index"`):git bash 下不带引号的反斜杠路径会被转义吞掉';
+    : '派单/命令里的路径必须用正斜杠+引号(`cd "' + rel + '"`):git bash 下不带引号的反斜杠路径会被转义吞掉';
   const toolLabel = PACKED_INSTALL ? 'npx tokensaver' : rel;
   const P = (n, t) => n + '. ' + t;
   const items = [
@@ -424,15 +462,9 @@ const wireRoots = [...new Set([repoRoot, ...effRoots.map(r => path.resolve(r))])
 for (const r of wireRoots) {
   if (fs.existsSync(path.join(r, '.git'))) {
     wireRepo(r);
-    // 不入 git:机器本地 hooks;宿主仓库另忽略依赖、项目资产和 hf-cache(权重超过远程单文件限制)。
-    const giEntries = ['/.zcode/'];
-    if (r === repoRoot) {
-      const rel = (p) => '/' + path.relative(repoRoot, p).split(path.sep).join('/');
-      giEntries.push(rel(DATA_DIR) + '/');
-      if (!PACKED_INSTALL) {
-        giEntries.push(rel(path.join(here, 'node_modules')) + '/', rel(HF_CACHE_DIR) + '/');
-      }
-    }
+    const giEntries = r === repoRoot
+      ? gitignoreEntries({ packed: PACKED_INSTALL, repoRoot, moduleDir: here, dataDir: DATA_DIR })
+      : [...EDITOR_IGNORE];
     ensureGitignore(r, giEntries);
   } else console.error(`  [note] ${r} 非 git 仓库,只索引不接线(无 AGENTS.md/hooks)`);
 }
@@ -444,5 +476,5 @@ if (!fs.existsSync(codeMapPath)) {
   fs.writeFileSync(codeMapPath, `# CODE_MAP —— 项目代码知识地图(由 agent 在深挖中持续维护)\n\n> 用法:先读本文获得全局背景 → node search.mjs 检索定位 → 按行区间精读。\n> 建议内容:项目架构图、核心链路、关键文件职责、已知问题速查。\n\n(模板生成于 ${new Date().toISOString().slice(0, 10)};请按项目实际逐步充实,knownAnnotations 同步沉淀)\n`);
   ok(`已生成 CODE_MAP 模板:${codeMapPath}(请逐步充实)`);
 }
-log(`提示:工具可用 npm i -D @dionfang/tokensaver 后 npx tokensaver init,也可复制本目录。项目资产在 ${DATA_DIR}(config/CODE_MAP/索引)。Ollama/local 模型权重不在 npm 包内。`);
+log(`提示:项目资产在 ${DATA_DIR}(config/CODE_MAP/索引)。Ollama/local 模型权重不随本目录复制。`);
 }
