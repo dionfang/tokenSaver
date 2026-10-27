@@ -7,8 +7,11 @@
  *     无进程 → 立即判定不可用。ollama 嵌入路径因此退 bm25;local 路径不调用本函数做向量检索。
  * 服务本身由使用者手动启动(桌面版 Ollama 或服务方式)。
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { loadConfig } from './config.mjs';
+import { DATA_DIR, loadConfig } from './config.mjs';
+import { readVectorMeta } from './vectorStore.mjs';
 
 export function resolveBase(explicit) {
   return explicit || loadConfig().ollamaBase;
@@ -117,6 +120,81 @@ export function gpuOptions() {
   return resolveGpuMode().numGpu === 0 ? { num_gpu: 0 } : {};
 }
 
+const WARMED_PATH = path.join(DATA_DIR, '.last-warmed.json');
+
+export function sameOllamaName(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const parts = (s) => {
+    const i = String(s).lastIndexOf(':');
+    return i > 0 ? [s.slice(0, i), s.slice(i + 1)] : [String(s), 'latest'];
+  };
+  const [ba, ta] = parts(a);
+  const [bb, tb] = parts(b);
+  if (ba !== bb) return false;
+  const latest = (t) => t === 'latest' || t === '';
+  return ta === tb || (latest(ta) && latest(tb));
+}
+
+export function readLastWarmed() {
+  try { return JSON.parse(fs.readFileSync(WARMED_PATH, 'utf8')); } catch { return null; }
+}
+
+export function rememberWarmedModels(state) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(WARMED_PATH, JSON.stringify(state) + '\n');
+}
+
+/** 驻留名单里、既不是 keep 又对得上 extras 的,视为被替换的模型。不碰聊天模型。 */
+export function replacedOllamaNames(runningNames, keep, extras) {
+  const keepList = (keep || []).filter(Boolean);
+  const extraList = (extras || []).filter(Boolean);
+  const drop = [];
+  for (const name of runningNames || []) {
+    if (!name || keepList.some((k) => sameOllamaName(k, name))) continue;
+    if (extraList.some((e) => sameOllamaName(e, name))) drop.push(name);
+  }
+  return drop;
+}
+
+export async function unloadOllamaModel(name, onInfo) {
+  if (!name) return false;
+  const base = resolveBase();
+  try {
+    await fetch(`${base}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: name, keep_alive: 0 }),
+      signal: AbortSignal.timeout(15000),
+    });
+    onInfo?.(`[ollama] 已卸载 ${name}`);
+    return true;
+  } catch (e) {
+    onInfo?.(`[warn] 卸载 ${name} 失败(${e.message})`);
+    return false;
+  }
+}
+
+function replacedExtras() {
+  const prev = readLastWarmed() || {};
+  return [prev.embedding, prev.reranker, readVectorMeta('ollama')?.model];
+}
+
+async function listPsModels() {
+  const ps = await (await fetch(`${resolveBase()}/api/ps`, { signal: AbortSignal.timeout(3000) })).json();
+  return ps.models || [];
+}
+
+/** 卸掉本工具上次驻留、现已不在 keep 里的 Ollama 模型。不卸载 keep 与无关模型。 */
+export async function releaseReplacedOllamaModels(keep, onInfo) {
+  try {
+    const running = (await listPsModels()).map((m) => m.name || m.model);
+    for (const name of replacedOllamaNames(running, keep, replacedExtras())) {
+      await unloadOllamaModel(name, onInfo);
+    }
+  } catch { /* /api/ps 不可用则跳过 */ }
+}
+
 /**
  * 模型驻留位置同步:num_gpu 仅在加载时生效,若模型已按另一种模式驻留,
  * 后续请求只会复用旧实例。此函数查 /api/ps,位置与判定不符时先卸载
@@ -124,24 +202,17 @@ export function gpuOptions() {
  */
 export async function ensureModelPlacement(models, onInfo) {
   const g = resolveGpuMode();
-  const base = resolveBase();
   const wantCpu = g.mode === 'cpu';
   try {
-    const ps = await (await fetch(`${base}/api/ps`, { signal: AbortSignal.timeout(3000) })).json();
-    for (const m of ps.models || []) {
+    const listed = await listPsModels();
+    for (const m of listed) {
       const name = m.name || m.model;
-      if (!models?.includes(name) || !m.size) continue;
+      if (!models?.some((want) => sameOllamaName(want, name)) || !m.size) continue;
       const onGpu = m.size_vram / m.size > 0.9;
       const onCpu = m.size_vram / m.size < 0.1;
       if ((wantCpu && onGpu) || (!wantCpu && onCpu)) {
-        try {
-          await fetch(`${base}/api/generate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: name, keep_alive: 0 }), // 空请求仅触发卸载
-          });
-          onInfo?.(`[gpu] ${name} 当前在 ${wantCpu ? 'GPU' : 'CPU'},与判定不符,已卸载待按${wantCpu ? 'CPU' : 'GPU'}重载`);
-        } catch { /* 卸载失败不影响后续,顶多复用旧实例 */ }
+        await unloadOllamaModel(name, onInfo);
+        onInfo?.(`[gpu] ${name} 当前在 ${wantCpu ? 'GPU' : 'CPU'},与判定不符,已卸载待按${wantCpu ? 'CPU' : 'GPU'}重载`);
       }
     }
   } catch { /* /api/ps 不可用则跳过同步 */ }

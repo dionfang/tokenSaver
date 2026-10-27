@@ -21,19 +21,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement } from './ollamaGuard.mjs';
+import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, releaseReplacedOllamaModels } from './ollamaGuard.mjs';
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
-import { vectorPaths, readVectorMeta, writeVectorMeta } from './vectorStore.mjs';
+import { vectorPaths, readVectorMeta, writeVectorMeta, wantEmbedModel } from './vectorStore.mjs';
 import { ensureLocalResident, residentEmbed } from './localResident.mjs';
+import { pidAlive, LOCK_TTL_MS } from './proc.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
 const PIDFILE = path.join(DATA_DIR, '.embed.pid');
-
-function pidAlive(pid) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
-}
 
 const md5 = (s) => crypto.createHash('md5').update(s).digest('hex');
 
@@ -46,7 +42,7 @@ const getOpt = (name, def) => {
   const i = args.indexOf(name);
   return i >= 0 && args[i + 1] ? args[i + 1] : def;
 };
-const backend = loadConfig().modelIn === 'local' ? 'local' : 'ollama';
+const { backend } = wantEmbedModel();
 const store = vectorPaths(backend);
 const PAIRED_PATH = store.paired;
 const EMB_PATH = store.emb;
@@ -86,7 +82,7 @@ function trimToBudget(text, budget = EMBED_TOKEN_BUDGET) {
 
 // ---------- 新鲜度短路:签名一致且向量文件在且模型未变,直接返回 ----------
 // 生效模型名只认 config.mjs,不接受命令行覆盖
-const effModel = backend === 'local' ? loadConfig().models.localEmbedding : loadConfig().models.embedding;
+const effModel = wantEmbedModel().model;
 if (!FORCE && meta.signature === curSig && fs.existsSync(EMB_PATH) && meta.model === effModel) {
   if (!fs.existsSync(PAIRED_PATH)) fs.copyFileSync(CHUNKS_PATH, PAIRED_PATH); // 首次建立配对快照
   // 刷新保鲜时间戳:签名一致=向量对当前代码有效,不刷新会让 auto 对非 git 目录误判过期
@@ -100,7 +96,7 @@ if (!FORCE && meta.signature === curSig && fs.existsSync(EMB_PATH) && meta.model
 {
   let prev = { pid: NaN, ts: 0 };
   try { prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8')); } catch { /* 无 pidfile */ }
-  const alive = pidAlive(prev.pid) && Number.isFinite(prev.ts) && Date.now() - prev.ts < 6 * 60 * 60 * 1000;
+  const alive = pidAlive(prev.pid) && Number.isFinite(prev.ts) && Date.now() - prev.ts < LOCK_TTL_MS;
   if (alive) {
     console.log(`[warn] 已有嵌入进程在运行(pid ${prev.pid}),本次退出`);
     process.exit(0);
@@ -153,6 +149,7 @@ async function makeEmbedder() {
       console.error(`[err] Ollama 嵌入路径不可用(${OLLAMA_BASE},不自动拉起服务,也不改换 local)。本次嵌入失败,检索降级 bm25。切换路径请运行: node init.mjs --model-in local`);
       process.exit(1);
     }
+    await releaseReplacedOllamaModels([OLLAMA_MODEL, loadConfig().models.reranker], console.log);
     await ensureModelPlacement([OLLAMA_MODEL], console.log); // 先同步驻留位置,探测请求才会按目标模式加载
     const probe = await ollamaEmbed(['dimension probe']);
     const dim = probe[0].length;

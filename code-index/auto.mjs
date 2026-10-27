@@ -11,51 +11,12 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, DATA_DIR, gitHeadOf } from './config.mjs';
 import { assessModelStatus } from './modelStatus.mjs';
-import { activeBackend, readVectorMeta, vectorStoreNeedsEmbed } from './vectorStore.mjs';
+import { readVectorMeta, vectorStoreNeedsEmbed, wantEmbedModel } from './vectorStore.mjs';
+import { pidAlive, takeJsonLock, releaseJsonLock, spawnLogged, LOCK_TTL_MS } from './proc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const indexJson = path.join(DATA_DIR, 'index.json');
 const lockPath = path.join(DATA_DIR, '.warm.lock');
-
-function pidAlive(pid) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === 'EPERM';
-  }
-}
-
-// 锁内容 = JSON {pid, ts};PID 被系统重用给无关进程会造成"锁活着"的假象,
-// 故存活判定附加时间窗:超过 6 小时的锁一律视为陈旧(一次保鲜+重建远用不了 6 小时)
-const LOCK_TTL_MS = 6 * 60 * 60 * 1000;
-
-function lockIsAlive() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    if (!pidAlive(raw.pid)) return false;
-    return Number.isFinite(raw.ts) && Date.now() - raw.ts < LOCK_TTL_MS;
-  } catch { return false; }
-}
-
-function takeLock() {
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-  if (lockIsAlive()) return false;
-  try { fs.unlinkSync(lockPath); } catch { /* 无锁或已失效 */ }
-  try {
-    const fd = fs.openSync(lockPath, 'wx');
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-    fs.closeSync(fd);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function releaseLock() {
-  try { fs.unlinkSync(lockPath); } catch { /* 已释放 */ }
-}
 
 /**
  * 保鲜判定(逐 root 独立):
@@ -70,7 +31,7 @@ function evalFreshness() {
   if (!idx?.files) return { need: true, reason: '无索引' };
   const recorded = idx.rootsHeads || {};
   const cfg = loadConfig();
-  const wantBackend = activeBackend();
+  const { backend: wantBackend, model: wantModel } = wantEmbedModel(cfg);
   const meta = readVectorMeta(wantBackend);
   const builtAt = Date.parse(meta?.builtAt || idx.builtAt) || 0;
   const staleNonGit = cfg.staleNonGitMs ?? 24 * 60 * 60 * 1000;
@@ -89,7 +50,6 @@ function evalFreshness() {
   }
   if (reasons.length) return { need: true, reason: reasons.join(';') };
   // 代码没变:只看当前路径的向量目录,缺向量、模型不符或块签名过期才重嵌
-  const wantModel = wantBackend === 'local' ? cfg.models.localEmbedding : cfg.models.embedding;
   if (vectorStoreNeedsEmbed(wantBackend, wantModel).need) {
     const have = meta?.model ? `${meta.backend || wantBackend}/${meta.model}` : '无向量';
     return { need: true, embedOnly: true, reason: `当前路径向量需更新(${have} → ${wantBackend}/${wantModel})` };
@@ -112,32 +72,18 @@ function runNode(script) {
   });
 }
 
-/** 分离后台跑 embed:全量嵌入可能超过 hook 超时(ZCode 7 分钟 / Cursor 10 分钟),转后台以免被杀掉 */
-function spawnEmbedDetached() {
-  const logFd = fs.openSync(path.join(DATA_DIR, 'embed.log'), 'a');
-  const child = spawn(process.execPath, [path.join(here, 'embed.mjs')], {
-    cwd: here,
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-    windowsHide: true,
-  });
-  child.unref();
-  fs.closeSync(logFd);
-  return child.pid;
-}
-
 function embedPidAlive() {
   try {
     const prev = JSON.parse(fs.readFileSync(path.join(DATA_DIR, '.embed.pid'), 'utf8'));
     const pid = Number(prev.pid);
-    if (!Number.isFinite(pid) || pid <= 0) return false;
+    if (!pidAlive(pid)) return false;
     if (Number.isFinite(prev.ts) && Date.now() - prev.ts > LOCK_TTL_MS) return false;
-    try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+    return true;
   } catch { return false; }
 }
 
 async function main() {
-  if (!takeLock()) process.exit(0);
+  if (!takeJsonLock(lockPath)) process.exit(0);
   try {
     const f = evalFreshness();
     if (f.need) {
@@ -153,7 +99,7 @@ async function main() {
         if (embedPidAlive()) {
           console.error('[index] 后台嵌入进程已在运行,跳过重复启动');
         } else {
-          const pid = spawnEmbedDetached();
+          const pid = spawnLogged(path.join(here, 'embed.mjs'), path.join(DATA_DIR, 'embed.log'), here).pid;
           console.error(`[index] 嵌入已转后台(pid ${pid},日志 data/embed.log;期间检索自动降级 bm25,完成后自动恢复)`);
         }
       }
@@ -172,7 +118,7 @@ async function main() {
       additionalContext: `[code-index] 请在每次回复末尾原样附上这一句:"${assessed.relay}"`,
     }));
   } finally {
-    releaseLock();
+    releaseJsonLock(lockPath);
   }
   process.exit(0);
 }

@@ -3,8 +3,8 @@
  *   模型部署(models / ollamaBase / gpu / rerankBlend):只认本文件。不读环境变量,也不读 data/code-index.config.json。
  *     改完随 git 可见,协作排查时打开本文件即可。单次命令仍可用 CLI(--rr-model)。嵌入模型名与 ollamaBase 不接受命令行覆盖。
  *   modelIn:init.mjs --model-in > code-index.config.json > 内置默认 local
- *   roots:CLI(--roots)> env(CODE_INDEX_ROOTS)> code-index.config.json > 内置默认(空)
- *   skipDirs/exts/chunk/knownAnnotations/staleNonGitMs:code-index.config.json > 内置默认(无 env/CLI)
+ *   roots:init --roots 与已有合并(纳入);无参数重跑只读本文件并自愈。运行时 env(CODE_INDEX_ROOTS) 仍可临时盖掉。内置默认空。
+ *   skipDirs/exts/chunk/knownAnnotations/staleNonGitMs/readMaxLines:code-index.config.json > 内置默认(无 env/CLI)
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -41,8 +41,9 @@ export function findGitRoot(start) {
 
 /**
  * 项目资产 vs 模型缓存落点。
- * 复制目录部署:data 在模块平行的 ../data,hf-cache 在模块内。
- * npm 安装:data 在仓库 scripts/data(可用 CODE_INDEX_DATA_DIR 覆盖),hf-cache 在用户主目录以免 node_modules 被删掉。
+ * 非 npm:data 只跟模块走(code-index 的上一级 data/,或模块自己就是 git 根时用模块内 data/),不跟当前工作区走。
+ *   TokenSaver 仓:data 在仓库根;复制到某项目 scripts/code-index:data 在 scripts/data。
+ * npm 安装:data 在当前仓 scripts/data(可用 CODE_INDEX_DATA_DIR 覆盖),hf-cache 在用户主目录。
  */
 export function resolveLayout({
   moduleDir,
@@ -55,12 +56,12 @@ export function resolveLayout({
   const dataFromEnv = env.CODE_INDEX_DATA_DIR && String(env.CODE_INDEX_DATA_DIR).trim();
   const root = realpathOr(gitRoot || findGitRoot(cwd) || findGitRoot(moduleDir) || cwd || '.');
   const moduleAbs = realpathOr(moduleDir);
-  // 本仓库 code-index/ 的 git 根在上一级,data 落在仓库根 ./data;复制到目标项目 scripts/code-index 用平行 ../data
+  const moduleGit = findGitRoot(moduleAbs);
   const dataDir = dataFromEnv
     ? path.resolve(dataFromEnv)
     : packed
       ? path.join(root, 'scripts', 'data')
-      : root === moduleAbs
+      : moduleGit && realpathOr(moduleGit) === moduleAbs
         ? path.join(moduleAbs, 'data')
         : path.resolve(moduleAbs, '..', 'data');
   const hfCacheDir = packed
@@ -99,6 +100,8 @@ export const DEFAULT_CONFIG = {
   exts: ['js', 'mjs', 'cjs', 'ts', 'tsx', 'vue', 'scss', 'css', 'less', 'html', 'sql', 'wxs'],
   jsonWhitelist: ['package.json', 'pages.json', 'manifest.json', 'tsconfig.json'],
   maxFileBytes: 800 * 1024,
+  // Cursor 全量 Read 行数上限。超过 ×1.25 由 preToolUse 拦截;带 offset/limit 的区间读不受限。
+  readMaxLines: 500,
   chunk: { targetLines: 70, maxLines: 120, overlapLines: 10, minTail: 15 },
   // 非 git root 的保鲜回退阈值(git root 走 HEAD 比对,不用时间)
   staleNonGitMs: 24 * 60 * 60 * 1000,

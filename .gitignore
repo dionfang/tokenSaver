@@ -4,3 +4,10 @@ hf-cache/
 *.tgz
 .zcode/
 .cursor/
+.qoder/
+
+# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
+/.zcode/
+/.cursor/
+/.qoder/
+/data/

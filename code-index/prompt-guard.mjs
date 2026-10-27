@@ -8,10 +8,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, DATA_DIR } from './config.mjs';
-import { activeBackend, vectorStoreNeedsEmbed } from './vectorStore.mjs';
+import { vectorStoreNeedsEmbed, wantEmbedModel } from './vectorStore.mjs';
+import { pidAlive, spawnLogged, LOCK_TTL_MS } from './proc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const autoAbs = path.resolve(here, 'auto.mjs');
@@ -19,9 +19,8 @@ const autoAbs = path.resolve(here, 'auto.mjs');
 function embedRunning() {
   try {
     const { pid, ts } = JSON.parse(fs.readFileSync(path.join(DATA_DIR, '.embed.pid'), 'utf8'));
-    if (!Number.isFinite(pid) || pid <= 0) return false;
-    try { process.kill(pid, 0); } catch (e) { return e?.code === 'EPERM'; }
-    return Number.isFinite(ts) && Date.now() - ts < 6 * 60 * 60 * 1000; // PID 重用防护
+    if (!pidAlive(pid)) return false;
+    return Number.isFinite(ts) && Date.now() - ts < LOCK_TTL_MS;
   } catch { return false; }
 }
 
@@ -30,9 +29,7 @@ process.stdin.on('data', (d) => { input += d; });
 process.stdin.on('end', () => {
   try {
     JSON.parse(input || '{}'); // 仅校验格式;prompt 内容与本检测无关
-    const cfg = loadConfig();
-    const wantBackend = activeBackend();
-    const wantModel = wantBackend === 'local' ? cfg.models.localEmbedding : cfg.models.embedding;
+    const { backend: wantBackend, model: wantModel } = wantEmbedModel(loadConfig());
     const check = vectorStoreNeedsEmbed(wantBackend, wantModel);
     if (!check.need) process.exit(0);
     const from = check.meta?.model ? `${check.meta.backend || wantBackend}/${check.meta.model}` : '无向量';
@@ -46,12 +43,7 @@ process.stdin.on('end', () => {
         ? `[code-index] 当前路径向量与块清单不一致,后台增量重嵌进行中;期间检索 bm25 兜底。`
         : `[code-index] 嵌入路径变更(${from} → ${to})后台增量更新当前目录,另一路径的向量保留;期间检索 bm25 兜底。`;
     } else {
-      const logFd = fs.openSync(path.join(DATA_DIR, 'auto.log'), 'a');
-      const child = spawn(process.execPath, [autoAbs], {
-        cwd: here, detached: true, stdio: ['ignore', logFd, logFd], windowsHide: true,
-      });
-      child.unref();
-      fs.closeSync(logFd);
+      spawnLogged(autoAbs, path.join(DATA_DIR, 'auto.log'), here);
       note = sameModel
         ? `[code-index] 当前路径向量与块清单不一致,已后台增量重嵌;期间检索 bm25 兜底。`
         : `[code-index] 检测到嵌入路径变更(${from} → ${to}),已后台增量更新当前目录(另一路径的向量保留);期间检索 bm25 兜底。`;

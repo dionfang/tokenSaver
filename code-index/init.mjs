@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * 新项目初始化。在本目录运行:
- *   node init.mjs [--roots "D:/repoA,D:/repoB"] [--model-in ollama|local]
+ * 枢纽初始化。在 TokenSaver/code-index 运行(数据始终写在本工具仓的 data/,不写进业务仓):
+ *   node init.mjs [--roots "D:/repoA,D:/repoB"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
+ *
+ * --roots 纳入扫描目录(与已有 roots 合并,不覆盖)。以后改 data/code-index.config.json 的 roots,
+ * 再跑一次不带参数的 node init.mjs 即可:自愈仍存在的路径、给新 git 仓挂钩子、后台按配置重建索引。
  *
  * --model-in 决定嵌入路径,写入 data/code-index.config.json 的 modelIn:
  *   local(新建配置时的默认) —— 常驻进程加载 models.localEmbedding 与 models.localReranker;常驻不在时当次进程内加载。不依赖 Ollama
@@ -10,34 +13,65 @@
  * 两条路径拉起失败时检索都降级 bm25,运行时不改换另一条路径。
  *
  * 做这些事:
- *   1) 写 code-index.config.json。没有该文件时新建(roots 缺省 = 向上找到的 git 根,modelIn 缺省 local)。
- *      已有文件保留其余键:传了 --roots 就覆盖 roots,否则按本机路径自愈;只有传了 --model-in 才写 modelIn。
+ *   1) 写 data/code-index.config.json(相对本模块的上一级 data/)。没有该文件时新建
+ *      (roots 缺省 = 工具仓 git 根,modelIn 缺省 local)。
+ *      已有文件保留其余键:传了 --roots 就并入 roots;不传则按文件自愈,不把工具仓自己塞进 roots。
+ *      只有传了 --model-in 才写 modelIn。
  *   2) 安装依赖 npm install --ignore-scripts(必装,local 路径需要 transformers.js)
  *   3) **分离后台**启动 auto.mjs 建首版索引(build 内联其内 + embed 后台增量 + 预热;
  *      init 秒级返回不等待;进度看 data/auto.log 与 data/embed.log;期间检索 bm25 可用)
- *   4) 接线会话 hook:每个 git 仓库 root 的 .zcode/config.json 与 .cursor/hooks.json。
- *      每次运行都重写 code-index 自己的钩子与 Cursor 转发器;同文件里的其他钩子保留。
- *      JSON 解析失败则不改该文件。
+ *   4) 接线会话 hook:默认只装当前 agent(Cursor/ZCode/Qoder)那一套;认不出则三套都装。
+ *      Cursor 另接 beforeSubmitPrompt → prompt-guard(会话中改嵌入模型才会后台重嵌)。
+ *      三套都接 Read 拦截(超行数全量读 deny,区间读放行,5 分钟内重试放行,出错 fail-open):
+ *      Cursor preToolUse;ZCode/Qoder PreToolUse。
+ *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具里本模块的钩子与转发器;
+ *      同文件里的其他钩子保留,未选中的工具不改。JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段,没有则追加;文件不存在则新建。
  *      再追加或替换末尾的 Ponytail 段(<!-- ponytail -->),不改纪律段和其他原文。
- *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor 与 .zcode 始终忽略。
+ *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor/.zcode/.qoder 始终忽略。
  *      不存在 CODE_MAP.md 时写一份空模板,已有则不动。
  * 依赖安装与索引构建均不可跳过。
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync, spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot } from './config.mjs';
 import { localOnnxCached } from './localRerank.mjs';
+import { spawnLogged } from './proc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"  --model-in ollama|local。等号写法(--roots=D:/a、--model-in=local)也认。';
+export const HOOK_TOOLS = ['cursor', 'zcode', 'qoder'];
+const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"  --model-in ollama|local  --hooks all|cursor|zcode|qoder。等号写法也认。';
+
+/**
+ * 从进程环境判断当前是哪个 agent。认不出返回 null。
+ * Cursor agent 注入 CURSOR_AGENT;Qoder/ZCode 注入各自 PROJECT_DIR。
+ * 不看 CLAUDE_* (Qoder/ZCode 会同时带上)。
+ */
+export function detectAgent(env = process.env) {
+  if (env.CURSOR_AGENT || env.CURSOR_CONVERSATION_ID || env.CURSOR_TRACE_ID || env.CURSOR_REQUEST_ID) return 'cursor';
+  if (env.QODER_PROJECT_DIR || env.QODER_CONFIG_DIR || env.QODER_SESSION_ID || env.QODER_CWD) return 'qoder';
+  if (env.ZCODE_PROJECT_DIR || env.ZCODE_SESSION_ID || env.ZCODE_PLUGIN_ROOT) return 'zcode';
+  const cwd = env.VSCODE_CWD || '';
+  if (/[\\/][Cc]ursor(?:\.app)?(?:[\\/]|$)/.test(cwd)) return 'cursor';
+  if (/[\\/][Qq]oder(?:\.app)?(?:[\\/]|$)/.test(cwd)) return 'qoder';
+  if (/[\\/][Zz][Cc]ode(?:\.app)?(?:[\\/]|$)/.test(cwd)) return 'zcode';
+  return null;
+}
+
+/** --hooks 优先;否则检测到哪个装哪个;都没有则三套都装。 */
+export function resolveHookTargets(hooksArg, env = process.env) {
+  if (hooksArg === 'all') return [...HOOK_TOOLS];
+  if (hooksArg) return [hooksArg];
+  const d = detectAgent(env);
+  return d ? [d] : [...HOOK_TOOLS];
+}
 
 /** 解析 init 参数。错误时返回 { error },不写配置。同一参数出现多次时后者生效。 */
 export function parseInitArgs(argv) {
-  const out = { roots: null, modelIn: null };
+  const out = { roots: null, modelIn: null, hooks: null };
   const unknown = [];
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -52,7 +86,7 @@ export function parseInitArgs(argv) {
       name = token.slice(0, eq);
       value = token.slice(eq + 1);
     }
-    if (name !== '--roots' && name !== '--model-in') {
+    if (name !== '--roots' && name !== '--model-in' && name !== '--hooks') {
       unknown.push(name);
       continue;
     }
@@ -64,7 +98,14 @@ export function parseInitArgs(argv) {
     }
     if (!String(value).trim()) return { error: `${name} 需要取值。${INIT_USAGE}` };
     if (name === '--roots') out.roots = value;
-    else out.modelIn = value;
+    else if (name === '--model-in') out.modelIn = value;
+    else {
+      const v = String(value).trim().toLowerCase();
+      if (v !== 'all' && !HOOK_TOOLS.includes(v)) {
+        return { error: `--hooks 只能是 all|cursor|zcode|qoder,收到 ${value}` };
+      }
+      out.hooks = v;
+    }
   }
   if (unknown.length) return { error: `无法识别的参数: ${unknown.join(' ')}。${INIT_USAGE}` };
   if (out.modelIn && out.modelIn !== 'ollama' && out.modelIn !== 'local') {
@@ -75,14 +116,58 @@ export function parseInitArgs(argv) {
   }
   return out;
 }
+
+export function splitRoots(raw) {
+  return String(raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function posixAbs(p) {
+  return path.resolve(p).split(path.sep).join('/');
+}
+
+/** 已有 ∪ 新增,绝对路径去重(Windows 大小写不敏感)。 */
+export function mergeRoots(existing, added) {
+  const out = [];
+  const seen = new Set();
+  const add = (r) => {
+    if (r == null || String(r).trim() === '') return;
+    const n = posixAbs(r);
+    const k = n.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(n);
+  };
+  for (const r of existing || []) add(r);
+  for (const r of added || []) add(r);
+  return out;
+}
+
+/** 仍存在的保留;缺失的按 siblingOf+basename 猜一次。不把宿主根塞进去。 */
+export function healRoots(roots, { siblingOf, exists = fs.existsSync, onMissing, onHeal } = {}) {
+  const healed = [];
+  for (const r of roots || []) {
+    if (exists(r)) {
+      healed.push(String(r).split(path.sep).join('/'));
+      continue;
+    }
+    const guess = siblingOf ? path.join(siblingOf, path.basename(r)).split(path.sep).join('/') : '';
+    if (guess && exists(guess)) {
+      healed.push(guess);
+      if (onHeal) onHeal(r, guess);
+    } else if (onMissing) onMissing(r);
+  }
+  return healed;
+}
+
 const log = (s) => console.log(s);
 const ok = (s) => console.log(`  [ok] ${s}`);
 
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-const repoRoot = findGitRoot(process.cwd()) || findGitRoot(here);
+// 枢纽以本模块所在仓为准,不跟当前工作区走,避免在业务仓里跑 init 把 data 搞乱。
+const repoRoot = findGitRoot(here) || findGitRoot(process.cwd());
 if (directRun) {
 if (!repoRoot) {
-  console.error('[err] 未找到 git 仓库根(从本目录向上未发现 .git);请在目标项目内使用本模块');
+  console.error('[err] 未找到 git 仓库根(从本模块向上未发现 .git);请在 TokenSaver/code-index 内运行');
   process.exit(1);
 }
 const parsedArgs = parseInitArgs(args);
@@ -95,44 +180,56 @@ const modelInArg = parsedArgs.modelIn;
 log(`\n[1/5] 生成配置`);
 const configPath = path.join(DATA_DIR, 'code-index.config.json');
 fs.mkdirSync(DATA_DIR, { recursive: true }); // 新项目首装:平行 data/ 目录尚不存在
+ok(`数据目录 ${DATA_DIR}`);
 const hostRoot = repoRoot.split(path.sep).join('/');
+const siblingOf = path.dirname(repoRoot);
+const takeExistingRoots = (raw) => {
+  const wanted = splitRoots(raw);
+  const present = [];
+  for (const r of wanted) {
+    if (fs.existsSync(r)) present.push(r);
+    else console.error(`  [warn] --roots 跳过不存在的路径: ${r}`);
+  }
+  return present;
+};
 let roots;
-if (rootsArg) {
-  roots = rootsArg.split(',').map(s => s.trim()).filter(Boolean);
-}
 const configExisted = fs.existsSync(configPath);
 const chosenBackend = modelInArg || 'local';
 if (configExisted) {
   const cfgOld = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   let dirty = false;
   if (rootsArg) {
-    // 显式 --roots:重写 roots;--model-in 另写 modelIn。其余键保留。
-    cfgOld.roots = roots;
-    dirty = true;
-    ok(`已存在,roots 已更新为 ${JSON.stringify(roots)}`);
-  } else {
-    // 无 --roots:对已有 roots 做"换机自愈"——
-    // 存在的保留;缺失的按兄弟目录约定重建(宿主父目录 + 同名);宿主根确保在列
-    const healed = [];
-    for (const r of cfgOld.roots || []) {
-      if (fs.existsSync(r)) { healed.push(r); continue; }
-      const guess = path.join(path.dirname(repoRoot), path.basename(r)).split(path.sep).join('/');
-      if (fs.existsSync(guess)) {
-        healed.push(guess);
-        ok(`root 自愈:${r} → ${guess}(兄弟目录约定)`);
-      } else {
-        console.error(`  [warn] root ${r} 在本机不存在且无法按兄弟目录定位,已剔除;如需指定请用 --roots`);
-      }
+    const added = takeExistingRoots(rootsArg);
+    if (!added.length && !(cfgOld.roots || []).length) {
+      console.error('[err] --roots 没有可用路径,未改配置');
+      process.exit(1);
     }
-    if (!healed.includes(hostRoot)) healed.unshift(hostRoot);
-    if (JSON.stringify(healed) !== JSON.stringify(cfgOld.roots || [])) {
-      cfgOld.roots = healed;
+    roots = mergeRoots(cfgOld.roots || [], added);
+    if (JSON.stringify(roots) !== JSON.stringify(cfgOld.roots || [])) {
+      cfgOld.roots = roots;
       dirty = true;
-      ok(`roots 已自愈为 ${JSON.stringify(healed)}`);
+      ok(`已纳入 roots = ${JSON.stringify(roots)}`);
     } else {
-      ok(`roots 已存在且全部有效,跳过(${configPath})`);
+      roots = cfgOld.roots || [];
+      ok(`roots 未变化 ${JSON.stringify(roots)}`);
     }
-    roots = healed;
+  } else {
+    roots = healRoots(cfgOld.roots || [], {
+      siblingOf,
+      onHeal: (from, to) => ok(`root 自愈:${from} → ${to}(兄弟目录约定)`),
+      onMissing: (r) => console.error(`  [warn] root ${r} 在本机不存在且无法按兄弟目录定位,已剔除;改配置或 --roots 再纳入`),
+    });
+    if (!roots.length) {
+      console.error('  [warn] 配置里没有仍存在的 root,回退为工具仓自身;请在 data/code-index.config.json 填写业务目录后重跑 init');
+      roots = [hostRoot];
+    }
+    if (JSON.stringify(roots) !== JSON.stringify(cfgOld.roots || [])) {
+      cfgOld.roots = roots;
+      dirty = true;
+      ok(`roots 已按配置生效 ${JSON.stringify(roots)}`);
+    } else {
+      ok(`按配置 roots 接线并重建索引 ${JSON.stringify(roots)}`);
+    }
   }
   if (modelInArg) {
     if (cfgOld.modelIn !== modelInArg) {
@@ -145,10 +242,17 @@ if (configExisted) {
   }
   if (dirty) fs.writeFileSync(configPath, JSON.stringify(cfgOld, null, 2));
 } else {
-  if (!Array.isArray(roots)) roots = [hostRoot]; // 无 --roots 时 roots 尚未赋值 → 宿主根(rootsArg 分支已提前 split,不会走到这)
-  const desc = '项目配置。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 默认 < 本文件 < CODE_INDEX_ROOTS < --roots。modelIn: --model-in > 本文件 > local。不传 --model-in 不改已有 modelIn。skipDirs 整表替换。';
-  // 新项目部署:显式写出 skipDirs(内置默认 + 排除部署单元自身及其 hooks 转发器)
-  const skipDirs = [...new Set([...DEFAULT_CONFIG.skipDirs, path.basename(here), 'code-index', '.cursor', '.zcode'])];
+  if (rootsArg) {
+    roots = mergeRoots([], takeExistingRoots(rootsArg));
+    if (!roots.length) {
+      console.error('[err] --roots 没有可用路径,未写配置');
+      process.exit(1);
+    }
+  } else {
+    roots = [hostRoot];
+  }
+  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。';
+  const skipDirs = [...new Set([...DEFAULT_CONFIG.skipDirs, path.basename(here), 'code-index', '.cursor', '.zcode', '.qoder'])];
   fs.writeFileSync(configPath, JSON.stringify({
     $说明: desc,
     roots,
@@ -191,16 +295,7 @@ if (PACKED_INSTALL) {
 
 log(`\n[3/5] 后台启动首版索引构建(不等待)`);
 {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const logFd = fs.openSync(path.join(DATA_DIR, 'auto.log'), 'a');
-  const child = spawn(process.execPath, [path.join(here, 'auto.mjs')], {
-    cwd: here,
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-    windowsHide: true,
-  });
-  child.unref();
-  fs.closeSync(logFd);
+  const child = spawnLogged(path.join(here, 'auto.mjs'), path.join(DATA_DIR, 'auto.log'), here);
   ok(`auto.mjs 已分离后台运行(pid ${child.pid}):build → 增量 embed → 预热;进度看 data/auto.log 与 data/embed.log`);
   console.error('  [note] 所选嵌入路径拉起失败时检索保持 bm25,不自动改换另一条路径。CPU 全量嵌入可达十几分钟(后台进行,不阻塞)');
 }
@@ -218,7 +313,7 @@ export function toGitignorePath(repoRoot, target) {
   return rel.endsWith('/') ? rel : rel + '/';
 }
 
-const EDITOR_IGNORE = ['/.zcode/', '/.cursor/'];
+const EDITOR_IGNORE = ['/.zcode/', '/.cursor/', '/.qoder/'];
 
 /** 本地复制部署:忽略整个模块目录和平行 data。npm 安装只忽略 data。.cursor/.zcode 始终忽略。 */
 export function gitignoreEntries({ packed, repoRoot, moduleDir, dataDir }) {
@@ -226,8 +321,12 @@ export function gitignoreEntries({ packed, repoRoot, moduleDir, dataDir }) {
   const data = toGitignorePath(repoRoot, dataDir);
   if (data) out.push(data);
   if (!packed) {
-    const mod = toGitignorePath(repoRoot, moduleDir);
-    if (mod) out.push(mod);
+    // 枢纽仓源码在 git 根下的 code-index/,不能 ignore;复制部署在 scripts/code-index/ 才忽略。
+    const hubSelf = path.resolve(path.dirname(moduleDir)) === path.resolve(repoRoot);
+    if (!hubSelf) {
+      const mod = toGitignorePath(repoRoot, moduleDir);
+      if (mod) out.push(mod);
+    }
   }
   return [...new Set(out)];
 }
@@ -241,7 +340,7 @@ function ensureGitignore(root, entries) {
   const missing = entries.map(e => e.startsWith('/') ? e : '/' + e).filter(e => !have.has(e));
   if (!missing.length) { ok(`[${path.basename(root)}] .gitignore 已覆盖所需条目`); return; }
   if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
-  lines.push('# code-index(部署目录、data、.cursor/.zcode 钩子不入库)');
+  lines.push('# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)');
   lines.push(...missing);
   fs.writeFileSync(giPath, lines.join('\n') + '\n');
   ok(`[${path.basename(root)}] .gitignore 已追加:${missing.join(', ')}`);
@@ -250,16 +349,16 @@ function ensureGitignore(root, entries) {
 /** 只认本模块的脚本。项目里别的 auto.mjs / warm.mjs 不碰。目录名不限(复制部署常用 code-index)。 */
 export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
-  if (/(?:^|\/)(?:warm-code-index|output-savings)\.mjs$/.test(s)) return true;
+  if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard)\.mjs$/.test(s)) return true;
+  if (/(?:^|\/)\.qoder\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const names = 'auto|commit-refresh|prompt-guard|warm|output-savings';
+  const names = 'auto|commit-refresh|prompt-guard|read-guard|warm|output-savings';
   if (new RegExp(`(?:^|/)(?:code-index|tokensaver|${dir})/(?:${names})\\.mjs$`).test(s)) return true;
   const herePosix = here.replace(/\\/g, '/');
   return s.includes(herePosix + '/') || s.endsWith(herePosix);
 }
 
-function cursorHookEntry(root, scriptName) {
-  const hooksDir = path.join(root, '.cursor', 'hooks');
+function hookEntryExpr(hooksDir, scriptName) {
   const target = path.join(here, scriptName);
   const rel = path.relative(hooksDir, target);
   if (path.isAbsolute(rel)) return JSON.stringify(target.split(path.sep).join('/'));
@@ -267,21 +366,74 @@ function cursorHookEntry(root, scriptName) {
   return `path.resolve(here, ${JSON.stringify(relPosix)})`;
 }
 
-function cursorHookPrelude(root, scriptName) {
-  const hooksDir = path.join(root, '.cursor', 'hooks');
+function hookPrelude(hooksDir, scriptName) {
   const rel = path.relative(hooksDir, path.join(here, scriptName));
   if (path.isAbsolute(rel)) return `import { spawn } from 'node:child_process'\n\n`;
   return `import { spawn } from 'node:child_process'\nimport path from 'node:path'\nimport { fileURLToPath } from 'node:url'\n\nconst here = path.dirname(fileURLToPath(import.meta.url))\n`;
 }
 
+function hookScript(hooksDir, scriptName, comment, body) {
+  return `/** ${comment} */\n${hookPrelude(hooksDir, scriptName)}const entry = ${hookEntryExpr(hooksDir, scriptName)}\n${body}`;
+}
+
 function cursorForwarderSource(root) {
+  const hooksDir = path.join(root, '.cursor', 'hooks');
   const body = `const child = spawn(process.execPath, [entry], { stdio: ['ignore', 'ignore', 'inherit'], windowsHide: true })\nchild.on('error', (err) => { console.error('[fail] 无法启动 code-index:', err.message); process.exit(0) })\nchild.on('exit', () => process.exit(0))\n`;
-  return `/** Cursor sessionStart: 转发到当前 code-index 的 auto.mjs。stdout 保持空。 */\n${cursorHookPrelude(root, 'auto.mjs')}const entry = ${cursorHookEntry(root, 'auto.mjs')}\n${body}`;
+  return hookScript(hooksDir, 'auto.mjs', 'Cursor sessionStart: 转发到当前 code-index 的 auto.mjs。stdout 保持空。', body);
 }
 
 function cursorOutputSavingsSource(root) {
+  const hooksDir = path.join(root, '.cursor', 'hooks');
   const body = `const child = spawn(process.execPath, [entry], { stdio: 'inherit', windowsHide: true })\nchild.on('error', () => process.exit(0))\nchild.on('exit', (code) => process.exit(code || 0))\n`;
-  return `/** Cursor afterAgentResponse: 转发到 output-savings.mjs,沿用 stdin 里的 output_tokens。 */\n${cursorHookPrelude(root, 'output-savings.mjs')}const entry = ${cursorHookEntry(root, 'output-savings.mjs')}\n${body}`;
+  return hookScript(hooksDir, 'output-savings.mjs', 'Cursor afterAgentResponse: 转发到 output-savings.mjs,沿用 stdin 里的 output_tokens。', body);
+}
+
+function cursorPromptGuardSource(root) {
+  const hooksDir = path.join(root, '.cursor', 'hooks');
+  const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'ignore', 'inherit'], windowsHide: true })
+child.on('error', () => { process.stdout.write('{"continue":true}'); process.exit(0) })
+child.on('exit', () => { process.stdout.write('{"continue":true}'); process.exit(0) })
+`;
+  return hookScript(hooksDir, 'prompt-guard.mjs', 'Cursor beforeSubmitPrompt: 转发 prompt-guard.mjs(模型变更则后台重嵌)。stdout 只回 continue,不注入上下文。', body);
+}
+
+function cursorReadGuardSource(root) {
+  const hooksDir = path.join(root, '.cursor', 'hooks');
+  const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
+let out = ''
+child.stdout.on('data', (d) => { out += d })
+child.on('error', () => { process.stdout.write('{"permission":"allow"}'); process.exit(0) })
+child.on('exit', () => {
+  const s = String(out).trim()
+  try {
+    const j = JSON.parse(s)
+    if (j && (j.permission === 'allow' || j.permission === 'deny')) process.stdout.write(s)
+    else process.stdout.write('{"permission":"allow"}')
+  } catch { process.stdout.write('{"permission":"allow"}') }
+  process.exit(0)
+})
+`;
+  return hookScript(hooksDir, 'read-guard.mjs', 'Cursor preToolUse Read: 转发 read-guard.mjs。无合法 permission 则 fail-open allow。', body);
+}
+
+function qoderReadGuardSource(root) {
+  const hooksDir = path.join(root, '.qoder', 'hooks');
+  const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
+let out = ''
+child.stdout.on('data', (d) => { out += d })
+child.on('error', () => { process.stdout.write('{}'); process.exit(0) })
+child.on('exit', () => {
+  const s = String(out).trim()
+  try {
+    const j = JSON.parse(s)
+    const d = j && j.hookSpecificOutput && j.hookSpecificOutput.permissionDecision
+    if (d === 'deny' || d === 'allow' || d === 'ask') process.stdout.write(s)
+    else process.stdout.write('{}')
+  } catch { process.stdout.write('{}') }
+  process.exit(0)
+})
+`;
+  return hookScript(hooksDir, 'read-guard.mjs', 'Qoder PreToolUse Read: 转发 read-guard.mjs。无合法 permissionDecision 则 {} fail-open。', body);
 }
 
 /** 每次重写本模块的 Cursor 钩子与转发器。同文件其他事件保留。JSON 坏了则只重写转发器。 */
@@ -290,11 +442,17 @@ export function rewriteCursorHooks(root) {
   const hooksDir = path.join(root, '.cursor', 'hooks');
   const forwarderPath = path.join(hooksDir, 'warm-code-index.mjs');
   const outputHookPath = path.join(hooksDir, 'output-savings.mjs');
+  const guardPath = path.join(hooksDir, 'prompt-guard.mjs');
+  const readGuardPath = path.join(hooksDir, 'read-guard.mjs');
   fs.mkdirSync(hooksDir, { recursive: true });
   fs.writeFileSync(forwarderPath, cursorForwarderSource(root));
   fs.writeFileSync(outputHookPath, cursorOutputSavingsSource(root));
+  fs.writeFileSync(guardPath, cursorPromptGuardSource(root));
+  fs.writeFileSync(readGuardPath, cursorReadGuardSource(root));
   const ours = { command: 'node .cursor/hooks/warm-code-index.mjs', timeout: 600 };
   const outputHook = { command: 'node .cursor/hooks/output-savings.mjs', timeout: 20 };
+  const guardHook = { command: 'node .cursor/hooks/prompt-guard.mjs', timeout: 10 };
+  const readHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: '^Read$', timeout: 10 };
   let cfg = { version: 1, hooks: {} };
   if (fs.existsSync(hooksJson)) {
     try {
@@ -312,7 +470,9 @@ export function rewriteCursorHooks(root) {
     cfg.hooks[key] = cfg.hooks[key].filter(h => !isCodeIndexHookRef(h?.command));
   }
   cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
+  cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
   cfg.hooks.afterAgentResponse = [outputHook, ...(cfg.hooks.afterAgentResponse || [])];
+  cfg.hooks.preToolUse = [readHook, ...(cfg.hooks.preToolUse || [])];
   fs.writeFileSync(hooksJson, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[${path.basename(root)}] Cursor hooks 已按当前模块重写(其他钩子保留)`);
 }
@@ -326,11 +486,11 @@ function isOurZcodeHook(h) {
   return refs.some(isCodeIndexHookRef);
 }
 
-function dropCodeIndexZcodeHooks(groups) {
+function dropHookGroups(groups, isOurs) {
   const kept = [];
   for (const g of groups || []) {
     if (!g || typeof g !== 'object' || !Array.isArray(g.hooks)) { kept.push(g); continue; }
-    const hooks = g.hooks.filter(h => !isOurZcodeHook(h));
+    const hooks = g.hooks.filter((h) => !isOurs(h));
     if (hooks.length) kept.push({ ...g, hooks });
   }
   return kept;
@@ -345,6 +505,7 @@ export function rewriteZcodeHooks(root) {
   const autoAbs = path.join(here, 'auto.mjs');
   const commitRefreshAbs = path.join(here, 'commit-refresh.mjs');
   const promptGuardAbs = path.join(here, 'prompt-guard.mjs');
+  const readGuardAbs = path.join(here, 'read-guard.mjs');
   let zc = { hooks: { enabled: true, events: {} } };
   if (fs.existsSync(zcodePath)) {
     try {
@@ -360,31 +521,106 @@ export function rewriteZcodeHooks(root) {
   const events = zc.hooks.events && typeof zc.hooks.events === 'object' && !Array.isArray(zc.hooks.events) ? zc.hooks.events : {};
   zc.hooks.events = events;
   for (const key of Object.keys(events)) {
-    if (Array.isArray(events[key])) events[key] = dropCodeIndexZcodeHooks(events[key]);
+    if (Array.isArray(events[key])) events[key] = dropHookGroups(events[key], isOurZcodeHook);
   }
   const push = (name, group) => { events[name] = [...(Array.isArray(events[name]) ? events[name] : []), group]; };
   push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(autoAbs, 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地检索模型')] });
   push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(commitRefreshAbs, 10000, '提交后索引保鲜')] });
   push('UserPromptSubmit', { hooks: [zcodeProcess(promptGuardAbs, 10000, '模型变更检测')] });
+  push('PreToolUse', { matcher: '^Read$', hooks: [zcodeProcess(readGuardAbs, 10000, '超行数全量 Read 拦截')] });
   fs.mkdirSync(path.dirname(zcodePath), { recursive: true });
   fs.writeFileSync(zcodePath, JSON.stringify(zc, null, 2) + '\n');
   ok(`[${path.basename(root)}] ZCode hooks 已按当前模块重写(其他钩子保留)`);
 }
 
+function qoderWrapSource(root, scriptName, eventName) {
+  const hooksDir = path.join(root, '.qoder', 'hooks');
+  return hookScript(hooksDir, scriptName, `Qoder ${eventName}: 转发 ${scriptName},把 additionalContext 包成 hookSpecificOutput。`, `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
+let out = ''
+child.stdout.on('data', (d) => { out += d })
+child.on('error', () => process.exit(0))
+child.on('exit', (code) => {
+  try {
+    const j = JSON.parse(String(out).trim() || '{}')
+    const ctx = j.additionalContext || j.hookSpecificOutput && j.hookSpecificOutput.additionalContext
+    if (ctx) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: ${JSON.stringify(eventName)}, additionalContext: ctx } }))
+  } catch { /* 无 JSON 则静默 */ }
+  process.exit(code || 0)
+})
+`);
+}
+
+function qoderPassthroughSource(root, scriptName) {
+  const hooksDir = path.join(root, '.qoder', 'hooks');
+  return hookScript(hooksDir, scriptName, `Qoder: 转发 ${scriptName}。stdout 保持空。`, `const child = spawn(process.execPath, [entry], { stdio: 'inherit', windowsHide: true })
+child.on('error', () => process.exit(0))
+child.on('exit', (code) => process.exit(code || 0))
+`);
+}
+
+function qoderCmd(rel, timeoutSec, statusMessage) {
+  return { type: 'command', command: 'node ' + rel, timeout: timeoutSec, statusMessage };
+}
+
+/**
+ * 每次卸掉本模块的 Qoder 钩子再按当前脚本路径写回(.qoder/settings.json)。
+ * 其他事件、其他钩子保留。JSON 解析失败则只重写转发器。
+ */
+export function rewriteQoderHooks(root) {
+  const settingsPath = path.join(root, '.qoder', 'settings.json');
+  const hooksDir = path.join(root, '.qoder', 'hooks');
+  fs.mkdirSync(hooksDir, { recursive: true });
+  fs.writeFileSync(path.join(hooksDir, 'session-start.mjs'), qoderWrapSource(root, 'auto.mjs', 'SessionStart'));
+  fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), qoderWrapSource(root, 'prompt-guard.mjs', 'UserPromptSubmit'));
+  fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), qoderPassthroughSource(root, 'commit-refresh.mjs'));
+  fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), qoderReadGuardSource(root));
+  let cfg = { hooks: {} };
+  if (fs.existsSync(settingsPath)) {
+    try {
+      cfg = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch (e) {
+      console.error(`  [warn] [${path.basename(root)}] .qoder/settings.json 解析失败,未改 JSON(${e.message});转发器已按当前模块重写`);
+      return;
+    }
+  }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
+  const hooks = cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks) ? cfg.hooks : {};
+  cfg.hooks = hooks;
+  for (const key of Object.keys(hooks)) {
+    if (Array.isArray(hooks[key])) hooks[key] = dropHookGroups(hooks[key], (h) => isCodeIndexHookRef(h?.command));
+  }
+  const prepend = (name, group) => { hooks[name] = [group, ...(Array.isArray(hooks[name]) ? hooks[name] : [])]; };
+  prepend('SessionStart', { hooks: [qoderCmd('.qoder/hooks/session-start.mjs', 420, '索引保鲜检查+预热本地检索模型')] });
+  prepend('PostToolUse', { matcher: 'Bash|Shell', hooks: [qoderCmd('.qoder/hooks/commit-refresh.mjs', 10, '提交后索引保鲜')] });
+  prepend('UserPromptSubmit', { hooks: [qoderCmd('.qoder/hooks/prompt-guard.mjs', 10, '模型变更检测')] });
+  prepend('PreToolUse', { matcher: '^Read$', hooks: [qoderCmd('.qoder/hooks/read-guard.mjs', 10, '超行数全量 Read 拦截')] });
+  fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
+  ok(`[${path.basename(root)}] Qoder hooks 已按当前模块重写(其他钩子保留)`);
+}
+
 if (directRun) {
+const hookArg = parseInitArgs(args).hooks;
+const hookTools = resolveHookTargets(hookArg);
+{
+  const detected = detectAgent();
+  if (hookArg) ok(`hooks = ${hookTools.join(',')} (--hooks)`);
+  else if (detected) ok(`检测到当前为 ${detected},只接线该工具 hooks(其余可用 --hooks all 或 --hooks <名>)`);
+  else ok('未识别当前 agent,接线 Cursor/ZCode/Qoder(可用 --hooks 指定)');
+}
 log(`\n[4/5]+[5/5] 对每个 git 仓库 root 接线会话 hook + AGENTS.md 检索纪律`);
 
-/** 给一个 git 仓库根接线:.zcode hook、.cursor 转发器、AGENTS.md 纪律段 */
+/** 给一个 git 仓库根接线选中的 editor hook、AGENTS.md 纪律段 */
 function wireRepo(root) {
-  rewriteZcodeHooks(root);
-  rewriteCursorHooks(root);
+  if (hookTools.includes('zcode')) rewriteZcodeHooks(root);
+  if (hookTools.includes('cursor')) rewriteCursorHooks(root);
+  if (hookTools.includes('qoder')) rewriteQoderHooks(root);
   const agentsPath = path.join(root, 'AGENTS.md');
   const MARK_V2 = '<!-- code-index:v2 -->';
   const rel = path.relative(root, here).split(path.sep).join('/');
   const dataRel = path.relative(root, DATA_DIR).split(path.sep).join('/');
   const searchCmd = PACKED_INSTALL
-    ? 'npx tokensaver search <中英文关键词> --rerank --k 5'
-    : 'cd ' + rel + ' && node search.mjs <中英文关键词> --rerank --k 5';
+    ? 'npx tokensaver search <中英文关键词> --k 5'
+    : 'cd ' + rel + ' && node search.mjs <中英文关键词> --k 5';
   const statusCmd = PACKED_INSTALL ? 'npx tokensaver status' : 'node ' + rel + '/status.mjs';
   const autoCmd = PACKED_INSTALL ? 'npx tokensaver auto' : 'cd ' + rel + ' && node auto.mjs';
   const rebuildCmd = PACKED_INSTALL
@@ -398,8 +634,8 @@ function wireRepo(root) {
   const P = (n, t) => n + '. ' + t;
   const items = [
     P(1, '**全局背景**:先读 `' + dataRel + '/CODE_MAP.md`(架构速查模板,随使用逐步充实;或自行维护项目架构说明)'),
-    P(2, '**无条件先走索引**:任何定位/阅读/修改代码的任务,动手前必须先执行至少一次 `' + searchCmd + '`——**即使任务已给出 file:行号也要先检索核对**(行号会漂移,以检索结果为准;`--json` 供程序消费);Grep 只能作为索引之后的补充'),
-    P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间;定位阶段禁止未检索就整文件通读 500 行以上的大文件;**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
+    P(2, '**无条件先走索引**:定位/阅读/修改代码前先执行至少一次 `' + searchCmd + '`(默认混合检索,**不要加 --rerank**,精排要加载 reranker 会拖慢会话)。即使已有 file:行号也先检索核对;Grep 作补充。确需精排时再手动加 `--rerank`'),
+    P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 会被钩子拦截,改走检索+区间读;同一文件 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
     P(4, pathHint),
     P(5, '**模型状态提示(原样转达一句)**:会话开始后先运行 `' + statusCmd + '`,把输出的那一句 ⚙ 原样附在每次回复末尾。该句只含三项:是否启动成功、嵌入模型名与精排模型名、失败时的最可能原因或成功时今日已节约的 tokens(每天 24:00 清零)。不要加长、不要改写;没有这句输出时不得虚构'),
     P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/code-index.config.json` 的 knownAnnotations 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后校验 JSON 合法'),
@@ -455,7 +691,7 @@ function upsertPonytail(agentsPath) {
 
 // 宿主仓库 + config 实际生效的每个 root(去重);root 不是 git 仓库(纯目录)则只索引不接线
 const effRoots = (() => {
-  try { return JSON.parse(fs.readFileSync(configPath, 'utf8')).roots || []; }
+  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8')).roots || []; }
   catch { return []; }
 })();
 const wireRoots = [...new Set([repoRoot, ...effRoots.map(r => path.resolve(r))])];

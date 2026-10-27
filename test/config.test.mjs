@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { isInsideNodeModules, resolveLayout } from './config.mjs';
+import { DEFAULT_CONFIG, isInsideNodeModules, resolveLayout } from '../code-index/config.mjs';
+
+assert.equal(DEFAULT_CONFIG.readMaxLines, 500);
 
 assert.equal(isInsideNodeModules(path.join('D:', 'proj', 'scripts', 'code-index')), false);
 assert.equal(isInsideNodeModules(path.join('D:', 'proj', 'node_modules', '@dionfang', 'tokensaver')), true);
@@ -37,6 +39,16 @@ const packed = resolveLayout({
 assert.equal(packed.packed, true);
 assert.equal(packed.dataDir, path.join('D:', 'proj', 'scripts', 'data'));
 assert.equal(packed.hfCacheDir, path.join('C:', 'Users', 'me', '.tokensaver', 'hf-cache'));
+
+const hubFromOtherCwd = resolveLayout({
+  moduleDir: path.join('D:', 'HbuilderX-Project', 'TokenSaver', 'code-index'),
+  cwd: path.join('D:', 'HbuilderX-Project', 'yiwu-processing-platform'),
+  env: {},
+  homedir: path.join('C:', 'Users', 'me'),
+  gitRoot: path.join('D:', 'HbuilderX-Project', 'yiwu-processing-platform'),
+});
+assert.equal(hubFromOtherCwd.packed, false);
+assert.equal(hubFromOtherCwd.dataDir, path.join('D:', 'HbuilderX-Project', 'TokenSaver', 'data'));
 
 const overridden = resolveLayout({
   moduleDir: path.join('D:', 'proj', 'node_modules', '@dionfang', 'tokensaver'),

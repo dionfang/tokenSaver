@@ -5,12 +5,15 @@ TokenSaver 直接部署
 用 local 时不需要 Ollama。模型名改本目录 config.mjs。
 Ollama 模型不随本目录复制。transformers.js 两个 local 模型在本目录 hf-cache(约 439MB),请一起复制。
 
-复制本目录到目标项目 scripts\code-index,在该目录执行:
+作为独立工具(推荐):在 TokenSaver\code-index 执行 init。数据写在 TokenSaver\data,不写进业务仓。
+  node init.mjs --roots "D:/业务仓A,D:/业务仓B"
+以后改 data\code-index.config.json 的 roots,再跑一次不带参数的:
   node init.mjs
-默认嵌入路径 local。改走 Ollama:
-  node init.mjs --model-in ollama
+即可把新目录编进索引并给那些 git 仓挂钩子。
 
-init 会安装依赖、写配置、接线 hook,并后台建索引+预热。确认就绪: node status.mjs
+也可把本目录复制到目标项目(建议 scripts\code-index),数据则在与本目录平级的 data\。若本目录本身就是 git 根,则写在本目录 data\。可用环境变量 CODE_INDEX_DATA_DIR 改位置。npm 安装固定用仓库 scripts\data。
+
+init 会安装依赖、写配置、接线当前 agent 的 hook(认不出则 Cursor/ZCode/Qoder 都接),并后台建索引+预热。确认就绪: node status.mjs
 
 从 GitCode 拉源码后同样只跑 init:
   git clone https://gitcode.com/dionfang/TokenSaver.git
@@ -19,21 +22,26 @@ init 会安装依赖、写配置、接线 hook,并后台建索引+预热。确�
 
 复制细节
 
-1. 复制的是本目录(到目标项目建议放在 scripts\code-index)。
+1. 复制的是本目录。可放在项目任意位置,建议 scripts\code-index。
    必须带上 hf-cache(两个 local 模型)。不要带 node_modules,不要带 data\。
 2. 在该目录执行:
-   node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local]
+   node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
 3. 确认是否就绪: node status.mjs
 
 init 会写配置并安装依赖。
-参数名写错、缺少取值,或 --model-in 不是 ollama/local 时,报错退出且不改配置。
+参数名写错、缺少取值,或 --model-in / --hooks 取值非法时,报错退出且不改配置。
 --roots=路径 与 --model-in=local 这种写法也可以。
 
 --roots
-  逗号分隔的扫描目录,写入 scripts/data/code-index.config.json。路径用 D:/proj 或 D:\proj。
-  不传且还没有配置:用当前 git 根。
-  不传且已有配置:保留本机上还在的路径。
-  传入:用这次的列表覆盖 roots,其他键保留。
+  逗号分隔的扫描目录,写入本工具仓 data\code-index.config.json。路径用 D:/proj 或 D:\proj。
+  不传且还没有配置:用工具仓 git 根。
+  不传且已有配置:按文件里的 roots 自愈(仍存在的保留,失踪的按兄弟目录猜一次),不把工具仓自己塞进名单;然后给这些 git 仓挂钩子并后台建索引。
+  传入:与已有 roots 合并(纳入,不去掉旧的)。不存在的路径跳过。要删目录请改 JSON 后重跑不带参的 init。
+
+--hooks
+  all | cursor | zcode | qoder。只写选中工具的会话 hook,不改其他工具已有文件。
+  不传:能从环境变量认出当前 agent 就只装那一套(Cursor: CURSOR_AGENT;Qoder/ZCode: 各自 PROJECT_DIR)。
+  认不出(例如系统终端里跑):三套都装。
 
 --model-in
   ollama 或 local。写入 modelIn,不改模型名。
@@ -56,13 +64,14 @@ init 会写配置并安装依赖。
   OLLAMA_KEEP_ALIVE       默认 2h
   OLLAMA_NUM_CTX          默认 4096
 
-项目配置在仓库 scripts\data\code-index.config.json(可用环境变量 CODE_INDEX_DATA_DIR 改位置)。未写的键用 config.mjs 的默认值。
+项目配置在与本目录平级的 data\code-index.config.json(建议路径下即 scripts\data;可用环境变量 CODE_INDEX_DATA_DIR 改位置)。未写的键用 config.mjs 的默认值。
   roots              扫描目录。--roots > 环境变量 CODE_INDEX_ROOTS > 本文件
   modelIn            ollama | local。--model-in > 本文件 > local
   skipDirs           跳过的目录名。写了就整表替换,不是追加
   exts               收录的扩展名,不带点
   jsonWhitelist      允许收录的 json 文件名。默认 package.json、pages.json、manifest.json、tsconfig.json
   maxFileBytes       单文件上限。默认 819200
+  readMaxLines       全量 Read 行数上限,默认 500。超过 ×1.25 由 Cursor preToolUse / ZCode·Qoder PreToolUse 拦截;带 offset/limit 的区间读不受限。同一文件 5 分钟内重试一次即放行。设很大等于关掉。
   chunk              targetLines 70,maxLines 120,overlapLines 10,minTail 15
   staleNonGitMs      非 git 目录多久重建一次,毫秒。默认 86400000
   knownAnnotations   "项目名/相对路径" → 一句职责

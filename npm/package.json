@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "prepack": "node ../sync-npm.mjs",
-    "test": "node ../code-index/config.test.mjs"
+    "test": "node ../test/config.test.mjs && node ../test/init.test.mjs && node ../test/ollamaGuard.test.mjs && node ../test/read-guard.test.mjs"
   },
   "repository": {
     "type": "git",

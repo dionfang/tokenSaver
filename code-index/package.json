@@ -8,7 +8,8 @@
     "build": "node build.mjs",
     "embed": "node embed.mjs",
     "search": "node search.mjs",
-    "test": "node config.test.mjs && node init.test.mjs"
+    "test": "node ../test/config.test.mjs && node ../test/init.test.mjs && node ../test/ollamaGuard.test.mjs && node ../test/read-guard.test.mjs && node ../test/gen-questions.test.mjs",
+    "regress": "node ../test/regress.mjs --suite"
   },
   "repository": {
     "type": "git",

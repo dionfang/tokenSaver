@@ -13,6 +13,12 @@ export function activeBackend() {
   return loadConfig().modelIn === 'local' ? 'local' : 'ollama';
 }
 
+/** 当前路径要嵌入的模型名(local 用 jina,ollama 用 config.models.embedding)。 */
+export function wantEmbedModel(cfg = loadConfig()) {
+  const backend = activeBackend();
+  return { backend, model: backend === 'local' ? cfg.models.localEmbedding : cfg.models.embedding };
+}
+
 export function vectorPaths(backend) {
   const name = backend === 'local' ? 'local' : 'ollama';
   const dir = path.join(DATA_DIR, 'vectors', name);

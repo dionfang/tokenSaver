@@ -13,13 +13,13 @@ import { ollamaProcessesRunning, resolveBase } from './ollamaGuard.mjs';
 import { localOnnxCached } from './localRerank.mjs';
 import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from './vectorStore.mjs';
 import { residentHealth } from './localResident.mjs';
+import { pidAlive, LOCK_TTL_MS } from './proc.mjs';
 import { countTokens } from 'token-estimator';
 
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
 const IDX_PATH = path.join(DATA_DIR, 'index.json');
 const PIDFILE = path.join(DATA_DIR, '.embed.pid');
 const SAVINGS_PATH = path.join(DATA_DIR, 'session-savings.json');
-const PID_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKENS_PER_LINE = 8;
 /** 返回文本约占原来总数的 67.4%,节约约占 32.6%。只供状态句。 */
 const AGENT_OUTPUT_SHARE = 0.674;
@@ -28,15 +28,10 @@ function fileReady(p) {
   try { return fs.statSync(p).size > 0; } catch { return false; }
 }
 
-function pidAlive(pid) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
-}
-
 function readEmbedPid() {
   try {
     const prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8'));
-    if (pidAlive(prev.pid) && Number.isFinite(prev.ts) && Date.now() - prev.ts < PID_TTL_MS) return prev.pid;
+    if (pidAlive(prev.pid) && Number.isFinite(prev.ts) && Date.now() - prev.ts < LOCK_TTL_MS) return prev.pid;
   } catch { /* 无 pidfile */ }
   return null;
 }

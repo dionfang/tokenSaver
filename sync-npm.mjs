@@ -12,7 +12,7 @@ const root = path.dirname(fileURLToPath(import.meta.url))
 const srcDir = path.join(root, 'code-index')
 const npmDir = path.join(root, 'npm')
 const KEEP = new Set(['package.json', 'README.md', '.gitignore'])
-const SKIP_SRC = new Set(['config.test.mjs', 'init.test.mjs', 'cli.mjs'])
+const SKIP_SRC = new Set(['cli.mjs'])
 
 fs.mkdirSync(npmDir, { recursive: true })
 
@@ -36,7 +36,7 @@ npmPkg.engines = srcPkg.engines
 fs.writeFileSync(npmPkgPath, JSON.stringify(npmPkg, null, 2) + '\n')
 
 for (const n of fs.readdirSync(srcDir)) {
-  if (SKIP_SRC.has(n)) continue
+  if (SKIP_SRC.has(n) || n.endsWith('.test.mjs') || n === 'regress.mjs') continue
   if (n.endsWith('.mjs') || n === 'ponytail.md') copy(n)
 }
 

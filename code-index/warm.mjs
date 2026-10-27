@@ -11,10 +11,11 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureOllama, resolveBase, gpuOptions, resolveGpuMode, ensureModelPlacement } from './ollamaGuard.mjs';
+import { ensureOllama, resolveBase, gpuOptions, resolveGpuMode, ensureModelPlacement, releaseReplacedOllamaModels, rememberWarmedModels } from './ollamaGuard.mjs';
 import { loadConfig, DATA_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
-import { ensureLocalResident } from './localResident.mjs';
+import { ensureLocalResident, stopLocalResident } from './localResident.mjs';
+import { pidAlive } from './proc.mjs';
 
 const cfg = loadConfig();
 const MODELS_CFG = cfg.models;
@@ -24,9 +25,7 @@ const base = resolveBase();
 function embedBusy() {
   try {
     const prev = JSON.parse(fs.readFileSync(path.join(DATA_DIR, '.embed.pid'), 'utf8'));
-    const pid = Number(prev.pid);
-    if (!Number.isFinite(pid) || pid <= 0) return false;
-    try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+    return pidAlive(Number(prev.pid));
   } catch { return false; }
 }
 
@@ -54,14 +53,20 @@ if (backend === 'local') {
     if (rerankOk) console.error(`[ok] ${MODELS_CFG.localReranker} 已留在常驻进程`);
     else console.error(`[fail] local 精排模型拉起失败,精排将跳过`);
   }
+  if (embedOk && rerankOk) {
+    await releaseReplacedOllamaModels([], console.error);
+    rememberWarmedModels({ backend: 'local', embedding: MODELS_CFG.localEmbedding, reranker: MODELS_CFG.localReranker });
+  }
 } else {
   const g = await ensureOllama({ base, onInfo: console.error });
   if (!g.up) {
     console.error('[fail] Ollama 嵌入路径不可用(不自动拉起服务,也不改换 local),检索将降级 bm25');
     process.exit(1);
   }
+  await stopLocalResident();
   const gpu = resolveGpuMode();
   console.error(`[gpu] ${gpu.reason}`);
+  await releaseReplacedOllamaModels([MODELS_CFG.embedding, MODELS_CFG.reranker], console.error);
   await ensureModelPlacement([MODELS_CFG.embedding, MODELS_CFG.reranker], console.error);
   try {
     const e = await fetch(`${base}/api/embed`, {
@@ -85,6 +90,9 @@ if (backend === 'local') {
     console.error(r.ok ? `[ok] ${MODELS_CFG.reranker} 已加载(${gpu.mode.toUpperCase()})`
       : `[warn] 精排模型预热失败 HTTP ${r.status}${r.status === 404 ? `(${MODELS_CFG.reranker} 未安装,请手工执行: ollama pull ${MODELS_CFG.reranker})` : ''}`);
   } catch (e) { console.error('[warn] 精排模型预热异常:', e.message); }
+  if (embedOk && rerankOk) {
+    rememberWarmedModels({ backend: 'ollama', embedding: MODELS_CFG.embedding, reranker: MODELS_CFG.reranker });
+  }
 }
 
 console.error(`[done] 预热完成,耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);

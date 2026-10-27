@@ -7,10 +7,10 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR, HF_CACHE_DIR, loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
+import { pidAlive, spawnLogged } from './proc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(DATA_DIR, '.local-resident.json');
@@ -25,11 +25,6 @@ function keepAliveMs(text) {
   if (m[2] === 'h') return n * 60 * 60 * 1000;
   if (m[2] === 'm') return n * 60 * 1000;
   return n * 1000;
-}
-
-function pidAlive(pid) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
 }
 
 function readStateFile() {
@@ -133,17 +128,7 @@ export async function stopLocalResident() {
 }
 
 function startDetached() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const logFd = fs.openSync(LOG_PATH, 'a');
-  const child = spawn(process.execPath, [path.join(here, 'localResident.mjs')], {
-    cwd: here,
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-    windowsHide: true,
-  });
-  child.unref();
-  fs.closeSync(logFd);
-  return child.pid;
+  return spawnLogged(path.join(here, 'localResident.mjs'), LOG_PATH, here).pid;
 }
 
 /** 保证与当前 config 模型一致的常驻进程在跑。返回 /health;超时或失败为 null。 */
