@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, rewriteCursorHooks, rewriteQoderHooks, rewriteZcodeHooks, splitRoots, mergeRoots, healRoots } from '../code-index/init.mjs';
+import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, rewriteCursorHooks, rewriteQoderHooks, rewriteZcodeHooks, splitRoots, mergeRoots, healRoots, rollKnownAnnotations } from '../code-index/init.mjs';
 
 assert.equal(parseInitArgs([]).modelIn, null);
 assert.equal(parseInitArgs(['--model-in', 'local']).modelIn, 'local');
@@ -13,6 +13,11 @@ assert.equal(parseInitArgs(['--roots', 'D:/a']).roots, 'D:/a');
 assert.deepEqual(splitRoots('D:/a, D:/b'), ['D:/a', 'D:/b']);
 assert.deepEqual(mergeRoots(['D:/a'], ['D:/a', 'D:/b']), mergeRoots(['D:/a'], ['D:/b']));
 assert.equal(mergeRoots(['D:/a'], ['D:/b']).length, 2);
+
+assert.deepEqual(rollKnownAnnotations({ 'p/a.ts': '注解' }, true), {});
+assert.deepEqual(rollKnownAnnotations({ 'p/a.ts': '注解' }, false), { 'p/a.ts': '注解' });
+assert.deepEqual(rollKnownAnnotations(undefined, false), {});
+assert.deepEqual(rollKnownAnnotations('坏数据', true), {});
 {
   const exists = (p) => String(p).replace(/\\/g, '/') === 'D:/keep';
   assert.deepEqual(healRoots(['D:/keep', 'D:/gone'], { exists, siblingOf: 'D:/sib' }), ['D:/keep']);
@@ -47,6 +52,8 @@ assert.equal(isCodeIndexHookRef('.cursor/hooks/prompt-guard.mjs'), true);
 assert.equal(isCodeIndexHookRef('.cursor/hooks/read-guard.mjs'), true);
 assert.equal(isCodeIndexHookRef('.qoder/hooks/session-start.mjs'), true);
 assert.equal(isCodeIndexHookRef('.qoder/hooks/read-guard.mjs'), true);
+assert.equal(isCodeIndexHookRef('node .qoder/hooks/session-start.mjs'), true);
+assert.equal(isCodeIndexHookRef('node .qoder/hooks/commit-refresh.mjs'), true);
 assert.equal(isCodeIndexHookRef('src/utils/auto.mjs'), false);
 
 const copiedGi = gitignoreEntries({
@@ -82,18 +89,32 @@ assert.equal(cursorCfg.hooks.preToolUse[0].command, 'node .cursor/hooks/read-gua
 assert.equal(cursorCfg.hooks.preToolUse[0].matcher, '^Read$');
 assert.ok(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'warm-code-index.mjs')));
 assert.ok(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'read-guard.mjs')));
+cursorCfg.hooks.afterAgentResponse = [{ command: 'node .cursor/hooks/output-savings.mjs', timeout: 20 }];
+fs.writeFileSync(path.join(hookDir, '.cursor', 'hooks.json'), JSON.stringify(cursorCfg, null, 2) + '\n');
+fs.writeFileSync(path.join(hookDir, '.cursor', 'hooks', 'output-savings.mjs'), 'stale\n');
 rewriteCursorHooks(hookDir);
 const cursorCfg2 = JSON.parse(fs.readFileSync(path.join(hookDir, '.cursor', 'hooks.json'), 'utf8'));
 assert.equal(cursorCfg2.hooks.preToolUse.filter((h) => String(h.command || '').includes('read-guard')).length, 1);
+assert.equal(cursorCfg2.hooks.afterAgentResponse, undefined);
+assert.equal(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'output-savings.mjs')), false);
 rewriteQoderHooks(hookDir);
 const qoderCfg = JSON.parse(fs.readFileSync(path.join(hookDir, '.qoder', 'settings.json'), 'utf8'));
 assert.equal(qoderCfg.hooks.SessionStart[0].hooks[0].command, 'node .qoder/hooks/session-start.mjs');
 assert.equal(qoderCfg.hooks.PreToolUse[0].matcher, '^Read$');
 assert.equal(qoderCfg.hooks.PreToolUse[0].hooks[0].command, 'node .qoder/hooks/read-guard.mjs');
 assert.ok(fs.existsSync(path.join(hookDir, '.qoder', 'hooks', 'read-guard.mjs')));
+qoderCfg.hooks.Stop = [{ hooks: [{ type: 'command', command: 'node .qoder/hooks/output-savings.mjs', timeout: 10 }] }];
+fs.writeFileSync(path.join(hookDir, '.qoder', 'settings.json'), JSON.stringify(qoderCfg, null, 2) + '\n');
+fs.writeFileSync(path.join(hookDir, '.qoder', 'hooks', 'output-savings.mjs'), 'stale\n');
 rewriteQoderHooks(hookDir);
 const qoderCfg2 = JSON.parse(fs.readFileSync(path.join(hookDir, '.qoder', 'settings.json'), 'utf8'));
 assert.equal(qoderCfg2.hooks.PreToolUse.filter((g) => (g.hooks || []).some((h) => String(h.command || '').includes('read-guard'))).length, 1);
+assert.equal(qoderCfg2.hooks.SessionStart.length, 1);
+assert.equal(qoderCfg2.hooks.PostToolUse.length, 1);
+assert.equal(qoderCfg2.hooks.UserPromptSubmit.length, 1);
+assert.equal(qoderCfg2.hooks.PreToolUse.length, 1);
+assert.equal(qoderCfg2.hooks.Stop, undefined);
+assert.equal(fs.existsSync(path.join(hookDir, '.qoder', 'hooks', 'output-savings.mjs')), false);
 rewriteZcodeHooks(hookDir);
 const zcodeCfg = JSON.parse(fs.readFileSync(path.join(hookDir, '.zcode', 'config.json'), 'utf8'));
 assert.equal(zcodeCfg.hooks.events.PreToolUse[0].matcher, '^Read$');

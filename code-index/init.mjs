@@ -121,6 +121,12 @@ export function splitRoots(raw) {
   return String(raw || '').split(',').map((s) => s.trim()).filter(Boolean);
 }
 
+/** 注解保留策略:roots 实际变化时旧注解可能指向已剔除的目录,整表重置;--roots 未变或未传则增量保留。 */
+export function rollKnownAnnotations(prev, rootsChanged) {
+  if (!prev || typeof prev !== 'object' || Array.isArray(prev)) return {};
+  return rootsChanged ? {} : prev;
+}
+
 function posixAbs(p) {
   return path.resolve(p).split(path.sep).join('/');
 }
@@ -207,11 +213,16 @@ if (configExisted) {
     roots = mergeRoots(cfgOld.roots || [], added);
     if (JSON.stringify(roots) !== JSON.stringify(cfgOld.roots || [])) {
       cfgOld.roots = roots;
+      const prevAnn = cfgOld.knownAnnotations;
+      cfgOld.knownAnnotations = rollKnownAnnotations(prevAnn, true);
+      if (prevAnn && typeof prevAnn === 'object' && !Array.isArray(prevAnn) && Object.keys(prevAnn).length) {
+        ok(`roots 已变化,knownAnnotations 整表重置(${Object.keys(prevAnn).length} 条旧注解只对原 roots 有效)`);
+      }
       dirty = true;
       ok(`已纳入 roots = ${JSON.stringify(roots)}`);
     } else {
       roots = cfgOld.roots || [];
-      ok(`roots 未变化 ${JSON.stringify(roots)}`);
+      ok(`roots 未变化,knownAnnotations 增量保留 ${JSON.stringify(roots)}`);
     }
   } else {
     roots = healRoots(cfgOld.roots || [], {
@@ -251,7 +262,7 @@ if (configExisted) {
   } else {
     roots = [hostRoot];
   }
-  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。';
+  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。knownAnnotations: 首装为空;init --roots 使 roots 变化时整表重置,--roots 未变或未传则原样保留,由深挖后手工追加。';
   const skipDirs = [...new Set([...DEFAULT_CONFIG.skipDirs, path.basename(here), 'code-index', '.cursor', '.zcode', '.qoder'])];
   fs.writeFileSync(configPath, JSON.stringify({
     $说明: desc,
@@ -350,7 +361,8 @@ function ensureGitignore(root, entries) {
 export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
   if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard)\.mjs$/.test(s)) return true;
-  if (/(?:^|\/)\.qoder\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
+  // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
+  if (/(?:^|[\s/"'])\.qoder\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const names = 'auto|commit-refresh|prompt-guard|read-guard|warm|output-savings';
   if (new RegExp(`(?:^|/)(?:code-index|tokensaver|${dir})/(?:${names})\\.mjs$`).test(s)) return true;
@@ -380,12 +392,6 @@ function cursorForwarderSource(root) {
   const hooksDir = path.join(root, '.cursor', 'hooks');
   const body = `const child = spawn(process.execPath, [entry], { stdio: ['ignore', 'ignore', 'inherit'], windowsHide: true })\nchild.on('error', (err) => { console.error('[fail] 无法启动 code-index:', err.message); process.exit(0) })\nchild.on('exit', () => process.exit(0))\n`;
   return hookScript(hooksDir, 'auto.mjs', 'Cursor sessionStart: 转发到当前 code-index 的 auto.mjs。stdout 保持空。', body);
-}
-
-function cursorOutputSavingsSource(root) {
-  const hooksDir = path.join(root, '.cursor', 'hooks');
-  const body = `const child = spawn(process.execPath, [entry], { stdio: 'inherit', windowsHide: true })\nchild.on('error', () => process.exit(0))\nchild.on('exit', (code) => process.exit(code || 0))\n`;
-  return hookScript(hooksDir, 'output-savings.mjs', 'Cursor afterAgentResponse: 转发到 output-savings.mjs,沿用 stdin 里的 output_tokens。', body);
 }
 
 function cursorPromptGuardSource(root) {
@@ -446,11 +452,9 @@ export function rewriteCursorHooks(root) {
   const readGuardPath = path.join(hooksDir, 'read-guard.mjs');
   fs.mkdirSync(hooksDir, { recursive: true });
   fs.writeFileSync(forwarderPath, cursorForwarderSource(root));
-  fs.writeFileSync(outputHookPath, cursorOutputSavingsSource(root));
   fs.writeFileSync(guardPath, cursorPromptGuardSource(root));
   fs.writeFileSync(readGuardPath, cursorReadGuardSource(root));
   const ours = { command: 'node .cursor/hooks/warm-code-index.mjs', timeout: 600 };
-  const outputHook = { command: 'node .cursor/hooks/output-savings.mjs', timeout: 20 };
   const guardHook = { command: 'node .cursor/hooks/prompt-guard.mjs', timeout: 10 };
   const readHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: '^Read$', timeout: 10 };
   let cfg = { version: 1, hooks: {} };
@@ -471,8 +475,11 @@ export function rewriteCursorHooks(root) {
   }
   cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
   cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
-  cfg.hooks.afterAgentResponse = [outputHook, ...(cfg.hooks.afterAgentResponse || [])];
   cfg.hooks.preToolUse = [readHook, ...(cfg.hooks.preToolUse || [])];
+  for (const key of Object.keys(cfg.hooks)) {
+    if (Array.isArray(cfg.hooks[key]) && cfg.hooks[key].length === 0) delete cfg.hooks[key];
+  }
+  fs.rmSync(outputHookPath, { force: true });
   fs.writeFileSync(hooksJson, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[${path.basename(root)}] Cursor hooks 已按当前模块重写(其他钩子保留)`);
 }
@@ -594,6 +601,10 @@ export function rewriteQoderHooks(root) {
   prepend('PostToolUse', { matcher: 'Bash|Shell', hooks: [qoderCmd('.qoder/hooks/commit-refresh.mjs', 10, '提交后索引保鲜')] });
   prepend('UserPromptSubmit', { hooks: [qoderCmd('.qoder/hooks/prompt-guard.mjs', 10, '模型变更检测')] });
   prepend('PreToolUse', { matcher: '^Read$', hooks: [qoderCmd('.qoder/hooks/read-guard.mjs', 10, '超行数全量 Read 拦截')] });
+  for (const key of Object.keys(hooks)) {
+    if (Array.isArray(hooks[key]) && hooks[key].length === 0) delete hooks[key];
+  }
+  fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true });
   fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[${path.basename(root)}] Qoder hooks 已按当前模块重写(其他钩子保留)`);
 }

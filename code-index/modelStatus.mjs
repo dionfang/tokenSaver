@@ -21,8 +21,6 @@ const IDX_PATH = path.join(DATA_DIR, 'index.json');
 const PIDFILE = path.join(DATA_DIR, '.embed.pid');
 const SAVINGS_PATH = path.join(DATA_DIR, 'session-savings.json');
 const TOKENS_PER_LINE = 8;
-/** 返回文本约占原来总数的 67.4%,节约约占 32.6%。只供状态句。 */
-const AGENT_OUTPUT_SHARE = 0.674;
 
 function fileReady(p) {
   try { return fs.statSync(p).size > 0; } catch { return false; }
@@ -56,84 +54,37 @@ function readSavingsState() {
   try {
     const j = JSON.parse(fs.readFileSync(SAVINGS_PATH, 'utf8'));
     const sameDay = Number.isFinite(j.updatedAt) && localDay(j.updatedAt) === localDay(Date.now());
-    const savedTokens = sameDay && Number.isFinite(j.savedTokens) ? Math.max(0, Math.round(j.savedTokens)) : 0;
-    const seen = sameDay && j.outputByGeneration && typeof j.outputByGeneration === 'object' && !Array.isArray(j.outputByGeneration)
-      ? j.outputByGeneration
-      : {};
-    return { savedTokens, outputByGeneration: seen };
+    return sameDay && Number.isFinite(j.savedTokens) ? Math.max(0, Math.round(j.savedTokens)) : 0;
   } catch {
-    return { savedTokens: 0, outputByGeneration: {} };
+    return 0;
   }
 }
 
-function writeSavingsState(savedTokens, outputByGeneration) {
+function writeSavingsState(savedTokens) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(SAVINGS_PATH, JSON.stringify({
     savedTokens: Math.max(0, Math.round(savedTokens)),
     updatedAt: Date.now(),
-    outputByGeneration,
   }));
 }
 
-/** 按本机日期结算:每天 24:00 后从 0 重新累计。 */
+/** 按本机日期结算:每天 24:00 后从 0 重新累计。只含检索少读的输入侧。 */
 export function readSessionSavings() {
-  return readSavingsState().savedTokens;
+  return readSavingsState();
 }
 
 export function addSessionSavings(tokens) {
   const n = Math.round(tokens);
-  const state = readSavingsState();
-  if (!Number.isFinite(n) || n <= 0) return state.savedTokens;
-  try { writeSavingsState(state.savedTokens + n, state.outputByGeneration); } catch { /* 记账失败不影响检索 */ }
-  return state.savedTokens + n;
-}
-
-/** 大模型 API 的输出 token ÷ 67.4% × 32.6%。 */
-export function savingsFromOutputTokens(outputTokens) {
-  const n = Number(outputTokens);
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.round(n / AGENT_OUTPUT_SHARE * (1 - AGENT_OUTPUT_SHARE));
+  const saved = readSavingsState();
+  if (!Number.isFinite(n) || n <= 0) return saved;
+  try { writeSavingsState(saved + n); } catch { /* 记账失败不影响检索 */ }
+  return saved + n;
 }
 
 function chunkBody(text) {
   const raw = String(text || '');
   const nl = raw.indexOf('\n');
   return nl >= 0 ? raw.slice(nl + 1) : raw;
-}
-
-function textSeenKey(id, text) {
-  const s = String(text || '');
-  let h = 0;
-  for (let i = 0; i < s.length; i += 32) h = (h * 33 + s.charCodeAt(i)) >>> 0;
-  return `${id || 'text'}:${s.length}:${h}`;
-}
-
-/** API 给出 output_tokens 时用该数;没有时才用 token-estimator 数回复正文。同一轮累计值只记增量。 */
-export function addObservedOutputTokens(payload) {
-  const apiTokens = Number(payload?.output_tokens);
-  const fromApi = Number.isFinite(apiTokens) && apiTokens > 0;
-  const text = String(payload?.text || '');
-  const n = fromApi ? apiTokens : countTokens(text);
-  if (!Number.isFinite(n) || n <= 0) return readSessionSavings();
-  const id = String(payload?.generation_id || '');
-  const state = readSavingsState();
-  const map = { ...state.outputByGeneration };
-  let delta = n;
-  if (fromApi && id) {
-    const prev = Number(map[id]) || 0;
-    delta = Math.max(0, n - prev);
-    map[id] = Math.max(prev, n);
-  } else {
-    const key = textSeenKey(id, text);
-    if (map[key]) return state.savedTokens;
-    map[key] = n;
-  }
-  const keys = Object.keys(map);
-  while (keys.length > 40) delete map[keys.shift()];
-  if (delta <= 0) return state.savedTokens;
-  const savedTokens = state.savedTokens + savingsFromOutputTokens(delta);
-  try { writeSavingsState(savedTokens, map); } catch { /* 记账失败不影响检索 */ }
-  return savedTokens;
 }
 
 /** 用命中块代替整文件阅读的粗算:按命中正文的 token 密度外推同文件未读行。只供状态句,同一文件只计一次。 */
