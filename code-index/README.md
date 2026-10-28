@@ -1,5 +1,7 @@
 # TokenSaver 直接部署
 
+Use this directory as a standalone tool inside the TokenSaver repo, with index data in the parent `data/` folder. You can also copy it into a target project (suggested path `scripts/code-index`). Include `hf-cache/`, and leave out `node_modules` and `data`. The default embedding path is local transformers.js. `--model-in ollama` uses an Ollama you install, start, and pull models for yourself. `init` installs dependencies, writes config, attaches the current agent's hooks (all three if the agent cannot be detected), and builds the index in the background. Full-file reads over the line limit (default 500×1.25) are denied; reads with offset/limit are allowed, and one retry of the same file within five minutes is allowed. Hook errors fail open. Data is written beside this directory in `data/`. See `部署使用说明.txt` for the parameters.
+
 推荐在 **TokenSaver 本仓** 当独立工具用（数据在上一级 `data/`）：
 
 ```bash

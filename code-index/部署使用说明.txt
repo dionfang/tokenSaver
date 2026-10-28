@@ -1,5 +1,7 @@
 TokenSaver 直接部署
 
+Direct deploy. Requires Node.js >= 18 and git. Ollama, if used, must already be installed, started, and have its models pulled by you; this tool does not start the service or pull models. The local path needs no Ollama. Model names are set in config.mjs in this directory. Ollama weights are not copied with this directory. The two transformers.js models live in hf-cache (about 439MB) and should be copied along. Preferred: run init inside TokenSaver\code-index. Index data is written to TokenSaver\data, not into the repositories you index. You can also copy this directory into a target project (suggested scripts\code-index); data then sits in a sibling data\ directory. If this directory is itself the git root, data is written to data\ inside it. Override the location with CODE_INDEX_DATA_DIR. An npm install always uses the repo's scripts\data. init installs dependencies, writes config, attaches hooks for the current agent (Cursor, ZCode, and Qoder when it cannot tell which), and builds and warms the index in the background. Check readiness with node status.mjs.
+
 前提: Node.js >= 18、git。
 用 ollama 时,本机需已安装并自行启动 Ollama,并先手工 pull 模型。本工具不拉起服务,也不自动 pull。
 用 local 时不需要 Ollama。模型名改本目录 config.mjs。

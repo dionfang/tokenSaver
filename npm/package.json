@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": false,
   "type": "module",
-  "description": "TokenSaver 本地语义代码索引。Ollama 或 transformers.js,模型权重需本机自备。",
+  "description": "TokenSaver 本地语义代码索引。Ollama 或 transformers.js,模型权重需本机自备。 Local semantic code index that cuts coding-agent token use. Embeddings via transformers.js or Ollama; model weights stay on your machine.",
   "bin": {
     "tokensaver": "cli.mjs"
   },

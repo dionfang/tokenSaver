@@ -4,6 +4,8 @@
 
 运行时脚本、`cli.mjs`、`部署使用说明.txt` 都由仓库根 `sync-npm.mjs` 从 `code-index/` 生成。不要在这里改逻辑。
 
+This directory is only the npm publish skeleton (`package.json`, this README, and `.gitignore`). Runtime scripts, `cli.mjs`, and `部署使用说明.txt` are generated from `code-index/` by `sync-npm.mjs` at the repo root. Do not edit runtime logic here. To copy-deploy, copy `code-index/` from the repo, not this directory.
+
 ```bash
 cd npm
 npm publish --access public

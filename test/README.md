@@ -2,6 +2,8 @@
 
 不随 `code-index/` 复制部署，也不进 npm 包。npm 脚本写在 [`code-index/package.json`](../code-index/package.json)，**先进入该目录再跑**：
 
+These tests are not copied with `code-index/` and are not published in the npm package. The npm scripts live in `code-index/package.json`; change into that directory before running them.
+
 ```bash
 cd TokenSaver/code-index
 ```

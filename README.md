@@ -2,9 +2,13 @@
 
 ## 项目简介
 
-TokenSaver 是跑在本机的语义代码索引。编程 Agent 定位代码时，经常把整份文件读进上下文。本工具为代码库建索引，用混合检索返回 `文件:起始行-结束行`，Agent 只读这一段。
+TokenSaver 是跑在本机的语义代码索引。编程 Agent 定位代码时，经常把整份文件读进上下文。本工具为代码库建索引，用混合检索返回 `文件:起始行-结束行`，Agent 只读这一段，从而减少运行 Agent 时的 token 消耗。
 
 适合在 Cursor、Qoder、ZCode 里用 Agent 改本地代码库。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`，不进入 git。
+
+TokenSaver is a local semantic code index. Coding agents often pull entire files into context. This tool indexes the repository and uses hybrid search to return `file:start-end` spans, so the agent reads only that slice and spends fewer tokens while it runs.
+
+It is for Cursor, Qoder, and ZCode on local repositories. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
 ## 工作方式
 

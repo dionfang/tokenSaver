@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "TokenSaver 直接部署目录。复制到目标项目 scripts/code-index 后运行 node init.mjs。",
+  "description": "TokenSaver 直接部署目录。复制到目标项目 scripts/code-index 后运行 node init.mjs。 Direct-deploy directory. Copy to scripts/code-index in the target project and run node init.mjs.",
   "scripts": {
     "build": "node build.mjs",
     "embed": "node embed.mjs",
