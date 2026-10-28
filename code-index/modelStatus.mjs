@@ -243,9 +243,11 @@ export function renderModelStatus(p) {
       && p.rerankRunning === true
       && !p.embedPid
       && !p.indexError);
+  const reason = likelyReason(p, emb, rr);
+  const hint = reason.includes('未拉起') ? '。请重启会话或者 agent 恢复 TokenSaver服务' : '';
   const relay = healthy
-    ? `⚙ 本地模型已启动成功。${names}。本次会话今日已节约了 ${formatTokenCount(p.savedTokens)} tokens`
-    : `⚙ 本地模型未启动成功。${names}。最可能原因:${likelyReason(p, emb, rr)}`;
+    ? `⚙ TokenSaver服务已启动成功。${names}。本次会话今日已节约了 ${formatTokenCount(p.savedTokens)} tokens`
+    : `⚙ TokenSaver服务未启动成功。${names}。最可能原因:${reason}${hint}`;
   return { relay, detail: relay, healthy };
 }
 
