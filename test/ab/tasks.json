@@ -1,0 +1,10 @@
+{
+  "note": "Ponytail A/B 任务清单。work 相对仓库根目录，prompt 相对 test/ab。",
+  "tasks": [
+    { "id": "t1", "name": "wordcount", "prompt": "prompts/t1.md", "work": "data/ab/work/t1", "inputs": [] },
+    { "id": "t2", "name": "csv-stats", "prompt": "prompts/t2.md", "work": "data/ab/work/t2", "inputs": ["fixtures/inputs/t2/data.csv"] },
+    { "id": "t3", "name": "fib", "prompt": "prompts/t3.md", "work": "data/ab/work/t3", "inputs": [] },
+    { "id": "t4", "name": "deepClone", "prompt": "prompts/t4.md", "work": "data/ab/work/t4", "inputs": [] },
+    { "id": "t5", "name": "rle", "prompt": "prompts/t5.md", "work": "data/ab/work/t5", "inputs": [] }
+  ]
+}

@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "prepack": "node ../sync-npm.mjs",
-    "test": "node ../test/config.test.mjs && node ../test/init.test.mjs && node ../test/ollamaGuard.test.mjs && node ../test/read-guard.test.mjs && node ../test/prompt-guard.test.mjs && node ../test/modelStatus.test.mjs"
+    "test": "node ../test/config.test.mjs && node ../test/init.test.mjs && node ../test/ollamaGuard.test.mjs && node ../test/read-guard.test.mjs && node ../test/prompt-guard.test.mjs && node ../test/modelStatus.test.mjs && node ../test/usageReport.test.mjs && node ../test/ab/selftest.test.mjs"
   },
   "repository": {
     "type": "git",
