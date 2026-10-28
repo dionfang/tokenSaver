@@ -4,7 +4,7 @@
 
 ```bash
 cd TokenSaver/code-index
-node init.mjs --roots "D:/业务仓"
+node init.mjs --roots "<项目目录>"
 # 改 data/code-index.config.json 的 roots 后:
 node init.mjs
 ```

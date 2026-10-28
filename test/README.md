@@ -49,11 +49,11 @@ npm run regress -- --seed 1 --n-sym 30 --n-gap 20
 指定已有索引（PowerShell / CMD）：
 
 ```powershell
-$env:CODE_INDEX_DATA_DIR="D:\HbuilderX-Project\yiwu-processing-platform\scripts\data"
+$env:CODE_INDEX_DATA_DIR="<项目目录>\scripts\data"
 npm run regress
 ```
 
 ```bat
-set CODE_INDEX_DATA_DIR=D:\HbuilderX-Project\yiwu-processing-platform\scripts\data
+set CODE_INDEX_DATA_DIR=<项目目录>\scripts\data
 npm run regress
 ```
