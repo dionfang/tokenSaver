@@ -25,7 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, resolveBase } from './ollamaGuard.mjs';
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
-import { addSessionSavings, assessModelStatus, estimateSavedTokens, ollamaHasModel } from './modelStatus.mjs';
+import { assessModelStatus, measureInputSavings, ollamaHasModel } from './modelStatus.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
 import { residentEmbed, residentScorePairs } from './localResident.mjs';
 import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from './vectorStore.mjs';
@@ -111,8 +111,7 @@ bm25 = bm25.map(s => s / bm25Max);
 // 只读当前 modelIn 的 data/vectors/<路径>/。另一条路径的向量不参与,也不被本次检索改写。
 // ollama:必须已有 Ollama 服务。local:优先常驻进程,不在时本进程加载,不探测 Ollama。
 // 当前路径拉起失败 → bm25,不改换另一条路径。精排跟随 modelIn。
-let idx = {};
-try { idx = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'index.json'), 'utf8')); }
+try { JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'index.json'), 'utf8')); }
 catch { console.error('[warn] index.json 缺失或损坏,向量通道不可用(运行 node build.mjs && node embed.mjs 重建)'); }
 const indexBackend = activeBackend();
 const vmeta = readVectorMeta(indexBackend);
@@ -369,7 +368,20 @@ if (AS_JSON) {
   toolOutput = lines.join('\n');
 }
 
-if (vecScores && kept.length) addSessionSavings(estimateSavedTokens(kept, chunks, idx));
+if (vecScores && kept.length) {
+  // shortcut: 按命中块正文计原文,块间重叠行会重复计入,避免再读整文件
+  const original = kept.map((i) => {
+    const raw = String(chunks[i]?.t || '');
+    const nl = raw.indexOf('\n');
+    return nl >= 0 ? raw.slice(nl + 1) : raw;
+  }).join('\n');
+  try {
+    // 先计命中原文,再计本次实际送出的检索结果(压缩后)
+    await measureInputSavings(original, toolOutput);
+  } catch (e) {
+    console.error(`[warn] 输入 token 记账跳过(${e.message})`);
+  }
+}
 
 if (AS_JSON) console.log(toolOutput);
 else {

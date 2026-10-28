@@ -79,3 +79,85 @@ init 会写配置并安装依赖。
   knownAnnotations   "项目名/相对路径" → 一句职责
 
 skipDirs 默认已跳过依赖、构建产物和编辑器目录。新生成的配置还会加上 code-index、.cursor、.zcode。
+
+English
+
+TokenSaver direct deploy
+
+Requirements: Node.js >= 18 and git.
+For Ollama, install it, start it yourself, and pull the models by hand. This tool does not start the server and does not pull models.
+local does not need Ollama. Change model names in config.mjs in this directory.
+Ollama models are not copied with this directory. The two transformers.js local models live in hf-cache (about 439MB); copy that directory too.
+
+Standalone tool (recommended): run init in TokenSaver\code-index. Data is written to TokenSaver\data, not into application repos.
+  node init.mjs --roots "D:/app-a,D:/app-b"
+Later, edit roots in data\code-index.config.json and run init again with no arguments:
+  node init.mjs
+That indexes the new directories and installs hooks in those git repos.
+
+You can also copy this directory into the target project (suggested: scripts\code-index). Data then lives in data\ next to this directory. If this directory is itself the git root, data is written to data\ inside it. Override the location with CODE_INDEX_DATA_DIR. An npm install always uses the repo's scripts\data.
+
+init installs dependencies, writes config, wires the current agent's hooks (if it cannot tell which agent, it wires Cursor, ZCode, and Qoder), then builds the index and warms models in the background. Check readiness: node status.mjs
+
+After cloning from GitCode, init is still the only step:
+  git clone https://gitcode.com/dionfang/TokenSaver.git
+  cd TokenSaver/code-index
+  node init.mjs
+
+Copying
+
+1. Copy this directory. It can sit anywhere in the project; scripts\code-index is the suggested path.
+   hf-cache (the two local models) must come along. Do not copy node_modules or data\.
+2. In that directory run:
+   node init.mjs [--roots "<path1>[,<path2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
+3. Check readiness: node status.mjs
+
+init writes config and installs dependencies.
+A bad flag name, a missing value, or an illegal value for --model-in or --hooks exits with an error and does not change config.
+--roots=path and --model-in=local are also accepted.
+
+--roots
+  Comma-separated scan directories, written to data\code-index.config.json in this tool repo. Use D:/proj or D:\proj.
+  Omitted, and no config yet: the tool repo's git root.
+  Omitted, and config already exists: heal roots from the file (keep paths that still exist; guess a missing one once from a sibling directory). The tool repo is not added to the list. Then install hooks in those git repos and build the index in the background.
+  Passed: merge into the existing roots (add, do not drop old ones). Skip paths that do not exist. To remove a directory, edit the JSON and run init again with no arguments.
+
+--hooks
+  all | cursor | zcode | qoder. Writes session hooks only for the selected tool and does not change files already written for the others.
+  Omitted: if the environment identifies the current agent, install only that set (Cursor: CURSOR_AGENT; Qoder/ZCode: their own PROJECT_DIR).
+  If it cannot tell (for example a system terminal): install all three.
+
+--model-in
+  ollama or local. Writes modelIn and does not change model names.
+  Omitted on a new config: local. Omitted when config already exists: keep the current path.
+  ollama requires, first:
+    ollama pull qwen3-embedding:0.6b
+    ollama pull sam860/qwen3-reranker:0.6b-F16
+  If the names were changed in config.mjs, pull the new names.
+  The two local models are already in hf-cache in this directory; they are downloaded only when missing.
+
+Configuration
+
+Model deployment is edited only in config.mjs in this directory. The same keys in the data JSON are ignored.
+  models.embedding        default qwen3-embedding:0.6b
+  models.reranker         default sam860/qwen3-reranker:0.6b-F16
+  models.localEmbedding   default Xenova/jina-embeddings-v2-base-zh
+  models.localReranker    default Xenova/bge-reranker-base
+  ollamaBase              default http://localhost:11434
+  gpu                     auto | cpu | gpu, default auto
+  OLLAMA_KEEP_ALIVE       default 2h
+  OLLAMA_NUM_CTX          default 4096
+
+Project config is data\code-index.config.json next to this directory (under the suggested path that is scripts\data; override with CODE_INDEX_DATA_DIR). Missing keys use the defaults in config.mjs.
+  roots              Scan directories. --roots > env CODE_INDEX_ROOTS > this file
+  modelIn            ollama | local. --model-in > this file > local
+  skipDirs           Directory names to skip. When set, the list replaces the default; it is not appended
+  exts               Extensions to index, without the dot
+  jsonWhitelist      JSON file names allowed in the index. Default: package.json, pages.json, manifest.json, tsconfig.json
+  maxFileBytes       Per-file size cap. Default 819200
+  readMaxLines       Full Read line cap, default 500. Above ×1.25, Cursor preToolUse / ZCode and Qoder PreToolUse block it. A ranged read with offset/limit is not capped. One retry of the same file within 5 minutes is allowed. A very large value turns the cap off.
+  chunk              targetLines 70, maxLines 120, overlapLines 10, minTail 15
+  staleNonGitMs      How often a non-git directory is rebuilt, in milliseconds. Default 86400000
+  knownAnnotations   "project/relative-path" → one line on what the file does
+
+skipDirs already skips dependencies, build output, and editor directories. Newly generated config also adds code-index, .cursor, and .zcode.

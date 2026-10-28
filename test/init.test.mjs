@@ -87,11 +87,12 @@ assert.equal(cursorCfg.hooks.sessionStart[0].command, 'node .cursor/hooks/warm-c
 assert.equal(cursorCfg.hooks.beforeSubmitPrompt[0].command, 'node .cursor/hooks/prompt-guard.mjs');
 assert.equal(cursorCfg.hooks.preToolUse[0].command, 'node .cursor/hooks/read-guard.mjs');
 assert.equal(cursorCfg.hooks.preToolUse[0].matcher, '^Read$');
+assert.equal(cursorCfg.hooks.afterAgentResponse, undefined, '不再安装输出端 tokens 统计钩子');
 assert.ok(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'warm-code-index.mjs')));
 assert.ok(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'read-guard.mjs')));
+fs.writeFileSync(path.join(hookDir, '.cursor', 'hooks', 'output-savings.mjs'), 'stale\n');
 cursorCfg.hooks.afterAgentResponse = [{ command: 'node .cursor/hooks/output-savings.mjs', timeout: 20 }];
 fs.writeFileSync(path.join(hookDir, '.cursor', 'hooks.json'), JSON.stringify(cursorCfg, null, 2) + '\n');
-fs.writeFileSync(path.join(hookDir, '.cursor', 'hooks', 'output-savings.mjs'), 'stale\n');
 rewriteCursorHooks(hookDir);
 const cursorCfg2 = JSON.parse(fs.readFileSync(path.join(hookDir, '.cursor', 'hooks.json'), 'utf8'));
 assert.equal(cursorCfg2.hooks.preToolUse.filter((h) => String(h.command || '').includes('read-guard')).length, 1);

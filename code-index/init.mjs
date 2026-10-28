@@ -26,11 +26,12 @@
  *      Cursor preToolUse;ZCode/Qoder PreToolUse。
  *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具里本模块的钩子与转发器;
  *      同文件里的其他钩子保留,未选中的工具不改。JSON 解析失败则不改该文件。
- *   5) AGENTS.md:已有 code-index 标记则替换纪律段,没有则追加;文件不存在则新建。
+ *   5) AGENTS.md:已有 code-index 标记则替换纪律段(含文档英文一条),没有则追加;文件不存在则新建。
  *      再追加或替换末尾的 Ponytail 段(<!-- ponytail -->),不改纪律段和其他原文。
  *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor/.zcode/.qoder 始终忽略。
  *      不存在 CODE_MAP.md 时写一份空模板,已有则不动。
  * 依赖安装与索引构建均不可跳过。
+ * data/session-savings.json 按日本机已加载项目的检索累计,本脚本不读不删。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -360,6 +361,7 @@ function ensureGitignore(root, entries) {
 /** 只认本模块的脚本。项目里别的 auto.mjs / warm.mjs 不碰。目录名不限(复制部署常用 code-index)。 */
 export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
+  // output-savings 已下线,仍匹配以便 rewrite 时卸掉旧钩子
   if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard)\.mjs$/.test(s)) return true;
   // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
   if (/(?:^|[\s/"'])\.qoder\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
@@ -454,6 +456,7 @@ export function rewriteCursorHooks(root) {
   fs.writeFileSync(forwarderPath, cursorForwarderSource(root));
   fs.writeFileSync(guardPath, cursorPromptGuardSource(root));
   fs.writeFileSync(readGuardPath, cursorReadGuardSource(root));
+  try { fs.rmSync(outputHookPath, { force: true }); } catch { /* 旧输出端统计钩子 */ }
   const ours = { command: 'node .cursor/hooks/warm-code-index.mjs', timeout: 600 };
   const guardHook = { command: 'node .cursor/hooks/prompt-guard.mjs', timeout: 10 };
   const readHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: '^Read$', timeout: 10 };
@@ -472,6 +475,7 @@ export function rewriteCursorHooks(root) {
   for (const key of Object.keys(cfg.hooks)) {
     if (!Array.isArray(cfg.hooks[key])) continue;
     cfg.hooks[key] = cfg.hooks[key].filter(h => !isCodeIndexHookRef(h?.command));
+    if (!cfg.hooks[key].length) delete cfg.hooks[key];
   }
   cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
   cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
@@ -648,10 +652,11 @@ function wireRepo(root) {
     P(2, '**无条件先走索引**:定位/阅读/修改代码前先执行至少一次 `' + searchCmd + '`(默认混合检索,**不要加 --rerank**,精排要加载 reranker 会拖慢会话)。即使已有 file:行号也先检索核对;Grep 作补充。确需精排时再手动加 `--rerank`'),
     P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 会被钩子拦截,改走检索+区间读;同一文件 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
     P(4, pathHint),
-    P(5, '**模型状态提示(原样转达一句)**:会话开始后先运行 `' + statusCmd + '`,把输出的那一句 ⚙ 原样附在每次回复末尾。该句只含三项:是否启动成功、嵌入模型名与精排模型名、失败时的最可能原因或成功时今日已节约的 tokens(每天 24:00 清零)。不要加长、不要改写;没有这句输出时不得虚构'),
+    P(5, '**模型状态提示(原样转达一句)**:会话开始后先运行 `' + statusCmd + '`,把输出的那一句 ⚙ 原样附在每次回复末尾。该句只含三项:是否启动成功、嵌入模型名与精排模型名、失败时的最可能原因或成功时今日已节约的 tokens 与累计百分比(每天 24:00 清零)。不要加长、不要改写;没有这句输出时不得虚构'),
     P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/code-index.config.json` 的 knownAnnotations 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后校验 JSON 合法'),
     P(7, '**提交后保鲜**:执行 `git commit` 后,运行 `' + autoCmd + '`(HEAD 没变秒级跳过;有变更时 build 内联约 10s+嵌入转后台)——有 PostToolUse hook 的环境已自动做,重复触发零成本'),
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
+    P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
   ];
   const snippet = `\n${MARK_V2}\n## 代码检索纪律(节约 token)\n\n本项目已部署本地语义索引(工具在 \`${toolLabel}\`,项目资产在 \`${dataRel}\`):\n\n${items.join('\n\n')}\n`;
   const block = snippet.trim() + '\n';
@@ -663,14 +668,14 @@ function wireRepo(root) {
     if (next === content) ok(`[${path.basename(root)}] AGENTS.md 纪律段已与当前模板一致,跳过`);
     else {
       fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
-      ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(8 条)`);
+      ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(9 条)`);
     }
   } else if (content) {
     fs.appendFileSync(agentsPath, snippet);
-    ok(`[${path.basename(root)}] AGENTS.md 已追加检索纪律段(8 条)`);
+    ok(`[${path.basename(root)}] AGENTS.md 已追加检索纪律段(9 条)`);
   } else {
     fs.writeFileSync(agentsPath, block);
-    ok(`[${path.basename(root)}] AGENTS.md 已写入检索纪律段(8 条)`);
+    ok(`[${path.basename(root)}] AGENTS.md 已写入检索纪律段(9 条)`);
   }
   upsertPonytail(agentsPath);
 }
