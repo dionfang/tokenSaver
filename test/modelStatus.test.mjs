@@ -49,7 +49,7 @@ assert.equal(typeof mod.accumulateSavings, 'function');
   assert.equal(state.compressedTokens, 400);
   assert.equal(state.savedTokens, 700);
   assert.equal(state.days['2026-10-27'].savedTokens, 6, '累加今天不清昨天');
-  assert.equal(mod.formatSavedClause(state), '700 tokens（输入端节约63.6%）', '比率由当天原文与压缩后相除');
+  assert.equal(mod.formatSavedClause(state), '700 tokens(压缩率 63.6%)', '比率由当天原文与压缩后相除');
 }
 
 {

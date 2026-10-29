@@ -5,8 +5,8 @@
  * 只读:不联网，不写 data/session-savings.json，不改任何索引状态。
  *
  * 用法:
- *   node usageReport.mjs --dir <rollout 目录或单个 jsonl> [--since ISO] [--until ISO] [--all-sources] [--json] [--out 文件]
- *   node usageReport.mjs --a <A 目录> --b <B 目录> [同上] [--label-a A] [--label-b B]
+ *   node test/usageReport.mjs --dir <rollout 目录或单个 jsonl> [--since ISO] [--until ISO] [--all-sources] [--json] [--out 文件]
+ *   node test/usageReport.mjs --a <A 目录> --b <B 目录> [同上] [--label-a A] [--label-b B]
  *
  * 默认只统计 querySource=main_turn(排除会话标题生成等辅助请求);--all-sources 全算。
  * error 非空或 usage 为空的记录不计数;同一 requestId 只算一次。
@@ -302,8 +302,8 @@ function renderAB(labelA, labelB, a, b, dirA, dirB) {
 
 function usage() {
   console.error(`用法:
-  node usageReport.mjs --dir <rollout 目录或 jsonl> [--since ISO] [--until ISO] [--all-sources] [--json] [--out 文件]
-  node usageReport.mjs --a <A 目录> --b <B 目录> [--label-a A] [--label-b B] [同上]
+  node test/usageReport.mjs --dir <rollout 目录或 jsonl> [--since ISO] [--until ISO] [--all-sources] [--json] [--out 文件]
+  node test/usageReport.mjs --a <A 目录> --b <B 目录> [--label-a A] [--label-b B] [同上]
 
 默认只统计 querySource=main_turn;--all-sources 连标题生成等辅助请求一起算。
 A/B 目录里放本次实验的 model-io-session_*.jsonl 副本，不要混入其他会话。`);

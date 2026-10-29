@@ -65,6 +65,22 @@ export function evaluateReadGuard({
   return { permission: 'allow' };
 }
 
+/** shortcut: 钩子只有文件字节数,按 4 字节约 1 token,不再把整文件送进 tokenizer。 */
+export function tokensFromBlockedBytes(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.ceil(n / 4);
+}
+
+async function recordBlockedBytes(bytes) {
+  const tokens = tokensFromBlockedBytes(bytes);
+  if (tokens <= 0) return;
+  try {
+    const { addInputSavings } = await import('./modelStatus.mjs');
+    addInputSavings(tokens, 0);
+  } catch { /* 记账失败仍拒绝 */ }
+}
+
 export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd }) {
   const kb = Math.max(1, Math.round((size || 0) / 1024));
   const cap = readMaxLines;
@@ -201,6 +217,7 @@ export async function runReadGuard({ stdinText } = {}) {
       readMaxLines: resolveReadMaxLines(),
       searchCmd: searchCmd(),
     });
+    await recordBlockedBytes(st.size);
     return emit(dialect, 'deny', msg);
   }
 

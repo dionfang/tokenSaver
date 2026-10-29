@@ -207,7 +207,7 @@ export function formatSavedClause(state) {
   if (original <= 0) return `${tokens} tokens`;
   const pct = Math.min(100, Math.max(0, (original - compressed) / original * 100));
   const text = (Math.round(pct * 10) / 10).toFixed(1).replace(/\.0$/, '');
-  return `${tokens} tokens（输入端节约${text}%）`;
+  return `${tokens} tokens(压缩率 ${text}%)`;
 }
 
 function formatTokenCount(n) {
@@ -296,7 +296,7 @@ export function renderModelStatus(p) {
       && !p.embedPid
       && !p.indexError);
   const relay = healthy
-    ? `⚙ 本地模型已启动成功。${names}。本次会话今日已节约了 ${formatSavedClause(p)}`
+    ? `⚙ 本地模型已启动成功。${names}。TokenSaver今日已经帮你在输入端节约 ${formatSavedClause(p)}`
     : `⚙ 本地模型未启动成功。${names}。最可能原因:${likelyReason(p, emb, rr)}`;
   return { relay, detail: relay, healthy };
 }

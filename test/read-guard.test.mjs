@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { detectDialect, evaluateReadGuard, formatDecision, oversizeGuidance, OVERRIDE_WINDOW_MS } from '../code-index/read-guard.mjs';
+import { detectDialect, evaluateReadGuard, formatDecision, oversizeGuidance, OVERRIDE_WINDOW_MS, tokensFromBlockedBytes } from '../code-index/read-guard.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hook = path.join(here, '..', 'code-index', 'read-guard.mjs');
@@ -123,13 +123,25 @@ function runHook(input) {
   });
 }
 
+assert.equal(tokensFromBlockedBytes(0), 0);
+assert.equal(tokensFromBlockedBytes(4), 1);
+assert.equal(tokensFromBlockedBytes(5), 2);
+
+const blockedTokens = tokensFromBlockedBytes(fs.statSync(big).size);
 const first = runHook(payload);
 assert.equal(first.status, 0, first.stderr);
 assert.equal(JSON.parse(first.stdout).permission, 'deny');
 assert.match(JSON.parse(first.stdout).agent_message, /offset\/limit/);
+const ledger = JSON.parse(fs.readFileSync(path.join(dataDir, 'session-savings.json'), 'utf8'));
+const day = Object.values(ledger.days)[0];
+assert.equal(day.originalTokens, blockedTokens);
+assert.equal(day.compressedTokens, 0);
+assert.equal(day.savedTokens, blockedTokens);
 
 const second = runHook(payload);
 assert.equal(JSON.parse(second.stdout).permission, 'allow');
+const ledgerAfterAllow = JSON.parse(fs.readFileSync(path.join(dataDir, 'session-savings.json'), 'utf8'));
+assert.equal(Object.values(ledgerAfterAllow.days)[0].savedTokens, blockedTokens);
 
 const ranged = runHook({ ...payload, tool_input: { path: big, offset: 1, limit: 20 } });
 assert.equal(JSON.parse(ranged.stdout).permission, 'allow');

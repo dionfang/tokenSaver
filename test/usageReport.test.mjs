@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const mod = await import(pathToFileURL(path.join(here, '../code-index/usageReport.mjs')).href);
+const mod = await import(pathToFileURL(path.join(here, 'usageReport.mjs')).href);
 
 const rec = (o) => JSON.stringify({
   type: 'model_io',
