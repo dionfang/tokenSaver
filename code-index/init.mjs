@@ -22,8 +22,8 @@
  *      init 秒级返回不等待;进度看 data/auto.log 与 data/embed.log;期间检索 bm25 可用)
  *   4) 接线会话 hook:默认只装当前 agent(Cursor/ZCode/Qoder)那一套;认不出则三套都装。
  *      Cursor 另接 beforeSubmitPrompt → prompt-guard(会话中改嵌入模型才会后台重嵌)。
- *      三套都接 Read 拦截(超行数全量读 deny,区间读放行,5 分钟内重试放行,出错 fail-open):
- *      Cursor preToolUse;ZCode/Qoder PreToolUse。
+ *      三套都接 Read/终端整读拦截(超行数 deny,区间读放行,5 分钟内重试放行,出错 fail-open):
+ *      Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$。
  *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具里本模块的钩子与转发器;
  *      同文件里的其他钩子保留,未选中的工具不改。JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段(含文档英文一条),没有则追加;文件不存在则新建。
@@ -41,7 +41,7 @@ import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot } from './config.
 import { localOnnxCached } from './localRerank.mjs';
 import { spawnLogged } from './proc.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+const here = fs.realpathSync.native(path.dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 export const HOOK_TOOLS = ['cursor', 'zcode', 'qoder'];
 const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"  --model-in ollama|local  --hooks all|cursor|zcode|qoder。等号写法也认。';
@@ -149,7 +149,7 @@ export function mergeRoots(existing, added) {
   return out;
 }
 
-/** 仍存在的保留;缺失的按 siblingOf+basename 猜一次。不把宿主根塞进去。 */
+/** 仍存在的保留;缺失的按 siblingOf+basename 猜一次。 */
 export function healRoots(roots, { siblingOf, exists = fs.existsSync, onMissing, onHeal } = {}) {
   const healed = [];
   for (const r of roots || []) {
@@ -272,7 +272,7 @@ if (configExisted) {
     modelIn: chosenBackend,
     knownAnnotations: {},
   }, null, 2));
-  ok(`已生成,roots = ${JSON.stringify(roots)},嵌入路径 = ${chosenBackend};skipDirs 含内置默认 + "code-index"(部署单元自身不入索引)`);
+  ok(`已生成,roots = ${JSON.stringify(roots)},嵌入路径 = ${chosenBackend};skipDirs 含内置默认 + "code-index"(hub 模式下由 build 放行工具目录)`);
 }
 if (!configExisted || modelInArg) {
   if (chosenBackend === 'local') {
@@ -365,6 +365,7 @@ export function isCodeIndexHookRef(value) {
   if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard)\.mjs$/.test(s)) return true;
   // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
   if (/(?:^|[\s/"'])\.qoder\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
+  if (/(?:^|[\s/"'])\.zcode\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const names = 'auto|commit-refresh|prompt-guard|read-guard|warm|output-savings';
   if (new RegExp(`(?:^|/)(?:code-index|tokensaver|${dir})/(?:${names})\\.mjs$`).test(s)) return true;
@@ -407,21 +408,13 @@ child.on('exit', () => { process.stdout.write('{"continue":true}'); process.exit
 
 function cursorReadGuardSource(root) {
   const hooksDir = path.join(root, '.cursor', 'hooks');
-  const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
-let out = ''
-child.stdout.on('data', (d) => { out += d })
-child.on('error', () => { process.stdout.write('{"permission":"allow"}'); process.exit(0) })
-child.on('exit', () => {
-  const s = String(out).trim()
-  try {
-    const j = JSON.parse(s)
-    if (j && (j.permission === 'allow' || j.permission === 'deny')) process.stdout.write(s)
-    else process.stdout.write('{"permission":"allow"}')
-  } catch { process.stdout.write('{"permission":"allow"}') }
-  process.exit(0)
-})
-`;
-  return hookScript(hooksDir, 'read-guard.mjs', 'Cursor preToolUse Read: 转发 read-guard.mjs。无合法 permission 则 fail-open allow。', body);
+  const entryExpr = hookEntryExpr(hooksDir, 'read-guard.mjs');
+  const rel = path.relative(hooksDir, path.join(here, 'read-guard.mjs'));
+  // 同进程读 Cursor 写入的 stdin。Windows 上子进程 inherit 接不到后写入的管道,空输入会放行。
+  const head = path.isAbsolute(rel)
+    ? `import { pathToFileURL } from 'node:url'\n`
+    : `import path from 'node:path'\nimport { fileURLToPath, pathToFileURL } from 'node:url'\n\nconst here = path.dirname(fileURLToPath(import.meta.url))\n`;
+  return `/** Cursor preToolUse Read: 同进程调用 read-guard.mjs。stdout 含 permission deny 才拦截;失败则 allow。 */\n${head}const entry = ${entryExpr}\nlet raw = ''\nprocess.stdin.setEncoding('utf8')\nprocess.stdin.on('data', (c) => { raw += c })\nprocess.stdin.on('end', async () => {\n  try {\n    const { runReadGuard } = await import(pathToFileURL(entry).href)\n    await runReadGuard({ stdinText: raw })\n  } catch {\n    process.stdout.write('{"permission":"allow"}')\n  }\n})\n`;
 }
 
 function qoderReadGuardSource(root) {
@@ -459,7 +452,9 @@ export function rewriteCursorHooks(root) {
   try { fs.rmSync(outputHookPath, { force: true }); } catch { /* 旧输出端统计钩子 */ }
   const ours = { command: 'node .cursor/hooks/warm-code-index.mjs', timeout: 600 };
   const guardHook = { command: 'node .cursor/hooks/prompt-guard.mjs', timeout: 10 };
+  // Cursor 终端不走 preToolUse Bash,走 beforeShellExecution;matcher 按命令串匹配 cat。
   const readHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: '^Read$', timeout: 10 };
+  const shellHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: 'cat', timeout: 10 };
   let cfg = { version: 1, hooks: {} };
   if (fs.existsSync(hooksJson)) {
     try {
@@ -480,6 +475,7 @@ export function rewriteCursorHooks(root) {
   cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
   cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
   cfg.hooks.preToolUse = [readHook, ...(cfg.hooks.preToolUse || [])];
+  cfg.hooks.beforeShellExecution = [shellHook, ...(cfg.hooks.beforeShellExecution || [])];
   for (const key of Object.keys(cfg.hooks)) {
     if (Array.isArray(cfg.hooks[key]) && cfg.hooks[key].length === 0) delete cfg.hooks[key];
   }
@@ -507,22 +503,57 @@ function dropHookGroups(groups, isOurs) {
   return kept;
 }
 
+function zcodePassthroughSource(root, scriptName) {
+  const hooksDir = path.join(root, '.zcode', 'hooks');
+  return hookScript(hooksDir, scriptName, `ZCode: 转发 ${scriptName}。stdout/stderr 原样透传。`, `const child = spawn(process.execPath, [entry], { stdio: 'inherit', windowsHide: true })
+child.on('error', () => process.exit(0))
+child.on('exit', (code) => process.exit(code || 0))
+`);
+}
+
+function zcodeReadGuardSource(root) {
+  const hooksDir = path.join(root, '.zcode', 'hooks');
+  const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
+let out = ''
+child.stdout.on('data', (d) => { out += d })
+child.on('error', () => { process.stdout.write('{}'); process.exit(0) })
+child.on('exit', () => {
+  const s = String(out).trim()
+  try {
+    const j = JSON.parse(s)
+    const d = j && j.hookSpecificOutput && j.hookSpecificOutput.permissionDecision
+    if (d === 'deny' || d === 'allow' || d === 'ask') process.stdout.write(s)
+    else process.stdout.write('{}')
+  } catch { process.stdout.write('{}') }
+  process.exit(0)
+})
+`;
+  return hookScript(hooksDir, 'read-guard.mjs', 'ZCode PreToolUse Read/Bash: 转发 read-guard.mjs。无合法 permissionDecision 则 {} fail-open。', body);
+}
+
 /**
  * 每次卸掉本模块的 ZCode 钩子再按当前脚本路径写回。
- * 其他事件、其他钩子保留。JSON 解析失败则不改文件。
+ * 转发器写在 .zcode/hooks/(与 Cursor/Qoder 对称),config 只引用它们。其他事件、其他钩子保留。
  */
 export function rewriteZcodeHooks(root) {
   const zcodePath = path.join(root, '.zcode', 'config.json');
-  const autoAbs = path.join(here, 'auto.mjs');
-  const commitRefreshAbs = path.join(here, 'commit-refresh.mjs');
-  const promptGuardAbs = path.join(here, 'prompt-guard.mjs');
-  const readGuardAbs = path.join(here, 'read-guard.mjs');
+  const hooksDir = path.join(root, '.zcode', 'hooks');
+  fs.mkdirSync(hooksDir, { recursive: true });
+  fs.writeFileSync(path.join(hooksDir, 'session-start.mjs'), zcodePassthroughSource(root, 'auto.mjs'));
+  fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), zcodePassthroughSource(root, 'prompt-guard.mjs'));
+  fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), zcodePassthroughSource(root, 'commit-refresh.mjs'));
+  fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), zcodeReadGuardSource(root));
+  try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
+  const sessionStart = path.join(hooksDir, 'session-start.mjs');
+  const commitRefresh = path.join(hooksDir, 'commit-refresh.mjs');
+  const promptGuard = path.join(hooksDir, 'prompt-guard.mjs');
+  const readGuard = path.join(hooksDir, 'read-guard.mjs');
   let zc = { hooks: { enabled: true, events: {} } };
   if (fs.existsSync(zcodePath)) {
     try {
       zc = JSON.parse(fs.readFileSync(zcodePath, 'utf8'));
     } catch (e) {
-      console.error(`  [warn] [${path.basename(root)}] .zcode/config.json 解析失败,未改动(${e.message})`);
+      console.error(`  [warn] [${path.basename(root)}] .zcode/config.json 解析失败,未改 JSON(${e.message});转发器已按当前模块重写`);
       return;
     }
   }
@@ -535,11 +566,10 @@ export function rewriteZcodeHooks(root) {
     if (Array.isArray(events[key])) events[key] = dropHookGroups(events[key], isOurZcodeHook);
   }
   const push = (name, group) => { events[name] = [...(Array.isArray(events[name]) ? events[name] : []), group]; };
-  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(autoAbs, 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地检索模型')] });
-  push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(commitRefreshAbs, 10000, '提交后索引保鲜')] });
-  push('UserPromptSubmit', { hooks: [zcodeProcess(promptGuardAbs, 10000, '模型变更检测')] });
-  push('PreToolUse', { matcher: '^Read$', hooks: [zcodeProcess(readGuardAbs, 10000, '超行数全量 Read 拦截')] });
-  fs.mkdirSync(path.dirname(zcodePath), { recursive: true });
+  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(sessionStart, 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地检索模型')] });
+  push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(commitRefresh, 10000, '提交后索引保鲜')] });
+  push('UserPromptSubmit', { hooks: [zcodeProcess(promptGuard, 10000, '模型变更检测')] });
+  push('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readGuard, 10000, '超行数全量 Read/Bash 拦截')] });
   fs.writeFileSync(zcodePath, JSON.stringify(zc, null, 2) + '\n');
   ok(`[${path.basename(root)}] ZCode hooks 已按当前模块重写(其他钩子保留)`);
 }
@@ -604,7 +634,7 @@ export function rewriteQoderHooks(root) {
   prepend('SessionStart', { hooks: [qoderCmd('.qoder/hooks/session-start.mjs', 420, '索引保鲜检查+预热本地检索模型')] });
   prepend('PostToolUse', { matcher: 'Bash|Shell', hooks: [qoderCmd('.qoder/hooks/commit-refresh.mjs', 10, '提交后索引保鲜')] });
   prepend('UserPromptSubmit', { hooks: [qoderCmd('.qoder/hooks/prompt-guard.mjs', 10, '模型变更检测')] });
-  prepend('PreToolUse', { matcher: '^Read$', hooks: [qoderCmd('.qoder/hooks/read-guard.mjs', 10, '超行数全量 Read 拦截')] });
+  prepend('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [qoderCmd('.qoder/hooks/read-guard.mjs', 10, '超行数全量 Read/Bash 拦截')] });
   for (const key of Object.keys(hooks)) {
     if (Array.isArray(hooks[key]) && hooks[key].length === 0) delete hooks[key];
   }
@@ -650,7 +680,7 @@ function wireRepo(root) {
   const items = [
     P(1, '**全局背景**:先读 `' + dataRel + '/CODE_MAP.md`(架构速查模板,随使用逐步充实;或自行维护项目架构说明)'),
     P(2, '**无条件先走索引**:定位/阅读/修改代码前先执行至少一次 `' + searchCmd + '`(默认混合检索,**不要加 --rerank**,精排要加载 reranker 会拖慢会话)。即使已有 file:行号也先检索核对;Grep 作补充。确需精排时再手动加 `--rerank`'),
-    P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 会被钩子拦截,改走检索+区间读;同一文件 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
+    P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 与 Bash 里 cat 整读大文件都会被钩子拦截(拒绝信息自带检索/区间读/grep 替代方案),改走检索+区间读;同一目标 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
     P(4, pathHint),
     P(5, '**模型状态提示(原样转达一句)**:会话开始后先运行 `' + statusCmd + '`,把输出的那一句 ⚙ 原样附在每次回复末尾。该句只含三项:是否启动成功、嵌入模型名与精排模型名、失败时的最可能原因或成功时今日已节约的 tokens 与累计百分比(每天 24:00 清零)。不要加长、不要改写;没有这句输出时不得虚构'),
     P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/code-index.config.json` 的 knownAnnotations 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后校验 JSON 合法'),

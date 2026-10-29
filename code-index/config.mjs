@@ -14,8 +14,8 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** 模块目录(部署单元:纯工具,零项目内容) */
-export const MODULE_DIR = __dirname;
+/** 模块目录(部署单元:纯工具,零项目内容)。realpath 保证与磁盘大小写一致,不受调用写法影响。 */
+export const MODULE_DIR = realpathOr(__dirname);
 
 export function isInsideNodeModules(dir) {
   return String(dir || '').split(path.sep).includes('node_modules');

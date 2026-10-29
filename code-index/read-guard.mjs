@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
- * Read 拦截:Cursor preToolUse;ZCode/Qoder PreToolUse。matcher ^Read$。
- * 全量读超过 readMaxLines×1.25 → deny,指路 search + 区间读。
- * 带 offset/limit 的区间读放行。刚拦过同一文件 5 分钟内再读则放行。
+ * Read/Bash 拦截:Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$。
+ * 全量 Read 超过 readMaxLines×1.25 → deny,指路 search + 区间读。
+ * 终端/Bash 里各链式组末段的 cat 整读同规则拦;带 | 限量管道、> 重定向、cat 无文件参数则放行。
+ * Cursor 终端走 beforeShellExecution(工具名常是 Shell,不进 preToolUse Bash);ZCode/Qoder 仍认 Bash。
+ * 带 offset/limit 的区间读放行。刚拦过同一目标 5 分钟内再发则放行。
  * Cursor 输出 {permission};ZCode/Qoder 输出 hookSpecificOutput.permissionDecision。
  * 自身出错 fail-open:Cursor 写 {permission:allow}(缺字段会被拦);Claude 系写 {}(allow 不短路权限链)。
  * 不拦重复读,不做差分。
@@ -20,7 +22,7 @@ const HUGE_BYTES = 8 * 1024 * 1024;
 export function detectDialect(input, env = process.env) {
   const ev = String(input?.hook_event_name || input?.hookEventName || '');
   if (ev === 'PreToolUse') return 'claude';
-  if (ev === 'preToolUse') return 'cursor';
+  if (ev === 'preToolUse' || ev === 'beforeShellExecution') return 'cursor';
   if (env.ZCODE_PROJECT_DIR || env.ZCODE_SESSION_ID || env.ZCODE_PLUGIN_ROOT) return 'claude';
   if (env.QODER_PROJECT_DIR || env.QODER_CONFIG_DIR || env.QODER_SESSION_ID || env.QODER_CWD) return 'claude';
   if (env.CURSOR_AGENT || env.CURSOR_CONVERSATION_ID) return 'cursor';
@@ -43,6 +45,15 @@ export function formatDecision(dialect, permission, reason) {
     return { permission: 'deny', agent_message: reason, user_message: reason };
   }
   return ALLOW;
+}
+
+/** 记录拒绝时来自哪个宿主。环境变量优先,事件名只能区分 Cursor 与 Claude 系。 */
+export function detectAgentType(input, env = process.env) {
+  if (env.ZCODE_PROJECT_DIR || env.ZCODE_SESSION_ID || env.ZCODE_PLUGIN_ROOT) return 'zcode';
+  if (env.QODER_PROJECT_DIR || env.QODER_CONFIG_DIR || env.QODER_SESSION_ID || env.QODER_CWD) return 'qoder';
+  if (env.CURSOR_AGENT || env.CURSOR_CONVERSATION_ID) return 'cursor';
+  const ev = String(input?.hook_event_name || input?.hookEventName || '');
+  return (ev === 'preToolUse' || ev === 'beforeShellExecution') ? 'cursor' : 'unknown';
 }
 
 export function evaluateReadGuard({
@@ -90,6 +101,53 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
     `不要整文件 Read。先检索 \`${searchCmd} <符号或关键词> --k 5\`(命中的 file:起-止即大纲),` +
     `再按该区间用 Read 的 offset/limit 精读。` +
     `若确实需要全文,5 分钟内对同一文件再发一次同样的全量 Read 即放行。`
+  );
+}
+
+/** Bash 命令按 &&/||/; 分组,取每组管道末段:只有它直接写进工具结果,前面的输出已被后续命令消化。 */
+export function catDumpPieces(command) {
+  return String(command ?? '')
+    .split(/&&|\|\||;/)
+    .map((g) => g.split('|').pop().trim())
+    .filter((p) => /^cat(\s|$)/.test(p) && !/[<>]/.test(p));
+}
+
+/** shortcut: cat 整读与 Read 同阈值;命令是字符串启发式,node -e 之类间接整读拦不住,宁可放行。 */
+export function evaluateBashGuard({ command, now, denialAt, readMaxLines, statFile } = {}) {
+  const files = [];
+  let totalLines = 0;
+  for (const piece of catDumpPieces(command)) {
+    const tokens = (piece.match(/"[^"]*"|'[^']*'|\S+/g) || []).slice(1);
+    for (const t of tokens) {
+      const f = t.replace(/^["']|["']$/g, '');
+      if (!f || f.startsWith('-')) continue;
+      const st = statFile(f);
+      if (!st) continue;
+      files.push(st.file);
+      totalLines += st.lines;
+    }
+  }
+  if (!files.length) return { permission: 'allow' };
+  if (denialAt != null && Number.isFinite(denialAt) && now - denialAt < OVERRIDE_WINDOW_MS) {
+    return { permission: 'allow', override: true };
+  }
+  const cap = Number(readMaxLines);
+  if (!Number.isFinite(cap) || cap <= 0) return { permission: 'allow' };
+  if (totalLines > cap * 1.25) return { permission: 'deny', files };
+  return { permission: 'allow' };
+}
+
+export function bashOversizeGuidance({ files, lines, size, readMaxLines, searchCmd }) {
+  const kb = Math.max(1, Math.round((size || 0) / 1024));
+  const cap = readMaxLines;
+  const slack = Math.floor(cap * 1.25);
+  const target = files.length === 1 ? files[0] : files.join(' ');
+  return (
+    `code-index: Bash 整读 ${target} 共 ${lines} 行(~${kb} KB),超过全量读上限 ${cap} 行(宽限至 ${slack} 行)。不要用 cat 整读大文件。替代方案:` +
+    `① 先检索 \`${searchCmd} <关键词> --k 5\` 定位内容(命中的 file:起-止即大纲);` +
+    `② 看片段改用 Read 的 offset/limit,或给命令加限量管道 \`sed -n '起,止p' 文件\` / \`head -n N\`;` +
+    `③ 按内容定位用 \`grep -n <关键词> 文件\` 拿行号后再区间读。` +
+    `确实需要全量输出时,5 分钟内重发同一命令即放行。`
   );
 }
 
@@ -153,16 +211,77 @@ function emit(dialect, permission, reason) {
   return body;
 }
 
+async function bashGuard(input, dialect) {
+  // Cursor beforeShellExecution 把命令放在顶层 command;Bash/Shell preToolUse 在 tool_input.command。
+  const cmd = input.tool_input?.command ?? input.command;
+  if (typeof cmd !== 'string' || !cmd.trim()) return emit(dialect, 'allow');
+  const convId = input.conversation_id || input.session_id || 'unknown';
+  const now = Date.now();
+  const cwd = input.cwd || process.cwd();
+  const denials = loadDenials(convId);
+  const key = catDumpPieces(cmd).join(' && ');
+  const stats = [];
+  const statFile = (f) => {
+    const abs = path.isAbsolute(f) ? f : path.resolve(cwd, f);
+    let st;
+    try { st = fs.statSync(abs); } catch { return null; }
+    if (!st.isFile()) return null;
+    let lines;
+    try { lines = countLines(abs, st.size); } catch { return null; }
+    const s = { file: abs, size: st.size, lines };
+    stats.push(s);
+    return s;
+  };
+  const decision = evaluateBashGuard({
+    command: cmd,
+    now,
+    denialAt: key ? denials[key]?.at : undefined,
+    readMaxLines: resolveReadMaxLines(),
+    statFile,
+  });
+  if (decision.override) {
+    delete denials[key];
+    try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
+    return emit(dialect, 'allow');
+  }
+  if (decision.permission !== 'deny' || !key) return emit(dialect, 'allow');
+  const size = stats.reduce((n, s) => n + s.size, 0);
+  const msg = bashOversizeGuidance({
+    files: decision.files,
+    lines: stats.reduce((n, s) => n + s.lines, 0),
+    size,
+    readMaxLines: resolveReadMaxLines(),
+    searchCmd: searchCmd(),
+  });
+  const body = formatDecision(dialect, 'deny', msg);
+  try {
+    denials[key] = { at: now, agentType: detectAgentType(input), response: body };
+    saveDenials(convId, denials);
+  } catch {
+    return emit(dialect, 'allow');
+  }
+  await recordBlockedBytes(size);
+  respond(body);
+  return body;
+}
+
 export async function runReadGuard({ stdinText } = {}) {
   const raw = stdinText != null ? stdinText : await readStdin();
   let input;
   try {
-    input = JSON.parse(raw || '{}');
+    // Cursor 在 stdin JSON 前写 UTF-8 BOM,JSON.parse 会抛错,否则整段被当成放行。
+    input = JSON.parse(String(raw || '').replace(/^\uFEFF/, '') || '{}');
   } catch {
     return emit(detectDialect({}), 'allow');
   }
   const dialect = detectDialect(input || {});
-  if (!input || (input.tool_name && input.tool_name !== 'Read')) return emit(dialect, 'allow');
+  const ev = String(input?.hook_event_name || input?.hookEventName || '');
+  const tool = input?.tool_name;
+  // ZCode/Qoder:Bash;Cursor:beforeShellExecution,偶发 Shell preToolUse。
+  if (tool === 'Bash' || tool === 'Shell' || ev === 'beforeShellExecution') {
+    return bashGuard(input, dialect);
+  }
+  if (!input || (tool && tool !== 'Read')) return emit(dialect, 'allow');
   const ti = input.tool_input || {};
   const rawPath = ti.file_path || ti.path || ti.target_file;
   if (!rawPath || typeof rawPath !== 'string') return emit(dialect, 'allow');
@@ -204,12 +323,6 @@ export async function runReadGuard({ stdinText } = {}) {
   }
 
   if (decision.permission === 'deny') {
-    try {
-      denials[file] = { at: now };
-      saveDenials(convId, denials);
-    } catch {
-      return emit(dialect, 'allow');
-    }
     const msg = oversizeGuidance({
       file,
       lines,
@@ -217,8 +330,16 @@ export async function runReadGuard({ stdinText } = {}) {
       readMaxLines: resolveReadMaxLines(),
       searchCmd: searchCmd(),
     });
+    const body = formatDecision(dialect, 'deny', msg);
+    try {
+      denials[file] = { at: now, agentType: detectAgentType(input), response: body };
+      saveDenials(convId, denials);
+    } catch {
+      return emit(dialect, 'allow');
+    }
     await recordBlockedBytes(st.size);
-    return emit(dialect, 'deny', msg);
+    respond(body);
+    return body;
   }
 
   return emit(dialect, 'allow');

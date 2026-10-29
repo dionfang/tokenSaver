@@ -37,7 +37,7 @@ init 会写配置并安装依赖。
 --roots
   逗号分隔的扫描目录,写入本工具仓 data\code-index.config.json。路径用 D:/proj 或 D:\proj。
   不传且还没有配置:用工具仓 git 根。
-  不传且已有配置:按文件里的 roots 自愈(仍存在的保留,失踪的按兄弟目录猜一次),不把工具仓自己塞进名单;然后给这些 git 仓挂钩子并后台建索引。
+  不传且已有配置:按文件里的 roots 自愈(仍存在的保留,失踪的按兄弟目录猜一次);要让工具自身代码入索引,把工具仓写进 roots(或 --roots)即可;然后给这些 git 仓挂钩子并后台建索引。
   传入:与已有 roots 合并(纳入,不去掉旧的)。不存在的路径跳过。要删目录请改 JSON 后重跑不带参的 init。
 
 --hooks
@@ -73,7 +73,7 @@ init 会写配置并安装依赖。
   exts               收录的扩展名,不带点
   jsonWhitelist      允许收录的 json 文件名。默认 package.json、pages.json、manifest.json、tsconfig.json
   maxFileBytes       单文件上限。默认 819200
-  readMaxLines       全量 Read 行数上限,默认 500。超过 ×1.25 由 Cursor preToolUse / ZCode·Qoder PreToolUse 拦截;带 offset/limit 的区间读不受限。同一文件 5 分钟内重试一次即放行。设很大等于关掉。
+  readMaxLines       全量读行数上限,默认 500。超过 ×1.25 由 Cursor preToolUse / ZCode·Qoder PreToolUse 拦截,对象是全量 Read 与 Bash 里各链式组末段的 cat 整读(带 | 限量管道、> 重定向放行);Read 带 offset/limit 的区间读不受限。拒绝信息自带替代方案(检索 / 区间读 / grep -n)。同一目标 5 分钟内重试一次即放行。设很大等于关掉。
   chunk              targetLines 70,maxLines 120,overlapLines 10,minTail 15
   staleNonGitMs      非 git 目录多久重建一次,毫秒。默认 86400000
   knownAnnotations   "项目名/相对路径" → 一句职责
@@ -119,7 +119,7 @@ A bad flag name, a missing value, or an illegal value for --model-in or --hooks 
 --roots
   Comma-separated scan directories, written to data\code-index.config.json in this tool repo. Use D:/proj or D:\proj.
   Omitted, and no config yet: the tool repo's git root.
-  Omitted, and config already exists: heal roots from the file (keep paths that still exist; guess a missing one once from a sibling directory). The tool repo is not added to the list. Then install hooks in those git repos and build the index in the background.
+  Omitted, and config already exists: heal roots from the file (keep paths that still exist; guess a missing one once from a sibling directory). To index the tool's own code, list the tool repo in roots (or pass --roots). Then install hooks in those git repos and build the index in the background.
   Passed: merge into the existing roots (add, do not drop old ones). Skip paths that do not exist. To remove a directory, edit the JSON and run init again with no arguments.
 
 --hooks
@@ -155,7 +155,7 @@ Project config is data\code-index.config.json next to this directory (under the 
   exts               Extensions to index, without the dot
   jsonWhitelist      JSON file names allowed in the index. Default: package.json, pages.json, manifest.json, tsconfig.json
   maxFileBytes       Per-file size cap. Default 819200
-  readMaxLines       Full Read line cap, default 500. Above ×1.25, Cursor preToolUse / ZCode and Qoder PreToolUse block it. A ranged read with offset/limit is not capped. One retry of the same file within 5 minutes is allowed. A very large value turns the cap off.
+  readMaxLines       Full-read line cap, default 500. Above ×1.25, Cursor preToolUse / ZCode and Qoder PreToolUse block both a full Read and a trailing-pipeline cat in Bash (piped limiters like head/grep and > redirects pass). A ranged read with offset/limit is not capped. Denials carry alternatives (index search / ranged read / grep -n). One retry of the same target within 5 minutes is allowed. A very large value turns the cap off.
   chunk              targetLines 70, maxLines 120, overlapLines 10, minTail 15
   staleNonGitMs      How often a non-git directory is rebuilt, in milliseconds. Default 86400000
   knownAnnotations   "project/relative-path" → one line on what the file does

@@ -54,6 +54,8 @@ assert.equal(isCodeIndexHookRef('.qoder/hooks/session-start.mjs'), true);
 assert.equal(isCodeIndexHookRef('.qoder/hooks/read-guard.mjs'), true);
 assert.equal(isCodeIndexHookRef('node .qoder/hooks/session-start.mjs'), true);
 assert.equal(isCodeIndexHookRef('node .qoder/hooks/commit-refresh.mjs'), true);
+assert.equal(isCodeIndexHookRef('.zcode/hooks/session-start.mjs'), true);
+assert.equal(isCodeIndexHookRef('.zcode/hooks/read-guard.mjs'), true);
 assert.equal(isCodeIndexHookRef('src/utils/auto.mjs'), false);
 
 const copiedGi = gitignoreEntries({
@@ -87,6 +89,8 @@ assert.equal(cursorCfg.hooks.sessionStart[0].command, 'node .cursor/hooks/warm-c
 assert.equal(cursorCfg.hooks.beforeSubmitPrompt[0].command, 'node .cursor/hooks/prompt-guard.mjs');
 assert.equal(cursorCfg.hooks.preToolUse[0].command, 'node .cursor/hooks/read-guard.mjs');
 assert.equal(cursorCfg.hooks.preToolUse[0].matcher, '^Read$');
+assert.equal(cursorCfg.hooks.beforeShellExecution[0].command, 'node .cursor/hooks/read-guard.mjs');
+assert.equal(cursorCfg.hooks.beforeShellExecution[0].matcher, 'cat');
 assert.equal(cursorCfg.hooks.afterAgentResponse, undefined, '不再安装输出端 tokens 统计钩子');
 assert.ok(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'warm-code-index.mjs')));
 assert.ok(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'read-guard.mjs')));
@@ -96,12 +100,13 @@ fs.writeFileSync(path.join(hookDir, '.cursor', 'hooks.json'), JSON.stringify(cur
 rewriteCursorHooks(hookDir);
 const cursorCfg2 = JSON.parse(fs.readFileSync(path.join(hookDir, '.cursor', 'hooks.json'), 'utf8'));
 assert.equal(cursorCfg2.hooks.preToolUse.filter((h) => String(h.command || '').includes('read-guard')).length, 1);
+assert.equal(cursorCfg2.hooks.beforeShellExecution.filter((h) => String(h.command || '').includes('read-guard')).length, 1);
 assert.equal(cursorCfg2.hooks.afterAgentResponse, undefined);
 assert.equal(fs.existsSync(path.join(hookDir, '.cursor', 'hooks', 'output-savings.mjs')), false);
 rewriteQoderHooks(hookDir);
 const qoderCfg = JSON.parse(fs.readFileSync(path.join(hookDir, '.qoder', 'settings.json'), 'utf8'));
 assert.equal(qoderCfg.hooks.SessionStart[0].hooks[0].command, 'node .qoder/hooks/session-start.mjs');
-assert.equal(qoderCfg.hooks.PreToolUse[0].matcher, '^Read$');
+assert.equal(qoderCfg.hooks.PreToolUse[0].matcher, '^Read$|^Bash$');
 assert.equal(qoderCfg.hooks.PreToolUse[0].hooks[0].command, 'node .qoder/hooks/read-guard.mjs');
 assert.ok(fs.existsSync(path.join(hookDir, '.qoder', 'hooks', 'read-guard.mjs')));
 qoderCfg.hooks.Stop = [{ hooks: [{ type: 'command', command: 'node .qoder/hooks/output-savings.mjs', timeout: 10 }] }];
@@ -118,11 +123,16 @@ assert.equal(qoderCfg2.hooks.Stop, undefined);
 assert.equal(fs.existsSync(path.join(hookDir, '.qoder', 'hooks', 'output-savings.mjs')), false);
 rewriteZcodeHooks(hookDir);
 const zcodeCfg = JSON.parse(fs.readFileSync(path.join(hookDir, '.zcode', 'config.json'), 'utf8'));
-assert.equal(zcodeCfg.hooks.events.PreToolUse[0].matcher, '^Read$');
-assert.ok(zcodeCfg.hooks.events.PreToolUse[0].hooks[0].args.some((a) => String(a).replace(/\\/g, '/').endsWith('/read-guard.mjs')));
+assert.equal(zcodeCfg.hooks.events.PreToolUse[0].matcher, '^Read$|^Bash$');
+assert.ok(zcodeCfg.hooks.events.PreToolUse[0].hooks[0].args.some((a) => String(a).replace(/\\/g, '/').endsWith('/.zcode/hooks/read-guard.mjs')));
+assert.ok(fs.existsSync(path.join(hookDir, '.zcode', 'hooks', 'session-start.mjs')));
+assert.ok(fs.existsSync(path.join(hookDir, '.zcode', 'hooks', 'read-guard.mjs')));
+assert.ok(fs.existsSync(path.join(hookDir, '.zcode', 'hooks', 'prompt-guard.mjs')));
+assert.ok(fs.existsSync(path.join(hookDir, '.zcode', 'hooks', 'commit-refresh.mjs')));
 rewriteZcodeHooks(hookDir);
 const zcodeCfg2 = JSON.parse(fs.readFileSync(path.join(hookDir, '.zcode', 'config.json'), 'utf8'));
 assert.equal(zcodeCfg2.hooks.events.PreToolUse.length, 1);
+assert.equal(zcodeCfg2.hooks.events.PreToolUse.filter((g) => (g.hooks || []).some((h) => (h.args || []).some((a) => String(a).includes('read-guard')))).length, 1);
 fs.rmSync(hookDir, { recursive: true, force: true });
 
 console.log('ok');

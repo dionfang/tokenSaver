@@ -15,9 +15,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, DATA_DIR, gitHeadOf } from './config.mjs';
+import { loadConfig, DATA_DIR, gitHeadOf, findGitRoot, MODULE_DIR } from './config.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** 工具目录是否是宿主仓的直接子目录(hub 部署)。 */
+export function isHubDir(moduleDir) {
+  const root = findGitRoot(moduleDir);
+  return !!root && path.dirname(path.resolve(moduleDir)) === path.resolve(root);
+}
+// hub:宿主代码也纳入索引(用户可能自行改造工具);复制部署时仍排除工具自身
+const HUB = isHubDir(MODULE_DIR);
+const isModuleDir = (p) => path.relative(MODULE_DIR, p) === '';
 
 /** 解析 --roots "a,b" 与 --roots=a,b。未传返回 null。 */
 export function rootsFromArgv(argv) {
@@ -95,10 +102,10 @@ function walk(dir, root, out) {
   for (const ent of entries) {
     const abs = path.join(dir, ent.name);
     if (ent.isDirectory()) {
-      if (SKIP_DIRS.has(ent.name)) continue;
+      if (SKIP_DIRS.has(ent.name) && !(HUB && isModuleDir(abs))) continue;
       walk(abs, root, out);
     } else if (ent.isFile()) {
-      if (abs.startsWith(path.join(__dirname))) continue; // 排除索引工具自身
+      if (!HUB && isModuleDir(path.dirname(abs))) continue; // 排除索引工具自身
       const base = ent.name;
       const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1).toLowerCase() : '';
       const ok = EXTS.has(ext) || (ext === 'json' && JSON_OK.has(base));
