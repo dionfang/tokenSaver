@@ -1,0 +1,13 @@
+{
+  "note": "Ponytail A/B 任务清单。work 相对仓库根目录，prompt 相对 test/scripts/ab。t1-t5 从零写算法;t6 修 bug;t7 复用已有代码写测试;t8 边界密集解析。",
+  "tasks": [
+    { "id": "t1", "name": "wordcount", "prompt": "prompts/t1.md", "work": "data/ab/work/t1", "inputs": [] },
+    { "id": "t2", "name": "csv-stats", "prompt": "prompts/t2.md", "work": "data/ab/work/t2", "inputs": ["fixtures/inputs/t2/data.csv"] },
+    { "id": "t3", "name": "fib", "prompt": "prompts/t3.md", "work": "data/ab/work/t3", "inputs": [] },
+    { "id": "t4", "name": "deepClone", "prompt": "prompts/t4.md", "work": "data/ab/work/t4", "inputs": [] },
+    { "id": "t5", "name": "rle", "prompt": "prompts/t5.md", "work": "data/ab/work/t5", "inputs": [] },
+    { "id": "t6", "name": "fix-pad", "prompt": "prompts/t6.md", "work": "data/ab/work/t6", "inputs": ["fixtures/inputs/t6/fmt.mjs"] },
+    { "id": "t7", "name": "test-existing", "prompt": "prompts/t7.md", "work": "data/ab/work/t7", "inputs": ["fixtures/inputs/t7/escapeHtml.mjs", "fixtures/inputs/t7/util.test.mjs"] },
+    { "id": "t8", "name": "parse-ini", "prompt": "prompts/t8.md", "work": "data/ab/work/t8", "inputs": [] }
+  ]
+}

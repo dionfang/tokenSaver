@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** A/B 测试脚手架自检:验收器 good/bad、条件切换、精确归属、重复保护、汇总门槛。不跑子代理。 */
+/** A/B 测试脚手架自检:验收器 good/bad、条件切换、精确归属、重复保护、汇总门槛。不跑子代理。启动:cd code-index && npm test(或 node ../test/ab-selftest.test.mjs) */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -13,17 +13,17 @@ const run = (args) => spawnSync(node, args, { encoding: 'utf8' });
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-ab-'));
 
 try {
-  const v = run([path.join(here, 'verify.mjs'), '--selftest']);
+  const v = run([path.join(here, 'scripts', 'ab', 'verify.mjs'), '--selftest']);
   assert.equal(v.status, 0, `verify --selftest 失败:\n${v.stdout}\n${v.stderr}`);
 
   const agents = path.join(tmp, 'AGENTS.md');
   const backup = path.join(tmp, 'AGENTS.backup.md');
   fs.writeFileSync(agents, '# T\n\n## Rules\nkeep\n\n<!-- ponytail -->\n## Ponytail\nbody\n');
-  let r = run([path.join(here, 'condition.mjs'), 'A', '--agents', agents, '--backup', backup]);
+  let r = run([path.join(here, 'scripts', 'ab', 'condition.mjs'), 'A', '--agents', agents, '--backup', backup]);
   assert.equal(r.status, 0, r.stderr);
   assert.ok(!fs.readFileSync(agents, 'utf8').includes('<!-- ponytail -->'), 'A 应去掉 ponytail');
   assert.ok(fs.existsSync(backup), 'A 应留下备份');
-  r = run([path.join(here, 'condition.mjs'), 'B', '--agents', agents, '--backup', backup]);
+  r = run([path.join(here, 'scripts', 'ab', 'condition.mjs'), 'B', '--agents', agents, '--backup', backup]);
   assert.equal(r.status, 0, r.stderr);
   assert.ok(fs.readFileSync(agents, 'utf8').includes('<!-- ponytail -->'), 'B 应恢复 ponytail');
   assert.ok(!fs.existsSync(backup), 'B 应删除备份');
@@ -53,7 +53,7 @@ try {
   ].join('\n'));
 
   const args = [
-    path.join(here, 'record.mjs'),
+    path.join(here, 'scripts', 'ab', 'record.mjs'),
     '--task', 't1', '--cond', 'B', '--pass', 'pass',
     '--agent', agent, '--since', '2026-01-01T00:00:00.000Z',
     '--rollout', rollout, '--runs', runs, '--out', results, '--agents', agents,
@@ -84,7 +84,7 @@ try {
     JSON.stringify({ task: 't1', cond: 'A', pass: true, promptSha: 'x', models: ['m1'], output: 100, requests: 2 }),
     JSON.stringify({ task: 't1', cond: 'B', pass: true, promptSha: 'x', models: ['m1'], output: 80, requests: 2 }),
   ].join('\n') + '\n');
-  r = run([path.join(here, 'summarize.mjs'), '--results', summary, '--partial', '--json']);
+  r = run([path.join(here, 'scripts', 'ab', 'summarize.mjs'), '--results', summary, '--partial', '--json']);
   assert.equal(r.status, 0, r.stderr);
   const js = JSON.parse(r.stdout);
   assert.equal(js.valid, true);
@@ -95,7 +95,7 @@ try {
     JSON.stringify({ task: 't1', cond: 'A', pass: true, promptSha: 'x', models: ['m1'], output: 100, requests: 2 }),
     JSON.stringify({ task: 't1', cond: 'B', pass: false, promptSha: 'x', models: ['m1'], output: 80, requests: 2 }),
   ].join('\n') + '\n');
-  r = run([path.join(here, 'summarize.mjs'), '--results', summary, '--partial', '--json']);
+  r = run([path.join(here, 'scripts', 'ab', 'summarize.mjs'), '--results', summary, '--partial', '--json']);
   assert.notEqual(r.status, 0, '通过率不一致应判不可比较');
   assert.equal(JSON.parse(r.stdout).valid, false);
 

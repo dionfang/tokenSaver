@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-/** usageReport 纯函数测试:解析、来源过滤、去重、汇总、A/B 对比。不联网、不读用户目录。 */
+/** usageReport 纯函数测试:解析、来源过滤、去重、汇总、A/B 对比。不联网、不读用户目录。 启动:cd code-index && npm test(或 node ../test/usageReport.test.mjs) */
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const mod = await import(pathToFileURL(path.join(here, 'usageReport.mjs')).href);
+const mod = await import(pathToFileURL(path.join(here, 'scripts', 'usageReport.mjs')).href);
 
 const rec = (o) => JSON.stringify({
   type: 'model_io',

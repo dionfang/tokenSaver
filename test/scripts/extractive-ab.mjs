@@ -11,13 +11,13 @@ import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { gpuOptions, resolveBase } from '../code-index/ollamaGuard.mjs';
-import { loadConfig, DATA_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from '../code-index/config.mjs';
+import { gpuOptions, resolveBase } from '../../code-index/ollamaGuard.mjs';
+import { loadConfig, DATA_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from '../../code-index/config.mjs';
 
-const { loadTokenizer, lookupModel } = createRequire(new URL('../code-index/package.json', import.meta.url))('tokenizer-core');
+const { loadTokenizer, lookupModel } = createRequire(new URL('../../code-index/package.json', import.meta.url))('tokenizer-core');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(here, '..');
+const root = path.resolve(here, '..', '..');
 const argv = process.argv.slice(2);
 const opt = (name, def) => {
   const i = argv.indexOf(name);

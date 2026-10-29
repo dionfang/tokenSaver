@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/** build 纯函数测试:hub 目录识别(isHubDir)。启动:cd code-index && npm test(或 node ../test/build.test.mjs) */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';

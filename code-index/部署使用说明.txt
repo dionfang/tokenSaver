@@ -41,9 +41,19 @@ init 会写配置并安装依赖。
   传入:与已有 roots 合并(纳入,不去掉旧的)。不存在的路径跳过。要删目录请改 JSON 后重跑不带参的 init。
 
 --hooks
-  all | cursor | zcode | qoder。只写选中工具的会话 hook,不改其他工具已有文件。
+  all | cursor | zcode | qoder。只写选中工具的用户级会话 hook,不改其他工具已有文件。
+  钩子统一装在用户级配置(ZCode ~/.zcode/cli/config.json;Cursor ~/.cursor/hooks.json;
+  Qoder ~/.qoder-cn/settings.json,国际版 ~/.qoder),绝对路径直指本模块,所有项目共享一份,
+  并清理各项目 .zcode/.cursor/.qoder 里本模块的旧工作区钩子(用户级没有 workspace 信任门控,派发稳定)。
   不传:能从环境变量认出当前 agent 就只装那一套(Cursor: CURSOR_AGENT;Qoder/ZCode: 各自 PROJECT_DIR)。
   认不出(例如系统终端里跑):三套都装。
+
+--uninstall(卸载)
+  node uninit.mjs —— 逐步回显状态地移除本模块部署的东西:
+  ①用户级钩子(ZCode/Cursor/Qoder;含他人配置的文件只摘本模块条目,空壳整删,转发器一并清)
+  ②各项目工作区钩子残留 ③各项目 AGENTS.md 的注入段(纪律段+ponytail 段;剥后仅剩空白才整删,用户内容保留)
+  ④运行时痕迹(data/.prefetch-last.json)。
+  不动:data/(索引与节约账)、code-index/ 本体、CODE_MAP.md、.gitignore、用户自己的 skills 与其他工具的钩子。
 
 --model-in
   ollama 或 local。写入 modelIn,不改模型名。
@@ -74,6 +84,8 @@ init 会写配置并安装依赖。
   jsonWhitelist      允许收录的 json 文件名。默认 package.json、pages.json、manifest.json、tsconfig.json
   maxFileBytes       单文件上限。默认 819200
   readMaxLines       全量读行数上限,默认 500。超过 ×1.25 由 Cursor preToolUse / ZCode·Qoder PreToolUse 拦截,对象是全量 Read 与 Bash 里各链式组末段的 cat 整读(带 | 限量管道、> 重定向放行);Read 带 offset/limit 的区间读不受限。拒绝信息自带替代方案(检索 / 区间读 / grep -n)。同一目标 5 分钟内重试一次即放行。设很大等于关掉。
+  prefetch           用户消息语义预取(ZCode UserPromptSubmit)。默认开:bm25 快路径对原话查索引,把 top 命中(file:行号)作为 additionalContext 注入,agent 第一步就带大纲开工。enabled=false 关闭;k 命中数(≤5,默认 3);minChars 短于该长度不注入(默认 12)。只走 bm25,不写节约账;相同原话 10 分钟内不重复注入。
+  nudge               连续读导航(ZCode PostToolUse/PostToolUseFailure ^Read$|^Bash$)。同一文件短窗口内区间读 ≥2 段 → 提示合并一次读完或先检索;Bash 输出超 bashDumpBytes(默认 24KB)→ 提示改用 Read offset/limit;Read/Bash 失败 → 指回检索。enabled=false 关闭;windowMs 提示限频窗(默认 10 分钟)。Read 实际读入字节数按 /4 折 token 记入当日账 readInputTokens(信息字段,不影响 savedTokens)。
   chunk              targetLines 70,maxLines 120,overlapLines 10,minTail 15
   staleNonGitMs      非 git 目录多久重建一次,毫秒。默认 86400000
   knownAnnotations   "项目名/相对路径" → 一句职责
@@ -123,9 +135,18 @@ A bad flag name, a missing value, or an illegal value for --model-in or --hooks 
   Passed: merge into the existing roots (add, do not drop old ones). Skip paths that do not exist. To remove a directory, edit the JSON and run init again with no arguments.
 
 --hooks
-  all | cursor | zcode | qoder. Writes session hooks only for the selected tool and does not change files already written for the others.
+  all | cursor | zcode | qoder. Wires the user-level session hooks of the selected tools only; other tools' files are untouched.
+  Hooks are installed once at user level (ZCode ~/.zcode/cli/config.json; Cursor ~/.cursor/hooks.json;
+  Qoder ~/.qoder-cn/settings.json, or ~/.qoder for the international build), with absolute paths pointing at this module,
+  shared by all projects; this module's old workspace hooks under each project's .zcode/.cursor/.qoder are cleaned up
+  (user-level hooks have no workspace trust gate, so dispatch is stable).
   Omitted: if the environment identifies the current agent, install only that set (Cursor: CURSOR_AGENT; Qoder/ZCode: their own PROJECT_DIR).
   If it cannot tell (for example a system terminal): install all three.
+
+--uninstall
+  node uninit.mjs — removes what this module deployed, printing one status line per step:
+  (1) user-level hooks (ZCode/Cursor/Qoder; files shared with other tools keep their other entries and lose only ours, pure skeletons are deleted, forwarders cleaned); (2) workspace hook leftovers per project; (3) the injected sections in each project's AGENTS.md (discipline + ponytail; the file is deleted only when nothing else remains — user content is preserved); (4) runtime traces (data/.prefetch-last.json).
+  Untouched: data/ (index and ledger), code-index/ itself, CODE_MAP.md, .gitignore, your own skills, and other tools' hooks.
 
 --model-in
   ollama or local. Writes modelIn and does not change model names.
@@ -156,6 +177,8 @@ Project config is data\code-index.config.json next to this directory (under the 
   jsonWhitelist      JSON file names allowed in the index. Default: package.json, pages.json, manifest.json, tsconfig.json
   maxFileBytes       Per-file size cap. Default 819200
   readMaxLines       Full-read line cap, default 500. Above ×1.25, Cursor preToolUse / ZCode and Qoder PreToolUse block both a full Read and a trailing-pipeline cat in Bash (piped limiters like head/grep and > redirects pass). A ranged read with offset/limit is not capped. Denials carry alternatives (index search / ranged read / grep -n). One retry of the same target within 5 minutes is allowed. A very large value turns the cap off.
+  prefetch           Semantic prefetch on each user message (ZCode UserPromptSubmit). On by default: a bm25 fast path searches the index for the prompt text and injects the top hits (file:lines) as additionalContext, so the agent starts with an outline. enabled=false turns it off; k = number of hits (max 5, default 3); minChars = skip prompts shorter than this (default 12). bm25 only, never writes the savings ledger; the same prompt is not re-injected within 10 minutes.
+  nudge              Consecutive-read navigation (ZCode PostToolUse/PostToolUseFailure ^Read$|^Bash$). Two or more ranged reads of the same file in a short window → suggests one combined read or a search first; Bash output above bashDumpBytes (default 24KB) → suggests Read offset/limit; a failed Read/Bash → points back to search. enabled=false turns it off; windowMs = nudge rate-limit window (default 10 minutes). Bytes actually read via Read are counted as /4 into the day's readInputTokens (informational, does not affect savedTokens).
   chunk              targetLines 70, maxLines 120, overlapLines 10, minTail 15
   staleNonGitMs      How often a non-git directory is rebuilt, in milliseconds. Default 86400000
   knownAnnotations   "project/relative-path" → one line on what the file does

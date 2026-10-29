@@ -20,12 +20,15 @@
  *   2) 安装依赖 npm install --ignore-scripts(必装,local 路径需要 transformers.js)
  *   3) **分离后台**启动 auto.mjs 建首版索引(build 内联其内 + embed 后台增量 + 预热;
  *      init 秒级返回不等待;进度看 data/auto.log 与 data/embed.log;期间检索 bm25 可用)
- *   4) 接线会话 hook:默认只装当前 agent(Cursor/ZCode/Qoder)那一套;认不出则三套都装。
+ *   4) 接线会话 hook:**统一装在用户级配置**(ZCode ~/.zcode/cli/config.json;Cursor ~/.cursor/hooks.json;
+ *      Qoder ~/.qoder-cn/settings.json,国际版 ~/.qoder),绝对路径直指本模块,所有工作区共享一份,
+ *      不依赖各仓的工作区信任审批。同时清理各 root 工作区里本模块的旧钩子与转发器。
+ *      默认只装当前 agent(Cursor/ZCode/Qoder)那一套;认不出则三套都装。
  *      Cursor 另接 beforeSubmitPrompt → prompt-guard(会话中改嵌入模型才会后台重嵌)。
  *      三套都接 Read/终端整读拦截(超行数 deny,区间读放行,5 分钟内重试放行,出错 fail-open):
  *      Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$。
- *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具里本模块的钩子与转发器;
- *      同文件里的其他钩子保留,未选中的工具不改。JSON 解析失败则不改该文件。
+ *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具的用户级配置里本模块的钩子;
+ *      同文件里的其他钩子保留。JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段(含文档英文一条),没有则追加;文件不存在则新建。
  *      再追加或替换末尾的 Ponytail 段(<!-- ponytail -->),不改纪律段和其他原文。
  *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor/.zcode/.qoder 始终忽略。
@@ -34,6 +37,7 @@
  * data/session-savings.json 按日本机已加载项目的检索累计,本脚本不读不删。
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -364,7 +368,7 @@ export function isCodeIndexHookRef(value) {
   // output-savings 已下线,仍匹配以便 rewrite 时卸掉旧钩子
   if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard)\.mjs$/.test(s)) return true;
   // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
-  if (/(?:^|[\s/"'])\.qoder\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
+  if (/(?:^|[\s/"'])\.qoder(?:-cn)?\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   if (/(?:^|[\s/"'])\.zcode\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const names = 'auto|commit-refresh|prompt-guard|read-guard|warm|output-savings';
@@ -391,14 +395,12 @@ function hookScript(hooksDir, scriptName, comment, body) {
   return `/** ${comment} */\n${hookPrelude(hooksDir, scriptName)}const entry = ${hookEntryExpr(hooksDir, scriptName)}\n${body}`;
 }
 
-function cursorForwarderSource(root) {
-  const hooksDir = path.join(root, '.cursor', 'hooks');
+function cursorForwarderSource(hooksDir) {
   const body = `const child = spawn(process.execPath, [entry], { stdio: ['ignore', 'ignore', 'inherit'], windowsHide: true })\nchild.on('error', (err) => { console.error('[fail] 无法启动 code-index:', err.message); process.exit(0) })\nchild.on('exit', () => process.exit(0))\n`;
   return hookScript(hooksDir, 'auto.mjs', 'Cursor sessionStart: 转发到当前 code-index 的 auto.mjs。stdout 保持空。', body);
 }
 
-function cursorPromptGuardSource(root) {
-  const hooksDir = path.join(root, '.cursor', 'hooks');
+function cursorPromptGuardSource(hooksDir) {
   const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'ignore', 'inherit'], windowsHide: true })
 child.on('error', () => { process.stdout.write('{"continue":true}'); process.exit(0) })
 child.on('exit', () => { process.stdout.write('{"continue":true}'); process.exit(0) })
@@ -406,8 +408,7 @@ child.on('exit', () => { process.stdout.write('{"continue":true}'); process.exit
   return hookScript(hooksDir, 'prompt-guard.mjs', 'Cursor beforeSubmitPrompt: 转发 prompt-guard.mjs(模型变更则后台重嵌)。stdout 只回 continue,不注入上下文。', body);
 }
 
-function cursorReadGuardSource(root) {
-  const hooksDir = path.join(root, '.cursor', 'hooks');
+function cursorReadGuardSource(hooksDir) {
   const entryExpr = hookEntryExpr(hooksDir, 'read-guard.mjs');
   const rel = path.relative(hooksDir, path.join(here, 'read-guard.mjs'));
   // 同进程读 Cursor 写入的 stdin。Windows 上子进程 inherit 接不到后写入的管道,空输入会放行。
@@ -417,8 +418,7 @@ function cursorReadGuardSource(root) {
   return `/** Cursor preToolUse Read: 同进程调用 read-guard.mjs。stdout 含 permission deny 才拦截;失败则 allow。 */\n${head}const entry = ${entryExpr}\nlet raw = ''\nprocess.stdin.setEncoding('utf8')\nprocess.stdin.on('data', (c) => { raw += c })\nprocess.stdin.on('end', async () => {\n  try {\n    const { runReadGuard } = await import(pathToFileURL(entry).href)\n    await runReadGuard({ stdinText: raw })\n  } catch {\n    process.stdout.write('{"permission":"allow"}')\n  }\n})\n`;
 }
 
-function qoderReadGuardSource(root) {
-  const hooksDir = path.join(root, '.qoder', 'hooks');
+function qoderReadGuardSource(hooksDir) {
   const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
 let out = ''
 child.stdout.on('data', (d) => { out += d })
@@ -437,63 +437,63 @@ child.on('exit', () => {
   return hookScript(hooksDir, 'read-guard.mjs', 'Qoder PreToolUse Read: 转发 read-guard.mjs。无合法 permissionDecision 则 {} fail-open。', body);
 }
 
-/** 每次重写本模块的 Cursor 钩子与转发器。同文件其他事件保留。JSON 坏了则只重写转发器。 */
-export function rewriteCursorHooks(root) {
+/** 清理后若整个文件只剩空骨架(无任何他人配置),连文件一起删,目录空了就回收。 */
+function removeIfPureSkeleton(file, isEmptyFn) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (cfg && typeof cfg === 'object' && !Array.isArray(cfg) && isEmptyFn(cfg)) {
+      fs.rmSync(file, { force: true });
+      return true;
+    }
+  } catch { /* JSON 坏了不敢删 */ }
+  return false;
+}
+
+const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0;
+
+/** 只清理:把本模块接入该工作区的 Cursor 钩子条目与转发器移除(钩子已迁用户级 ~/.cursor/hooks.json)。 */
+export function cleanCursorWorkspaceHooks(root) {
   const hooksJson = path.join(root, '.cursor', 'hooks.json');
   const hooksDir = path.join(root, '.cursor', 'hooks');
-  const forwarderPath = path.join(hooksDir, 'warm-code-index.mjs');
-  const outputHookPath = path.join(hooksDir, 'output-savings.mjs');
-  const guardPath = path.join(hooksDir, 'prompt-guard.mjs');
-  const readGuardPath = path.join(hooksDir, 'read-guard.mjs');
-  fs.mkdirSync(hooksDir, { recursive: true });
-  fs.writeFileSync(forwarderPath, cursorForwarderSource(root));
-  fs.writeFileSync(guardPath, cursorPromptGuardSource(root));
-  fs.writeFileSync(readGuardPath, cursorReadGuardSource(root));
-  try { fs.rmSync(outputHookPath, { force: true }); } catch { /* 旧输出端统计钩子 */ }
-  const ours = { command: 'node .cursor/hooks/warm-code-index.mjs', timeout: 600 };
-  const guardHook = { command: 'node .cursor/hooks/prompt-guard.mjs', timeout: 10 };
-  // Cursor 终端不走 preToolUse Bash,走 beforeShellExecution;matcher 按命令串匹配 cat。
-  const readHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: '^Read$', timeout: 10 };
-  const shellHook = { command: 'node .cursor/hooks/read-guard.mjs', matcher: 'cat', timeout: 10 };
-  let cfg = { version: 1, hooks: {} };
+  let fileGone = false;
   if (fs.existsSync(hooksJson)) {
     try {
-      cfg = JSON.parse(fs.readFileSync(hooksJson, 'utf8'));
-    } catch (e) {
-      console.error(`  [warn] [${path.basename(root)}] .cursor/hooks.json 解析失败,未改 JSON(${e.message});转发器已按当前模块重写`);
-      return;
-    }
+      const cfg = JSON.parse(fs.readFileSync(hooksJson, 'utf8'));
+      let changed = false;
+      if (cfg && typeof cfg === 'object' && cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks)) {
+        for (const key of Object.keys(cfg.hooks)) {
+          if (!Array.isArray(cfg.hooks[key])) continue;
+          const before = cfg.hooks[key].length;
+          cfg.hooks[key] = cfg.hooks[key].filter(h => !isCodeIndexHookRef(h?.command));
+          if (cfg.hooks[key].length !== before) changed = true;
+          if (!cfg.hooks[key].length) delete cfg.hooks[key];
+        }
+        // 只剩骨架(没有 version 之外的其他键、hooks 已空)→ 整个文件删掉
+        const skeletonOnly = Object.keys(cfg).every(k => k === 'version' || k === 'hooks') && isPlainObject(cfg.hooks);
+        if (skeletonOnly) fileGone = removeIfPureSkeleton(hooksJson, () => true);
+        else if (changed) fs.writeFileSync(hooksJson, JSON.stringify(cfg, null, 2) + '\n');
+      }
+    } catch { /* JSON 坏了不动,只删转发器 */ }
   }
-  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = { version: 1, hooks: {} };
-  if (cfg.version == null) cfg.version = 1;
-  if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) cfg.hooks = {};
-  for (const key of Object.keys(cfg.hooks)) {
-    if (!Array.isArray(cfg.hooks[key])) continue;
-    cfg.hooks[key] = cfg.hooks[key].filter(h => !isCodeIndexHookRef(h?.command));
-    if (!cfg.hooks[key].length) delete cfg.hooks[key];
+  for (const f of ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'output-savings.mjs']) {
+    try { fs.rmSync(path.join(hooksDir, f), { force: true }); } catch { /* 无该文件 */ }
   }
-  cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
-  cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
-  cfg.hooks.preToolUse = [readHook, ...(cfg.hooks.preToolUse || [])];
-  cfg.hooks.beforeShellExecution = [shellHook, ...(cfg.hooks.beforeShellExecution || [])];
-  for (const key of Object.keys(cfg.hooks)) {
-    if (Array.isArray(cfg.hooks[key]) && cfg.hooks[key].length === 0) delete cfg.hooks[key];
-  }
-  fs.rmSync(outputHookPath, { force: true });
-  fs.writeFileSync(hooksJson, JSON.stringify(cfg, null, 2) + '\n');
-  ok(`[${path.basename(root)}] Cursor hooks 已按当前模块重写(其他钩子保留)`);
+  try { fs.rmdirSync(hooksDir); } catch { /* 非空(如用户的 skills)或不存在 */ }
+  try { fs.rmdirSync(path.dirname(hooksDir)); } catch { /* 非空,留着 */ }
+  ok(`[${path.basename(root)}] Cursor 工作区钩子已清理${fileGone ? '(空壳 hooks.json 已删除)' : ''}(钩子在用户级 ~/.cursor/hooks.json)`);
 }
 
 function zcodeProcess(script, timeoutMs, statusMessage) {
   return { type: 'process', command: 'node', args: [script.split(path.sep).join('/')], timeoutMs, statusMessage };
 }
 
-function isOurZcodeHook(h) {
+export function isOurZcodeHook(h) {
   const refs = [h?.command, ...(Array.isArray(h?.args) ? h.args : [])];
   return refs.some(isCodeIndexHookRef);
 }
 
-function dropHookGroups(groups, isOurs) {
+/** 按判定函数剔除钩子组;组内清空则整组移除。 */
+export function dropHookGroups(groups, isOurs) {
   const kept = [];
   for (const g of groups || []) {
     if (!g || typeof g !== 'object' || !Array.isArray(g.hooks)) { kept.push(g); continue; }
@@ -503,79 +503,45 @@ function dropHookGroups(groups, isOurs) {
   return kept;
 }
 
-function zcodePassthroughSource(root, scriptName) {
-  const hooksDir = path.join(root, '.zcode', 'hooks');
-  return hookScript(hooksDir, scriptName, `ZCode: 转发 ${scriptName}。stdout/stderr 原样透传。`, `const child = spawn(process.execPath, [entry], { stdio: 'inherit', windowsHide: true })
-child.on('error', () => process.exit(0))
-child.on('exit', (code) => process.exit(code || 0))
-`);
-}
-
-function zcodeReadGuardSource(root) {
-  const hooksDir = path.join(root, '.zcode', 'hooks');
-  const body = `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
-let out = ''
-child.stdout.on('data', (d) => { out += d })
-child.on('error', () => { process.stdout.write('{}'); process.exit(0) })
-child.on('exit', () => {
-  const s = String(out).trim()
-  try {
-    const j = JSON.parse(s)
-    const d = j && j.hookSpecificOutput && j.hookSpecificOutput.permissionDecision
-    if (d === 'deny' || d === 'allow' || d === 'ask') process.stdout.write(s)
-    else process.stdout.write('{}')
-  } catch { process.stdout.write('{}') }
-  process.exit(0)
-})
-`;
-  return hookScript(hooksDir, 'read-guard.mjs', 'ZCode PreToolUse Read/Bash: 转发 read-guard.mjs。无合法 permissionDecision 则 {} fail-open。', body);
-}
-
 /**
- * 每次卸掉本模块的 ZCode 钩子再按当前脚本路径写回。
- * 转发器写在 .zcode/hooks/(与 Cursor/Qoder 对称),config 只引用它们。其他事件、其他钩子保留。
+ * 只清理:把本模块接入该工作区的 ZCode 钩子条目与转发器移除(钩子已迁用户级 ~/.zcode/cli/config.json)。
  */
-export function rewriteZcodeHooks(root) {
+export function cleanZcodeWorkspaceHooks(root) {
   const zcodePath = path.join(root, '.zcode', 'config.json');
   const hooksDir = path.join(root, '.zcode', 'hooks');
-  fs.mkdirSync(hooksDir, { recursive: true });
-  fs.writeFileSync(path.join(hooksDir, 'session-start.mjs'), zcodePassthroughSource(root, 'auto.mjs'));
-  fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), zcodePassthroughSource(root, 'prompt-guard.mjs'));
-  fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), zcodePassthroughSource(root, 'commit-refresh.mjs'));
-  fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), zcodeReadGuardSource(root));
-  try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
-  const sessionStart = path.join(hooksDir, 'session-start.mjs');
-  const commitRefresh = path.join(hooksDir, 'commit-refresh.mjs');
-  const promptGuard = path.join(hooksDir, 'prompt-guard.mjs');
-  const readGuard = path.join(hooksDir, 'read-guard.mjs');
-  let zc = { hooks: { enabled: true, events: {} } };
+  let fileGone = false;
   if (fs.existsSync(zcodePath)) {
     try {
-      zc = JSON.parse(fs.readFileSync(zcodePath, 'utf8'));
-    } catch (e) {
-      console.error(`  [warn] [${path.basename(root)}] .zcode/config.json 解析失败,未改 JSON(${e.message});转发器已按当前模块重写`);
-      return;
-    }
+      const zc = JSON.parse(fs.readFileSync(zcodePath, 'utf8'));
+      if (zc && typeof zc === 'object' && zc.hooks && typeof zc.hooks === 'object' && !Array.isArray(zc.hooks)) {
+        const events = zc.hooks.events && typeof zc.hooks.events === 'object' && !Array.isArray(zc.hooks.events) ? zc.hooks.events : {};
+        let changed = false;
+        for (const key of Object.keys(events)) {
+          if (Array.isArray(events[key])) {
+            const before = events[key].length;
+            events[key] = dropHookGroups(events[key], isOurZcodeHook);
+            if (events[key].length !== before) changed = true;
+            if (!events[key].length) delete events[key];
+          }
+        }
+        // 只剩骨架(顶层只有 hooks、hooks 里只有 enabled/events 且 events 已空)→ 整个文件删掉
+        const skeletonOnly = Object.keys(zc).every(k => k === 'hooks')
+          && Object.keys(zc.hooks).every(k => k === 'enabled' || k === 'events')
+          && Object.keys(events).length === 0;
+        if (skeletonOnly) fileGone = removeIfPureSkeleton(zcodePath, () => true);
+        else if (changed) fs.writeFileSync(zcodePath, JSON.stringify(zc, null, 2) + '\n');
+      }
+    } catch { /* JSON 坏了不动,只删转发器 */ }
   }
-  if (!zc || typeof zc !== 'object' || Array.isArray(zc)) zc = {};
-  zc.hooks = zc.hooks && typeof zc.hooks === 'object' && !Array.isArray(zc.hooks) ? zc.hooks : {};
-  zc.hooks.enabled = true;
-  const events = zc.hooks.events && typeof zc.hooks.events === 'object' && !Array.isArray(zc.hooks.events) ? zc.hooks.events : {};
-  zc.hooks.events = events;
-  for (const key of Object.keys(events)) {
-    if (Array.isArray(events[key])) events[key] = dropHookGroups(events[key], isOurZcodeHook);
+  for (const f of ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'output-savings.mjs']) {
+    try { fs.rmSync(path.join(hooksDir, f), { force: true }); } catch { /* 无该文件 */ }
   }
-  const push = (name, group) => { events[name] = [...(Array.isArray(events[name]) ? events[name] : []), group]; };
-  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(sessionStart, 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地检索模型')] });
-  push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(commitRefresh, 10000, '提交后索引保鲜')] });
-  push('UserPromptSubmit', { hooks: [zcodeProcess(promptGuard, 10000, '模型变更检测')] });
-  push('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readGuard, 10000, '超行数全量 Read/Bash 拦截')] });
-  fs.writeFileSync(zcodePath, JSON.stringify(zc, null, 2) + '\n');
-  ok(`[${path.basename(root)}] ZCode hooks 已按当前模块重写(其他钩子保留)`);
+  try { fs.rmdirSync(hooksDir); } catch { /* 非空或不存在 */ }
+  try { fs.rmdirSync(path.dirname(hooksDir)); } catch { /* 非空,留着 */ }
+  ok(`[${path.basename(root)}] ZCode 工作区钩子已清理${fileGone ? '(空壳 config.json 已删除)' : ''}(钩子在用户级 ~/.zcode/cli/config.json)`);
 }
 
-function qoderWrapSource(root, scriptName, eventName) {
-  const hooksDir = path.join(root, '.qoder', 'hooks');
+function qoderWrapSource(hooksDir, scriptName, eventName) {
   return hookScript(hooksDir, scriptName, `Qoder ${eventName}: 转发 ${scriptName},把 additionalContext 包成 hookSpecificOutput。`, `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
 let out = ''
 child.stdout.on('data', (d) => { out += d })
@@ -591,8 +557,7 @@ child.on('exit', (code) => {
 `);
 }
 
-function qoderPassthroughSource(root, scriptName) {
-  const hooksDir = path.join(root, '.qoder', 'hooks');
+function qoderPassthroughSource(hooksDir, scriptName) {
   return hookScript(hooksDir, scriptName, `Qoder: 转发 ${scriptName}。stdout 保持空。`, `const child = spawn(process.execPath, [entry], { stdio: 'inherit', windowsHide: true })
 child.on('error', () => process.exit(0))
 child.on('exit', (code) => process.exit(code || 0))
@@ -603,24 +568,149 @@ function qoderCmd(rel, timeoutSec, statusMessage) {
   return { type: 'command', command: 'node ' + rel, timeout: timeoutSec, statusMessage };
 }
 
-/**
- * 每次卸掉本模块的 Qoder 钩子再按当前脚本路径写回(.qoder/settings.json)。
- * 其他事件、其他钩子保留。JSON 解析失败则只重写转发器。
- */
-export function rewriteQoderHooks(root) {
+/** 只清理:把本模块接入该工作区的 Qoder 钩子条目与转发器移除(钩子已迁用户级 ~/.qoder-cn/settings.json)。 */
+export function cleanQoderWorkspaceHooks(root) {
   const settingsPath = path.join(root, '.qoder', 'settings.json');
   const hooksDir = path.join(root, '.qoder', 'hooks');
+  let fileGone = false;
+  if (fs.existsSync(settingsPath)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      let changed = false;
+      if (cfg && typeof cfg === 'object' && cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks)) {
+        for (const key of Object.keys(cfg.hooks)) {
+          if (Array.isArray(cfg.hooks[key])) {
+            const before = cfg.hooks[key].length;
+            cfg.hooks[key] = dropHookGroups(cfg.hooks[key], (h) => isCodeIndexHookRef(h?.command));
+            if (cfg.hooks[key].length !== before) changed = true;
+            if (!cfg.hooks[key].length) delete cfg.hooks[key];
+          }
+        }
+        // 只剩骨架(顶层只有空 hooks)→ 整个文件删掉
+        if (Object.keys(cfg).every(k => k === 'hooks') && isPlainObject(cfg.hooks)) fileGone = removeIfPureSkeleton(settingsPath, () => true);
+        else if (changed) fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
+      }
+    } catch { /* JSON 坏了不动,只删转发器 */ }
+  }
+  for (const f of ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'output-savings.mjs']) {
+    try { fs.rmSync(path.join(hooksDir, f), { force: true }); } catch { /* 无该文件 */ }
+  }
+  try { fs.rmdirSync(hooksDir); } catch { /* 非空或不存在 */ }
+  try { fs.rmdirSync(path.dirname(hooksDir)); } catch { /* 非空,留着 */ }
+  ok(`[${path.basename(root)}] Qoder 工作区钩子已清理${fileGone ? '(空壳 settings.json 已删除)' : ''}(钩子在用户级 ~/.qoder-cn/settings.json)`);
+}
+
+/** Qoder CN 版用户级配置目录是 ~/.qoder-cn(国际版 ~/.qoder);已有目录优先,都没有按 CN 建。 */
+export function qoderUserDir(home = os.homedir()) {
+  const cn = path.join(home, '.qoder-cn');
+  const intl = path.join(home, '.qoder');
+  if (fs.existsSync(intl) && !fs.existsSync(cn)) return intl;
+  return cn;
+}
+
+function hubCommand(script) {
+  return 'node ' + path.join(here, script).split(path.sep).join('/');
+}
+
+/**
+ * ZCode 用户级接线:~/.zcode/cli/config.json 的 hooks 键,绝对路径直指本模块脚本。
+ * 该文件还存插件开关等其他状态,只动 hooks 键;同文件其他钩子保留。无 workspace 信任门控。
+ */
+export function rewriteZcodeUserHooks({ home = os.homedir() } = {}) {
+  const cfgPath = path.join(home, '.zcode', 'cli', 'config.json');
+  let cfg = {};
+  if (fs.existsSync(cfgPath)) {
+    try {
+      cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    } catch (e) {
+      console.error(`[warn] ${cfgPath} 解析失败,未改(${e.message})`);
+      return;
+    }
+  }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
+  cfg.hooks = cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks) ? cfg.hooks : {};
+  cfg.hooks.enabled = true;
+  const events = cfg.hooks.events && typeof cfg.hooks.events === 'object' && !Array.isArray(cfg.hooks.events) ? cfg.hooks.events : {};
+  cfg.hooks.events = events;
+  for (const key of Object.keys(events)) {
+    if (Array.isArray(events[key])) events[key] = dropHookGroups(events[key], isOurZcodeHook);
+  }
+  const push = (name, group) => { events[name] = [...(Array.isArray(events[name]) ? events[name] : []), group]; };
+  const readNudge = path.join(here, 'read-nudge.mjs');
+  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'auto.mjs'), 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地检索模型')] });
+  push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(path.join(here, 'commit-refresh.mjs'), 10000, '提交后索引保鲜')] });
+  push('PostToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '连续读导航+工具结果记账')] });
+  push('PostToolUseFailure', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '读取失败导航')] });
+  push('UserPromptSubmit', { hooks: [zcodeProcess(path.join(here, 'prompt-guard.mjs'), 10000, '模型变更检测+语义预取')] });
+  push('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(path.join(here, 'read-guard.mjs'), 10000, '超行数全量 Read/Bash 拦截')] });
+  fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
+  ok(`[user] ZCode 用户级钩子已写入 ${cfgPath}(绝对路径直指本模块)`);
+}
+
+/**
+ * Cursor 用户级接线:~/.cursor/hooks.json + ~/.cursor/hooks/ 转发器(Cursor 自己的用户级初始化也用这个目录)。
+ * sessionStart/beforeSubmitPrompt 保留转发器(stdout 契约),preToolUse/beforeShellExecution 直呼 read-guard。
+ */
+export function rewriteCursorUserHooks({ home = os.homedir() } = {}) {
+  const hooksDir = path.join(home, '.cursor', 'hooks');
   fs.mkdirSync(hooksDir, { recursive: true });
-  fs.writeFileSync(path.join(hooksDir, 'session-start.mjs'), qoderWrapSource(root, 'auto.mjs', 'SessionStart'));
-  fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), qoderWrapSource(root, 'prompt-guard.mjs', 'UserPromptSubmit'));
-  fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), qoderPassthroughSource(root, 'commit-refresh.mjs'));
-  fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), qoderReadGuardSource(root));
+  fs.writeFileSync(path.join(hooksDir, 'warm-code-index.mjs'), cursorForwarderSource(hooksDir));
+  fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), cursorPromptGuardSource(hooksDir));
+  fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), cursorReadGuardSource(hooksDir));
+  try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
+  const cfgPath = path.join(home, '.cursor', 'hooks.json');
+  let cfg = { version: 1, hooks: {} };
+  if (fs.existsSync(cfgPath)) {
+    try {
+      cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    } catch (e) {
+      console.error(`[warn] ${cfgPath} 解析失败,未改(${e.message})`);
+      return;
+    }
+  }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = { version: 1, hooks: {} };
+  if (cfg.version == null) cfg.version = 1;
+  if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) cfg.hooks = {};
+  for (const key of Object.keys(cfg.hooks)) {
+    if (!Array.isArray(cfg.hooks[key])) continue;
+    cfg.hooks[key] = cfg.hooks[key].filter(h => !isCodeIndexHookRef(h?.command));
+    if (!cfg.hooks[key].length) delete cfg.hooks[key];
+  }
+  const win = p => p.split(path.sep).join('/');
+  const ours = { command: `node ${win(path.join(hooksDir, 'warm-code-index.mjs'))}`, timeout: 600 };
+  const guardHook = { command: `node ${win(path.join(hooksDir, 'prompt-guard.mjs'))}`, timeout: 10 };
+  // Cursor 的 matcher 只认字面工具名,正则会被判"全部工具不支持"并整组跳过;转发器同进程读 stdin(Windows 直呼子进程接不到管道)
+  const readHook = { command: `node ${win(path.join(hooksDir, 'read-guard.mjs'))}`, matcher: 'Read', timeout: 10 };
+  const shellHook = { command: hubCommand('read-guard.mjs'), timeout: 10 };
+  cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
+  cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
+  cfg.hooks.preToolUse = [readHook, ...(cfg.hooks.preToolUse || [])];
+  cfg.hooks.beforeShellExecution = [shellHook, ...(cfg.hooks.beforeShellExecution || [])];
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
+  ok(`[user] Cursor 用户级钩子已写入 ${cfgPath}`);
+}
+
+/**
+ * Qoder 用户级接线:~/.qoder-cn/settings.json(CN 版;国际版 ~/.qoder)+ 同目录 hooks/ 转发器。
+ * SDK 按 user → project → local 顺序合并 settings,同形状。
+ */
+export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
+  const userDir = qoderUserDir(home);
+  const hooksDir = path.join(userDir, 'hooks');
+  fs.mkdirSync(hooksDir, { recursive: true });
+  fs.writeFileSync(path.join(hooksDir, 'session-start.mjs'), qoderWrapSource(hooksDir, 'auto.mjs', 'SessionStart'));
+  fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), qoderWrapSource(hooksDir, 'prompt-guard.mjs', 'UserPromptSubmit'));
+  fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), qoderPassthroughSource(hooksDir, 'commit-refresh.mjs'));
+  fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), qoderReadGuardSource(hooksDir));
+  try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
+  const settingsPath = path.join(userDir, 'settings.json');
   let cfg = { hooks: {} };
   if (fs.existsSync(settingsPath)) {
     try {
       cfg = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     } catch (e) {
-      console.error(`  [warn] [${path.basename(root)}] .qoder/settings.json 解析失败,未改 JSON(${e.message});转发器已按当前模块重写`);
+      console.error(`[warn] ${settingsPath} 解析失败,未改(${e.message})`);
       return;
     }
   }
@@ -631,16 +721,13 @@ export function rewriteQoderHooks(root) {
     if (Array.isArray(hooks[key])) hooks[key] = dropHookGroups(hooks[key], (h) => isCodeIndexHookRef(h?.command));
   }
   const prepend = (name, group) => { hooks[name] = [group, ...(Array.isArray(hooks[name]) ? hooks[name] : [])]; };
-  prepend('SessionStart', { hooks: [qoderCmd('.qoder/hooks/session-start.mjs', 420, '索引保鲜检查+预热本地检索模型')] });
-  prepend('PostToolUse', { matcher: 'Bash|Shell', hooks: [qoderCmd('.qoder/hooks/commit-refresh.mjs', 10, '提交后索引保鲜')] });
-  prepend('UserPromptSubmit', { hooks: [qoderCmd('.qoder/hooks/prompt-guard.mjs', 10, '模型变更检测')] });
-  prepend('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [qoderCmd('.qoder/hooks/read-guard.mjs', 10, '超行数全量 Read/Bash 拦截')] });
-  for (const key of Object.keys(hooks)) {
-    if (Array.isArray(hooks[key]) && hooks[key].length === 0) delete hooks[key];
-  }
-  fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true });
+  const fwd = f => path.join(hooksDir, f).split(path.sep).join('/');
+  prepend('SessionStart', { hooks: [qoderCmd(fwd('session-start.mjs'), 420, '索引保鲜检查+预热本地检索模型')] });
+  prepend('PostToolUse', { matcher: 'Bash|Shell', hooks: [qoderCmd(fwd('commit-refresh.mjs'), 10, '提交后索引保鲜')] });
+  prepend('UserPromptSubmit', { hooks: [qoderCmd(fwd('prompt-guard.mjs'), 10, '模型变更检测')] });
+  prepend('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [qoderCmd(fwd('read-guard.mjs'), 10, '超行数全量 Read/Bash 拦截')] });
   fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
-  ok(`[${path.basename(root)}] Qoder hooks 已按当前模块重写(其他钩子保留)`);
+  ok(`[user] Qoder 用户级钩子已写入 ${settingsPath}`);
 }
 
 if (directRun) {
@@ -654,11 +741,11 @@ const hookTools = resolveHookTargets(hookArg);
 }
 log(`\n[4/5]+[5/5] 对每个 git 仓库 root 接线会话 hook + AGENTS.md 检索纪律`);
 
-/** 给一个 git 仓库根接线选中的 editor hook、AGENTS.md 纪律段 */
+/** 给一个 git 仓库根清理旧工作区钩子、AGENTS.md 纪律段(钩子本体在用户级,只在循环后装一次) */
 function wireRepo(root) {
-  if (hookTools.includes('zcode')) rewriteZcodeHooks(root);
-  if (hookTools.includes('cursor')) rewriteCursorHooks(root);
-  if (hookTools.includes('qoder')) rewriteQoderHooks(root);
+  if (hookTools.includes('zcode')) cleanZcodeWorkspaceHooks(root);
+  if (hookTools.includes('cursor')) cleanCursorWorkspaceHooks(root);
+  if (hookTools.includes('qoder')) cleanQoderWorkspaceHooks(root);
   const agentsPath = path.join(root, 'AGENTS.md');
   const MARK_V2 = '<!-- code-index:v2 -->';
   const rel = path.relative(root, here).split(path.sep).join('/');
@@ -750,6 +837,12 @@ for (const r of wireRoots) {
     ensureGitignore(r, giEntries);
   } else console.error(`  [note] ${r} 非 git 仓库,只索引不接线(无 AGENTS.md/hooks)`);
 }
+
+// 钩子本体统一装在用户级:所有工作区共享一份,绝对路径直指本模块,不依赖各仓的 workspace 信任审批
+log(`\n[user] 用户级钩子接线(${hookTools.join(', ')})`);
+if (hookTools.includes('zcode')) rewriteZcodeUserHooks();
+if (hookTools.includes('cursor')) rewriteCursorUserHooks();
+if (hookTools.includes('qoder')) rewriteQoderUserHooks();
 
 log(`\n============ 初始化完成 ============`);
 // CODE_MAP 模板(项目资产,位于 data/;已存在则不动)

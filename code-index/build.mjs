@@ -20,7 +20,10 @@ import { loadConfig, DATA_DIR, gitHeadOf, findGitRoot, MODULE_DIR } from './conf
 /** 工具目录是否是宿主仓的直接子目录(hub 部署)。 */
 export function isHubDir(moduleDir) {
   const root = findGitRoot(moduleDir);
-  return !!root && path.dirname(path.resolve(moduleDir)) === path.resolve(root);
+  if (!root) return false;
+  // findGitRoot 返回 realpath;moduleDir 侧也要 realpath,否则 tmp 的 8.3 短路径(ADMINI~1)对比失败
+  const dir = fs.realpathSync.native(path.resolve(moduleDir));
+  return path.dirname(dir) === root;
 }
 // hub:宿主代码也纳入索引(用户可能自行改造工具);复制部署时仍排除工具自身
 const HUB = isHubDir(MODULE_DIR);

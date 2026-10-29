@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/** ollamaGuard 纯函数测试:模型名比对、替换探测。启动:cd code-index && npm test(或 node ../test/ollamaGuard.test.mjs) */
 import assert from 'node:assert/strict';
 import { sameOllamaName, replacedOllamaNames } from '../code-index/ollamaGuard.mjs';
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/** config 纯函数测试:数据目录落点、CODE_INDEX_DATA_DIR、packed/非 packed 布局。启动:cd code-index && npm test(或 node ../test/config.test.mjs) */
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { DEFAULT_CONFIG, isInsideNodeModules, resolveLayout } from '../code-index/config.mjs';

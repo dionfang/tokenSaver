@@ -5,8 +5,9 @@
  *   node regress.mjs --suite [--seed N] [--n-sym 30] [--n-gap 20]
  *     按当前索引/roots 现抽 SYM+GAP 题,再跑 bm25/hybrid/rerank。
  *     数据目录:CODE_INDEX_DATA_DIR 或 TokenSaver/data。--gt 可对已有 jsonl 跑单臂。
+ * 启动:cd code-index && npm run regress(或 node ../test/regress.mjs --suite)
  */
-import { generateQuestions, writeQuestions } from './gen-questions.mjs';
+import { generateQuestions, writeQuestions } from './scripts/gen-questions.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';

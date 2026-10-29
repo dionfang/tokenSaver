@@ -91,6 +91,60 @@ export async function verifyTask(task, work) {
       return { ok: true, msg: 'PASS' };
     }
 
+    if (task === 't6') {
+      const m = await load(path.join(work, 'fmt.mjs'));
+      const pad = m.pad || m.default?.pad;
+      if (!pad) return fail('找不到 pad 导出');
+      assert.equal(pad('ab', 5), 'ab   ', '右侧补齐');
+      assert.equal(pad('abcdef', 4), 'abcd', '超长截断');
+      assert.equal(pad('abc', 3), 'abc', '恰好等长');
+      assert.equal(pad('', 2), '  ', '空串补齐');
+      return { ok: true, msg: 'PASS' };
+    }
+
+    if (task === 't7') {
+      // 用例必须跑得过原实现,且把坏实现替换进来时用例必须能挂(边界覆盖探针)
+      const testFile = path.join(work, 'util.test.mjs');
+      if (!fs.existsSync(testFile)) return fail('util.test.mjs 不存在');
+      const goodRun = run([ '--test', testFile ]);
+      if (goodRun.code !== 0) return fail(`用例跑不过原实现: ${goodRun.err}`);
+      const badImpl = path.join(here, 'fixtures', 'bad', 't7', 'escapeHtml.bad.mjs');
+      if (!fs.existsSync(badImpl)) return fail('缺探针坏实现 fixture');
+      const target = path.join(work, 'escapeHtml.mjs');
+      const backup = fs.readFileSync(target, 'utf8');
+      let badCaught = false;
+      try {
+        fs.copyFileSync(badImpl, target);
+        badCaught = run([ '--test', testFile ]).code !== 0;
+      } finally {
+        fs.writeFileSync(target, backup);
+      }
+      if (!badCaught) return fail('用例拦不住坏实现,边界覆盖不足');
+      return { ok: true, msg: 'PASS' };
+    }
+
+    if (task === 't8') {
+      const m = await load(path.join(work, 'parseIni.mjs'));
+      const p = m.parseIni || m.default?.parseIni;
+      if (!p) return fail('找不到 parseIni 导出');
+      const text = [
+        '; top comment',
+        'top = 1',
+        '[db]',
+        'host = localhost',
+        'dsn = "a b"',
+        'bad line no equals',
+        '# hash comment',
+      ].join('\n');
+      const out = p(text);
+      assert.equal(out.top, '1', '节外键');
+      assert.equal(out.db.host, 'localhost', '节内键');
+      assert.equal(out.db.dsn, 'a b', '去引号');
+      assert.equal(Object.keys(out).length, 2, '只应有 top 与 db');
+      assert.deepEqual(p(''), {}, '空文本');
+      return { ok: true, msg: 'PASS' };
+    }
+
     return fail(`unknown task ${task}`);
   } catch (e) {
     return fail(e.message);

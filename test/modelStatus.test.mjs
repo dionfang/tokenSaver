@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+/** modelStatus 纯函数测试:输入端按日累计(原文/压缩后/节约)、比率与历史日期保留。 启动:cd code-index && npm test(或 node ../test/modelStatus.test.mjs) */
 /** 输入端按日累计:原文、压缩后、节约。比率由当天前两个数相除。历史日期保留。 */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -57,6 +59,26 @@ assert.equal(typeof mod.accumulateSavings, 'function');
   assert.ok(Number.isFinite(before) && before >= 0);
   assert.equal(mod.addInputSavings(0, 0), before, '原文为 0 不累加');
   assert.equal(mod.addInputSavings(-3, 1), before);
+}
+
+{
+  // readInputTokens 信息字段:写入真实账本后原样还原,不影响节约口径
+  const file = path.join(here, '..', 'data', 'session-savings.json');
+  const snapshot = fs.existsSync(file) ? fs.readFileSync(file) : null;
+  try {
+    mod.addReadInputTokens(500);
+    mod.addReadInputTokens(250);
+    assert.ok(mod.readDayReadInputTokens() >= 750, 'readInputTokens 累加');
+    // 回归:随后的搜索/拦截记账不得清零 readInputTokens
+    mod.addInputSavings(1000, 400);
+    assert.ok(mod.readDayReadInputTokens() >= 750, 'addInputSavings 后 readInputTokens 存活');
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const today = j.days[mod.dayKey(Date.now())];
+    assert.equal(typeof today.readInputTokens, 'number', '当日桶带 readInputTokens');
+    assert.equal(typeof today.savedTokens, 'number');
+  } finally {
+    if (snapshot) fs.writeFileSync(file, snapshot); else fs.rmSync(file, { force: true });
+  }
 }
 
 console.log('ok');

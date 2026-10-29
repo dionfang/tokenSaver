@@ -53,14 +53,16 @@ export function dayKey(ts) {
 }
 
 function zeroBucket() {
-  return { originalTokens: 0, compressedTokens: 0, savedTokens: 0 };
+  return { originalTokens: 0, compressedTokens: 0, savedTokens: 0, readInputTokens: 0 };
 }
 
 function bucketOf(raw) {
   const originalTokens = Math.max(0, Math.round(Number(raw?.originalTokens) || 0));
   const compressedTokens = Math.max(0, Math.round(Number(raw?.compressedTokens) || 0));
   const savedTokens = Math.max(0, Math.round(Number(raw?.savedTokens) || 0));
-  return { originalTokens, compressedTokens, savedTokens };
+  // Read/Bash 工具结果实际进入上下文的量(信息字段),独立于节约三件套
+  const readInputTokens = Math.max(0, Math.round(Number(raw?.readInputTokens) || 0));
+  return { originalTokens, compressedTokens, savedTokens, readInputTokens };
 }
 
 /** 旧的平铺账(含 basisSaved)收成按日记录。没有原文分母的纯估算不带入。 */
@@ -141,6 +143,8 @@ export function accumulateSavings(state, originalTokens, compressedTokens) {
     originalTokens: (state.originalTokens || 0) + counted.original,
     compressedTokens: (state.compressedTokens || 0) + counted.compressed,
     savedTokens: 0,
+    // 信息字段必须透传,否则一次搜索/拦截记账会把当日 readInputTokens 清零
+    readInputTokens: state.readInputTokens || 0,
   };
   bucket.savedTokens = Math.max(0, bucket.originalTokens - bucket.compressedTokens);
   days[date] = bucket;
@@ -153,6 +157,24 @@ export function addInputSavings(originalTokens, compressedTokens) {
   if (next === state) return state.savedTokens;
   try { writeDoc(next); } catch { /* 记账失败不影响检索 */ }
   return next.savedTokens;
+}
+
+/** 工具结果实际进入上下文的量(Read/Bash,bytes/4 折算)。信息字段,不影响 savedTokens。 */
+export function addReadInputTokens(tokens) {
+  const n = Math.max(0, Math.round(Number(tokens) || 0));
+  if (n <= 0) return;
+  const state = readSavingsState();
+  const date = state.date || dayKey(Date.now());
+  const days = { ...(state.days || {}) };
+  const bucket = bucketOf(days[date]);
+  bucket.readInputTokens += n;
+  days[date] = bucket;
+  try { writeDoc({ updatedAt: Date.now(), days }); } catch { /* 记账失败不影响调用方 */ }
+}
+
+/** 当日实际读入的 token(信息口径)。 */
+export function readDayReadInputTokens() {
+  return readSavingsState().readInputTokens || 0;
 }
 
 let encodePromise = null;

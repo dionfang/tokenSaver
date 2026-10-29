@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(here, '../..');
+const root = path.resolve(here, '../../..');
 const argv = process.argv.slice(2);
 const opt = (name, def) => {
   const i = argv.indexOf(name);
@@ -69,7 +69,7 @@ const hasPonytail = content.includes('<!-- ponytail -->');
 const expected = cond === 'B';
 if (hasPonytail !== expected) {
   console.error(`[err] AGENTS.md 状态是 ${hasPonytail ? 'B(有 ponytail)' : 'A(无 ponytail)'},与 ${cond} 不一致。`);
-  console.error(`      先运行: node test/ab/condition.mjs ${cond}`);
+  console.error(`      先运行: node test/scripts/ab/condition.mjs ${cond}`);
   process.exit(1);
 }
 

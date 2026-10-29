@@ -1,11 +1,12 @@
 #!/usr/bin/env node
+/** read-guard 端到端测试:超行数 Read/Bash cat 拦截、offset/limit 放行、5 分钟重试、BOM、fail-open、记账。启动:cd code-index && npm test(或 node ../test/read-guard.test.mjs) */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { rewriteCursorHooks } from '../code-index/init.mjs';
+import { rewriteCursorUserHooks } from '../code-index/init.mjs';
 import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, oversizeGuidance, OVERRIDE_WINDOW_MS, tokensFromBlockedBytes } from '../code-index/read-guard.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -298,7 +299,7 @@ assert.equal(claudeBashDeny.hookSpecificOutput.permissionDecision, 'deny');
 assert.match(claudeBashDeny.hookSpecificOutput.permissionDecisionReason, /sed -n/);
 
 const hookRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-rg-hook-'));
-rewriteCursorHooks(hookRoot);
+rewriteCursorUserHooks({ home: hookRoot });
 const fwd = path.join(hookRoot, '.cursor', 'hooks', 'read-guard.mjs');
 const fwdDir = path.join(tmp, 'data-fwd');
 const fwdChild = spawn(process.execPath, [fwd], {

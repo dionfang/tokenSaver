@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+/** gen-questions 纯函数测试:符号拆词、按块抽 SYM/GAP 题、可复现。启动:cd code-index && npm test(或 node ../test/gen-questions.test.mjs) */
 import assert from 'node:assert/strict';
-import { chunkQueries, generateFromChunks, splitIdent } from './gen-questions.mjs';
+import { chunkQueries, generateFromChunks, splitIdent } from './scripts/gen-questions.mjs';
 
 assert.deepEqual(splitIdent('topListingByUser'), ['top', 'Listing', 'By', 'User']);
 assert.ok(splitIdent('script:unlockContact').includes('unlock') || splitIdent('script:unlockContact').includes('Contact'));
