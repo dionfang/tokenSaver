@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /** read-nudge 纯函数测试:连续区间读导航、全量读清零、Bash 大输出、失败导航、限频、记账字节数。 启动:cd code-index && npm test(或 node ../test/read-nudge.test.mjs) */
 import assert from 'node:assert/strict';
-import { evaluateNudge } from '../code-index/read-nudge.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { evaluateNudge, runReadNudge } from '../code-index/read-nudge.mjs';
 
 const cfg = { enabled: true, bashDumpBytes: 24 * 1024, windowMs: 10 * 60 * 1000 };
 const now = 1_800_000_000_000;
@@ -104,5 +107,41 @@ assert.equal(r.context, undefined, '失败提示 5 分钟内不重复');
 r = evaluateNudge({ hookEventName: 'PostToolUse', toolName: 'Read', toolInput: { file_path: 'D:/x/a.ts', offset: 1, limit: 1 }, toolResponse: { stdoutBytes: 4096 }, history: {}, now, config: { ...cfg, enabled: false } });
 assert.equal(r.context, undefined);
 assert.equal(r.accountTokens, undefined, '关闭时不记账');
+
+// runReadNudge:Cursor 载荷(tool_output 字符串、toolInput 对象、字节量未知)→ 导航文案省略 KB 段
+{
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-nudge-'));
+  const sid = 'cursor-style';
+  const payload = (offset) => JSON.stringify({
+    hookEventName: 'postToolUse', conversation_id: sid,
+    tool_name: 'Read', tool_input: { path: 'D:/x/c.ts', offset, limit: 100 },
+    tool_output: 'x'.repeat(5000),
+  });
+  const first = await runReadNudge({ stdinText: payload(1), stateDir, account: false });
+  assert.equal(first.additionalContext, undefined, 'Cursor 首段不提示');
+  const second = await runReadNudge({ stdinText: payload(101), stateDir, account: false });
+  assert.match(second.additionalContext, /连续区间读 2 段/);
+  assert.match(second.additionalContext, /约 \d+ KB/, 'tool_output 字符串可算出字节量');
+  // 会话归属:按 conversation_id 分文件,不同会话互不干扰
+  assert.ok(fs.existsSync(path.join(stateDir, `${sid}.reads.json`)), '按 conversation_id 落状态');
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
+
+// Cursor 的事件名是小写驼峰 postToolUseFailure,失败导航要认
+{
+  const r2 = evaluateNudge({
+    hookEventName: 'postToolUseFailure', toolName: 'Read',
+    toolInput: { path: 'D:/gone.ts' }, toolResponse: {},
+    history: {}, now, config: cfg,
+  });
+  assert.match(r2.context, /search\.mjs/, 'Cursor 小写事件名也要触发失败导航');
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-nudge2-'));
+  const out = await runReadNudge({
+    stdinText: JSON.stringify({ hookEventName: 'postToolUseFailure', conversation_id: 'cid-fail', tool_name: 'Read', tool_input: { path: 'D:/gone.ts' }, tool_output: 'err' }),
+    stateDir, account: false,
+  });
+  assert.match(out.additionalContext, /search\.mjs/, 'Cursor 失败导航端到端');
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
 
 console.log('ok');

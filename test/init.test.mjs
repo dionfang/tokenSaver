@@ -207,9 +207,16 @@ assert.equal(userCursor.hooks.preToolUse[0].matcher, 'Read', 'matcher 只能是�
 assert.ok(userCursor.hooks.preToolUse[0].command.startsWith('node '), 'Cursor preToolUse 用转发器命令');
 const userCursorFwd = userCursor.hooks.preToolUse[0].command.replace(/^node /, '');
 assert.ok(fs.existsSync(userCursorFwd), 'Cursor 转发器真实存在');
+assert.equal(userCursor.hooks.postToolUse[0].matcher, 'Read|Bash', 'postToolUse matcher:Bash 会被映射为 Shell');
+const nudgeFwd = userCursor.hooks.postToolUse[0].command.replace(/^node /, '');
+assert.ok(fs.existsSync(nudgeFwd), 'read-nudge 转发器真实存在');
+assert.ok(nudgeFwd.endsWith('.cursor/hooks/read-nudge.mjs'));
+assert.equal(userCursor.hooks.postToolUseFailure[0].matcher, undefined, 'postToolUseFailure 不支持 matcher');
+assert.ok(fs.existsSync(userCursor.hooks.postToolUseFailure[0].command.replace(/^node /, '')));
 rewriteCursorUserHooks({ home: fakeHome });
 const userCursor2 = JSON.parse(fs.readFileSync(path.join(fakeHome, '.cursor', 'hooks.json'), 'utf8'));
 assert.equal(userCursor2.hooks.preToolUse.length, 1, '幂等');
+assert.equal(userCursor2.hooks.postToolUse.length, 1, '幂等:postToolUse 不累积');
 
 rewriteQoderUserHooks({ home: fakeHome });
 assert.equal(qoderUserDir(fakeHome), path.join(fakeHome, '.qoder-cn'), 'CN 目录优先');

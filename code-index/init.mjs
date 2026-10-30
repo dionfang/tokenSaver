@@ -366,12 +366,12 @@ function ensureGitignore(root, entries) {
 export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
   // output-savings 已下线,仍匹配以便 rewrite 时卸掉旧钩子
-  if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard)\.mjs$/.test(s)) return true;
+  if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard|read-nudge)\.mjs$/.test(s)) return true;
   // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
-  if (/(?:^|[\s/"'])\.qoder(?:-cn)?\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
+  if (/(?:^|[\s/"'])\.qoder(?:-cn)?\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard|read-nudge)\.mjs$/.test(s)) return true;
   if (/(?:^|[\s/"'])\.zcode\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const names = 'auto|commit-refresh|prompt-guard|read-guard|warm|output-savings';
+  const names = 'auto|commit-refresh|prompt-guard|read-guard|read-nudge|warm|output-savings';
   if (new RegExp(`(?:^|/)(?:code-index|tokensaver|${dir})/(?:${names})\\.mjs$`).test(s)) return true;
   const herePosix = here.replace(/\\/g, '/');
   return s.includes(herePosix + '/') || s.endsWith(herePosix);
@@ -416,6 +416,15 @@ function cursorReadGuardSource(hooksDir) {
     ? `import { pathToFileURL } from 'node:url'\n`
     : `import path from 'node:path'\nimport { fileURLToPath, pathToFileURL } from 'node:url'\n\nconst here = path.dirname(fileURLToPath(import.meta.url))\n`;
   return `/** Cursor preToolUse Read: 同进程调用 read-guard.mjs。stdout 含 permission deny 才拦截;失败则 allow。 */\n${head}const entry = ${entryExpr}\nlet raw = ''\nprocess.stdin.setEncoding('utf8')\nprocess.stdin.on('data', (c) => { raw += c })\nprocess.stdin.on('end', async () => {\n  try {\n    const { runReadGuard } = await import(pathToFileURL(entry).href)\n    await runReadGuard({ stdinText: raw })\n  } catch {\n    process.stdout.write('{"permission":"allow"}')\n  }\n})\n`;
+}
+
+function cursorReadNudgeSource(hooksDir) {
+  const entryExpr = hookEntryExpr(hooksDir, 'read-nudge.mjs');
+  const rel = path.relative(hooksDir, path.join(here, 'read-nudge.mjs'));
+  const head = path.isAbsolute(rel)
+    ? `import { pathToFileURL } from 'node:url'\n`
+    : `import path from 'node:path'\nimport { fileURLToPath, pathToFileURL } from 'node:url'\n\nconst here = path.dirname(fileURLToPath(import.meta.url))\n`;
+  return `/** Cursor postToolUse/postToolUseFailure: 同进程调用 read-nudge.mjs,输出 additionalContext 导航;失败静默。 */\n${head}const entry = ${entryExpr}\nlet raw = ''\nprocess.stdin.setEncoding('utf8')\nprocess.stdin.on('data', (c) => { raw += c })\nprocess.stdin.on('end', async () => {\n  try {\n    const { runReadNudge } = await import(pathToFileURL(entry).href)\n    await runReadNudge({ stdinText: raw })\n  } catch {\n    process.stdout.write('{}')\n  }\n})\n`;
 }
 
 function qoderReadGuardSource(hooksDir) {
@@ -475,7 +484,7 @@ export function cleanCursorWorkspaceHooks(root) {
       }
     } catch { /* JSON 坏了不动,只删转发器 */ }
   }
-  for (const f of ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'output-savings.mjs']) {
+  for (const f of ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'output-savings.mjs']) {
     try { fs.rmSync(path.join(hooksDir, f), { force: true }); } catch { /* 无该文件 */ }
   }
   try { fs.rmdirSync(hooksDir); } catch { /* 非空(如用户的 skills)或不存在 */ }
@@ -658,6 +667,7 @@ export function rewriteCursorUserHooks({ home = os.homedir() } = {}) {
   fs.writeFileSync(path.join(hooksDir, 'warm-code-index.mjs'), cursorForwarderSource(hooksDir));
   fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), cursorPromptGuardSource(hooksDir));
   fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), cursorReadGuardSource(hooksDir));
+  fs.writeFileSync(path.join(hooksDir, 'read-nudge.mjs'), cursorReadNudgeSource(hooksDir));
   try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
   const cfgPath = path.join(home, '.cursor', 'hooks.json');
   let cfg = { version: 1, hooks: {} };
@@ -683,10 +693,15 @@ export function rewriteCursorUserHooks({ home = os.homedir() } = {}) {
   // Cursor 的 matcher 只认字面工具名,正则会被判"全部工具不支持"并整组跳过;转发器同进程读 stdin(Windows 直呼子进程接不到管道)
   const readHook = { command: `node ${win(path.join(hooksDir, 'read-guard.mjs'))}`, matcher: 'Read', timeout: 10 };
   const shellHook = { command: hubCommand('read-guard.mjs'), timeout: 10 };
+  // Bash 在 Cursor 的工具名是 Shell(transformToolMapper: Bash→Shell),matcher 写 Read|Bash 即得 Read|Shell
+  const nudgeHook = { command: `node ${win(path.join(hooksDir, 'read-nudge.mjs'))}`, matcher: 'Read|Bash', timeout: 10 };
+  const failHook = { command: `node ${win(path.join(hooksDir, 'read-nudge.mjs'))}`, timeout: 10 };
   cfg.hooks.sessionStart = [ours, ...(cfg.hooks.sessionStart || [])];
   cfg.hooks.beforeSubmitPrompt = [guardHook, ...(cfg.hooks.beforeSubmitPrompt || [])];
   cfg.hooks.preToolUse = [readHook, ...(cfg.hooks.preToolUse || [])];
   cfg.hooks.beforeShellExecution = [shellHook, ...(cfg.hooks.beforeShellExecution || [])];
+  cfg.hooks.postToolUse = [nudgeHook, ...(cfg.hooks.postToolUse || [])];
+  cfg.hooks.postToolUseFailure = [failHook, ...(cfg.hooks.postToolUseFailure || [])];
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] Cursor 用户级钩子已写入 ${cfgPath}`);
 }
