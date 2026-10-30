@@ -32,7 +32,7 @@
  *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具的用户级配置里本模块的钩子;
  *      同文件里的其他钩子保留。JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段(含文档英文一条),没有则追加;文件不存在则新建。
- *      再追加或替换末尾的输出纪律段(<!-- output-diet-v7 -->;遇旧 Ponytail 段一并迁移剥离),不改纪律段和其他原文。
+ *      再追加或替换末尾的输出纪律段(<!-- output-diet-v10 -->;遇旧版本段与旧 Ponytail 段一并迁移剥离),不改纪律段和其他原文。
  *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor/.zcode/.qoder 始终忽略。
  *      不存在 CODE_MAP.md 时写一份空模板,已有则不动。
  * 依赖安装与索引构建均不可跳过。
@@ -175,7 +175,7 @@ export function healRoots(roots, { siblingOf, exists = fs.existsSync, onMissing,
 const log = (s) => console.log(s);
 const ok = (s) => console.log(`  [ok] ${s}`);
 
-export const DIET_MARK = '<!-- output-diet-v7 -->';
+export const DIET_MARK = '<!-- output-diet-v10 -->';
 
 /** 输出纪律块:标记行 + output-diet.md 全文(内容同步自 A/B 实验的 v7 定稿,防漂移由 init.test 断言)。 */
 export function dietBlock(hereDir) {
