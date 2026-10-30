@@ -3,7 +3,7 @@
  * A/B 记账。用法:
  *   node record.mjs --task t1 --cond A --pass pass --agent agent_xxx --since ISO
  *     [--rollout 目录] [--runs 目录] [--out results.jsonl] [--agents AGENTS.md]
- *     [--replace] [--dry]
+ *     [--mark 标记] [--replace] [--dry]
  *
  * 归属规则(硬约束):
  *   只接受 sessionId === 'sess_subagent_' + agentId 的记录。
@@ -51,10 +51,11 @@ const task = tasks.find(t => t.id === taskId);
 if (!task) die(`tasks.json 里没有任务 ${taskId}`);
 
 const agentsPath = path.resolve(opt('--agents', path.join(root, 'AGENTS.md')));
+const mark = opt('--mark', '<!-- ponytail -->');
 const agents = fs.readFileSync(agentsPath, 'utf8');
-const hasPonytail = agents.includes('<!-- ponytail -->');
-if (hasPonytail !== (cond === 'B')) {
-  die(`AGENTS.md 当前是 ${hasPonytail ? 'B(有 ponytail)' : 'A(无 ponytail)'}，与 --cond ${cond} 不一致`);
+const rulesActive = agents.includes(mark);
+if (rulesActive !== (cond === 'B')) {
+  die(`AGENTS.md 当前是 ${rulesActive ? 'B(有规则段)' : 'A(无规则段)'}(${mark})，与 --cond ${cond} 不一致`);
 }
 
 const promptPath = path.resolve(here, task.prompt);
@@ -143,7 +144,8 @@ const rec = {
   task: taskId,
   cond,
   pass: pass === 'pass',
-  ponytail: hasPonytail,
+  mark,
+  rulesActive,
   agentId,
   sessionId: sid,
   since: new Date(since).toISOString(),

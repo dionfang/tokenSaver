@@ -3,7 +3,8 @@
  * A/B 汇总。默认要求每个任务 A/B 各一条、提示词哈希一致、模型一致、任务全通过；
  * 任一不满足就标记“不可作为收益结论”，但仍打印表格方便排查。
  *
- * 用法: node summarize.mjs [--results data/ab/results.jsonl] [--partial] [--json] [--out 文件]
+ * 用法: node summarize.mjs [--results data/ab/results.jsonl] [--partial] [--json]
+ *   [--out 文件] [--title 标题]
  * 退出码: 0 = 可比较;1 = 数据不完整/不可比较。
  */
 import fs from 'node:fs';
@@ -96,7 +97,7 @@ const nf = (n) => (Number.isFinite(n) ? Math.round(n).toLocaleString('en-US') : 
 const mark = (b) => (b ? 'pass' : 'fail');
 
 const lines = [
-  '# Ponytail A/B 汇总',
+  `# ${opt('--title', 'Ponytail A/B 汇总')}`,
   '',
   `- 数据:${resultsPath}`,
   `- 任务数:${pairs.length}/${taskIds.length}`,

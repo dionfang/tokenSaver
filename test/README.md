@@ -8,7 +8,7 @@ Only test launchers live at the top level (each file's header comment shows how 
 cd TokenSaver/code-index
 ```
 
-## `npm test`（14 个启动脚本）
+## `npm test`（15 个启动脚本）
 
 跑全部单元测试，不读索引、不调检索，几秒结束：
 
@@ -27,6 +27,7 @@ cd TokenSaver/code-index
 | `modelStatus.test.mjs` | 输入端按日累计记账、比率与历史日期保留 |
 | `usageReport.test.mjs` | 输出端报表：解析、来源过滤、去重、A/B 对比 |
 | `ab-selftest.test.mjs` | A/B 脚手架自检：验收器 good/bad、条件切换、汇总门槛 |
+| `input-ab.test.mjs` | 输入端反事实重放：真实格式回执解析、源码模板串不误报、合成 rollout 的受影响行与节约数 |
 
 ```bash
 npm test
@@ -60,3 +61,4 @@ Helpers under `scripts/` — imported by launchers, or manual tools:
 | `scripts/usageReport.mjs` | 输出端用量报表（手动工具）：读 ZCode model-io rollout 按会话汇总 tokens，支持 A/B 对比。`node test/scripts/usageReport.mjs --dir <rollout 目录>` |
 | `scripts/extractive-ab.mjs` | 抽取式上下文压缩 A/B 实验（手动工具，**依赖 Ollama 在线**）：A=全文 vs B=余弦保真历史。`node test/scripts/extractive-ab.mjs --rollout <jsonl> --cursor <jsonl>` |
 | `scripts/ab/` | Ponytail 输出端 A/B 测试脚手架（verify/condition/prepare/record/summarize + fixtures/prompts），操作手册见 [`scripts/ab/README.md`](scripts/ab/README.md) |
+| `scripts/input-ab.mjs` | 输入端反事实 A/B（手动工具）：从 rollout 重放历史，把拦截回执换成文件全文并按其后每个 iteration 累加，量化"会话累计"口径与账本"入口一次"记账的偏差。`node test/scripts/input-ab.mjs --rollout <jsonl>` 或 `--selftest`；`--events` 读当日事件（拦截+检索）与水位文件，按类目呈现入口一次 / 已入账累计 / 待入账增量 |

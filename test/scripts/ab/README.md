@@ -2,6 +2,8 @@
 
 验证 ponytail(AGENTS.md 末尾的行为规则)是否降低子代理的输出 tokens。结果**不写入** `data/session-savings.json`;该账只记输入端。
 
+> 本脚手架已泛化,可测任意规则段,见下文「换一套规则复用」。
+
 ## 硬约束(违反则结果作废)
 
 1. **先自测验收器**:`node test/scripts/ab/verify.mjs --selftest` 必须通过。验收脚本自己也会错(T4 曾把数组长度 3 断言成 1),不能靠肉眼。
@@ -42,6 +44,67 @@ node test/scripts/ab/summarize.mjs
 
 8 个任务建议按 A/B 交替顺序跑,消解时间漂移;同一 task+cond 重跑要
 `prepare --force` 和 `record --replace`。
+
+## 换一套规则复用(自定义规则段)
+
+`condition/prepare/record` 都接受 `--mark`,`condition` 额外接受 `--rules <规则文件>`:
+A = 无该规则段;B = 备份原文后在末尾追加「标记 + 规则文件内容」(A→B 循环幂等,不会重复追加)。
+结果与 rollout 建议用独立的 `--results`/`--runs`,避免与 ponytail 轮次混写;`summarize --title` 换报告标题。
+
+```bash
+node test/scripts/ab/condition.mjs B --mark "<!-- output-diet -->" --rules test/scripts/ab/rules/output-diet.md
+node test/scripts/ab/prepare.mjs t1 B --mark "<!-- output-diet -->" --results data/ab/results.od.jsonl
+node test/scripts/ab/record.mjs --task t1 --cond B --pass pass --agent <id> --since <start> \
+  --mark "<!-- output-diet -->" --out data/ab/results.od.jsonl --runs data/ab/runs.od
+node test/scripts/ab/summarize.mjs --results data/ab/results.od.jsonl --title "output-diet 汇总"
+```
+
+已跑过的一轮(2026-10-30,GLM-5.3,8 任务配对):**output-diet**(规则在 `rules/output-diet.md`,
+设计原则与 ponytail 相反——不加流程步骤、不加固定结尾,只压思考冗余/过渡文字/轮次,显式禁止砍实现)。
+总 output A 9,973 / B 9,396(−5.8%),配对 t=−0.53 不显著;请求数 21→20。
+方向与 ponytail(点估计 +38%/+9.8%)相反。**质量信号**:B 组 1/8 首跑验收失败
+(t5 多位数字解析 bug,写完零验证就收工),A 组 0/8——规则 5「验证一次到位」被走样成「不验证」,
+后续改规则需把「写完必须跑一次检查」写成硬性。数据:`data/ab/results.od.jsonl`、
+`data/ab/summary-output-diet.md`,失败样本 `data/ab/runs.od/t5-B.fail1.*`。
+
+再一轮(2026-10-30,三轮 24 配对):**output-diet-v2**(规则在 `rules/output-diet-v2.md`,
+补 v1 教训:改文件用最小 Edit、必跑一次检查、「两步轨迹」写进规则 1)。
+三轮 output:A 11,420/7,948/6,516,B 稳定在 7,341/8,404/7,023;合并 **−12.0%(t=−1.53,p≈0.14,不显著)**。
+机制:规则把单请求输出钉在 ~350-370(A 在 352~564 漂移,存在随机「话多模式」),
+收益全部来自压制话多轮(R1 −35.7%),A 本身简洁时小亏 +6~8%。质量:B 0/24 首跑失败(A 1/24)。
+结论:作为输出保险/方差压制有效零质量代价;作为确定性省钱不显著。数据:
+`data/ab/results.od2.r{1,2,3}.jsonl`、`data/ab/summary-output-diet-v2.md`。
+
+第三、四代迭代(2026-10-30,结论性,详见 `data/ab/summary-output-diet-v3-v4.md`):
+**四个机制发现**——① output 差异 100% 在思考文本(24/24 同向),回复恒 3 字符;
+②「话多模式」是会话推进的函数(A 组 out/req 按时间 544→378→326→252→241→274 单调下降),
+v2 R1 的 −35.7% 主要是对照组话多期的**时序假象**,按 out/req 校正后规则真实效应只有 −7.9%;
+③ **安慰剂对照**(注入等长无关风格规则)比任何纪律臂都贵(同窗 t8:安慰剂 2028 vs v4 1141)——
+注入任何规则段都会提高 agent 对工作区其他规则(⚙ 状态句/索引)的关注度;
+④ **措辞反噬**:否定式与元层面表述会激活 agent 去权衡指令本身
+(v3「四步动作」→先规划后动手;「冲突时以任务为准」→ 真去跑 status.mjs;
+「跑一次检查」→ 往交付文件加自检断言;t5 +1101)。**最终推荐 output-diet-v4**
+(`rules/output-diet-v4.md`,去否定式、去元层面、验证=一条命令):合并 16 配对 +2.0%(t=0.16),
+但**单请求强度 −12%**,同窗对照强度比安慰剂低 25%;24/24 首跑验收 PASS。
+**方法论:主指标用 out/req 而非总输出(总输出被轮次与时序污染);跨时段比较必须同窗多臂对照。**
+诊断脚本 `node test/scripts/ab/diagnose.mjs --runs data/ab/runs.od4.r1` 输出思考/回复/工具参数/追问/预演/额外命令分解。
+
+最新一代(2026-10-30 第二轮):**output-diet-v6**(同窗 v4 vs v6 配对 8 任务,v6 **−20.9%** 总输出、
+强度 −13.0%、思考 −39%,16/16 验收 PASS,机制自洽;方向性证据未过显著线)。
+规则文件已**双语化**(中文条目+英文对译,兼容中文理解弱的模型;v4/v6 均已补,历史 v1/v2/v3/v5 存档不动)。
+v6 要点:全部肯定式/具体动作——Write 自动建目录不 ls/mkdir、实现严格按题面、
+验证=跑题面示例一次即交付、不在交付文件内嵌自检块。详见 `data/ab/summary-output-diet-v6.md`,
+数据 `data/ab/results.pair.{v4,v6}.jsonl`。遗留:无示例任务上"跑示例"被解释成额外验证(t4 +581),
+待 v7 补一句判据。
+
+**v7(当前推荐,`rules/output-diet-v7.md`)** = v6 + 规则5 补判据"题面没给示例时,运行一次不报错即交付"。
+同窗配对 5 任务(v6 输的 t1/t4/t6 + v6 赢的 t3/t8):总 Δ +3.5%(t=0.17,两版不可区分),
+但判据句在被针对的任务上明确生效(t6 思考减半 −2267 字符、t3 −1888),v7 唯一大败点 t8 的
++817 全是「AGENTS.md ⚙ 句 vs 任务一行回复」的**冲突权衡**思考(3,312 字符),非判据句所致。
+采纳 v7(消确定性浪费,剩下方差由权衡主导)。**新发现:冲突权衡是最大单项随机浪费**(本窗 3/10 派发中招,
+1,000–3,300 字符/次);修复杠杆不在输出纪律段,而在 AGENTS.md 自身给格式条款加明确豁免
+(给权衡一个判定捷径)。v8 候选:实验验证"豁免句"降权衡成本、防 v3 式反噬。
+详见 `data/ab/summary-output-diet-v7.md`,数据 `data/ab/results.pair2.{v6,v7}.jsonl`。
 
 ## 任务覆盖
 

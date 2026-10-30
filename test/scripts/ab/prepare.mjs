@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
  * A/B 运行前置检查。用法:
- *   node prepare.mjs <task> <A|B> [--force]
+ *   node prepare.mjs <task> <A|B> [--force] [--mark 标记]
  *   [--agents 路径] [--tasks 文件] [--work-root 目录] [--results 文件]
  *
  * 做的事:
  *   1. 清空任务工作目录(防止上一次条件留下的文件让 agent 只核对不重写)
  *   2. 复制输入文件
- *   3. 校验 AGENTS.md 当前状态与条件一致(A=无 ponytail,B=有)
+ *   3. 校验 AGENTS.md 当前状态与条件一致(A=无规则段,B=有;默认查 <!-- ponytail -->)
  *   4. 同一 task+cond 已有记录时拒绝,除非 --force
  * 输出 JSON,其中 start 是本次运行的记账起点,dispatch 后原样传给 record.mjs。
  */
@@ -24,12 +24,14 @@ const opt = (name, def) => {
 };
 const flag = (name) => argv.includes(name);
 
-const taskId = argv.find(a => !a.startsWith('--') && argv[argv.indexOf(a) - 1] !== '--agents' && argv[argv.indexOf(a) - 1] !== '--tasks' && argv[argv.indexOf(a) - 1] !== '--work-root' && argv[argv.indexOf(a) - 1] !== '--results');
+const taskId = argv.find(a => !a.startsWith('--') && argv[argv.indexOf(a) - 1] !== '--agents' && argv[argv.indexOf(a) - 1] !== '--tasks' && argv[argv.indexOf(a) - 1] !== '--work-root' && argv[argv.indexOf(a) - 1] !== '--results' && argv[argv.indexOf(a) - 1] !== '--mark');
 const cond = argv.find(a => a === 'A' || a === 'B') || argv[2];
 if (!taskId || (cond !== 'A' && cond !== 'B')) {
-  console.error('用法: node prepare.mjs <task> <A|B> [--force]');
+  console.error('用法: node prepare.mjs <task> <A|B> [--force] [--mark 标记]');
   process.exit(1);
 }
+
+const mark = opt('--mark', '<!-- ponytail -->');
 
 const tasksPath = path.resolve(opt('--tasks', path.join(here, 'tasks.json')));
 const agentsPath = path.resolve(opt('--agents', path.join(root, 'AGENTS.md')));
@@ -65,11 +67,11 @@ for (const rel of task.inputs || []) {
 }
 
 const content = fs.readFileSync(agentsPath, 'utf8');
-const hasPonytail = content.includes('<!-- ponytail -->');
+const hasRules = content.includes(mark);
 const expected = cond === 'B';
-if (hasPonytail !== expected) {
-  console.error(`[err] AGENTS.md 状态是 ${hasPonytail ? 'B(有 ponytail)' : 'A(无 ponytail)'},与 ${cond} 不一致。`);
-  console.error(`      先运行: node test/scripts/ab/condition.mjs ${cond}`);
+if (hasRules !== expected) {
+  console.error(`[err] AGENTS.md 状态是 ${hasRules ? 'B(有规则段)' : 'A(无规则段)'}(${mark}),与 ${cond} 不一致。`);
+  console.error(`      先运行: node test/scripts/ab/condition.mjs ${cond} --mark "${mark}" [--rules 规则文件]`);
   process.exit(1);
 }
 
