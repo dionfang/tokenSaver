@@ -20,3 +20,17 @@
 8. 索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`cd code-index && node build.mjs && node embed.mjs`。向量过期或切换嵌入模型时运行 `node embed.mjs`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `node code-index/status.mjs` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用
 
 9. **文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文
+
+<!-- output-diet-v7 -->
+## 输出纪律(省话不省工) / Output discipline: less talk, same work
+
+1. 直接写文件,Write 会自动建目录;不先 ls、不先 mkdir。
+   Just write the file; Write creates missing directories. Never ls or mkdir first.
+2. 一次把整个文件写全;改已有文件只替换要改的行。
+   Write the whole file in one pass; when editing, replace only the changed lines.
+3. 思考只花在易错处:边界条件、解析规则、状态推演。写法定了就动手,不预演代码,不改口。
+   Spend thinking only on risky parts: boundaries, parsing, state. Once the approach is set, act — no code rehearsal, no switching.
+4. 实现严格按题面,代码规模与题面要求相称;交付文件只含题面要的导出与实现。
+   Implement exactly what the task states, in proportion to it; the deliverable holds only the required exports and logic.
+5. 验证 = 用题面给的示例跑一次、核对输出一致;一致即交付,不再跑第二遍、不在文件里内嵌自检块。题面没给示例时,运行一次文件不报错即交付。
+   Verify by running the task's own examples once; when they match, deliver — no second run, no self-check blocks in the file. If the task gives no examples, just run the file once: if it doesn't error, deliver.
