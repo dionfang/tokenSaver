@@ -30,7 +30,7 @@
  *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具的用户级配置里本模块的钩子;
  *      同文件里的其他钩子保留。JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段(含文档英文一条),没有则追加;文件不存在则新建。
- *      再追加或替换末尾的 Ponytail 段(<!-- ponytail -->),不改纪律段和其他原文。
+ *      再追加或替换末尾的输出纪律段(<!-- output-diet-v7 -->;遇旧 Ponytail 段一并迁移剥离),不改纪律段和其他原文。
  *      补 .gitignore:本地复制部署忽略整个本目录和平行 data/;npm 安装只忽略 data/。.cursor/.zcode/.qoder 始终忽略。
  *      不存在 CODE_MAP.md 时写一份空模板,已有则不动。
  * 依赖安装与索引构建均不可跳过。
@@ -172,6 +172,61 @@ export function healRoots(roots, { siblingOf, exists = fs.existsSync, onMissing,
 
 const log = (s) => console.log(s);
 const ok = (s) => console.log(`  [ok] ${s}`);
+
+export const DIET_MARK = '<!-- output-diet-v7 -->';
+
+/** 输出纪律块:标记行 + output-diet.md 全文(内容同步自 A/B 实验的 v7 定稿,防漂移由 init.test 断言)。 */
+export function dietBlock(hereDir) {
+  const body = fs.readFileSync(path.join(hereDir, 'output-diet.md'), 'utf8').trim();
+  return `${DIET_MARK}\n${body}\n`;
+}
+
+/** 纯函数:给定 AGENTS.md 原文与纪律块,返回应用后的全文(追加/替换文末输出纪律段,剥离旧 Ponytail 段)。
+ * shortcut: 注入段按 init 惯例恒为文末段,剥离即从标记切到文末。 */
+export function applyDiet(content, block) {
+  const pi = content.indexOf('<!-- ponytail -->');
+  if (pi >= 0) content = content.slice(0, pi).replace(/\s+$/, '');
+  const re = /<!-- output-diet[^>]* -->[\s\S]*$/;
+  if (re.test(content)) return content.replace(re, block);
+  if (content && !content.endsWith('\n')) content += '\n';
+  return content + (content ? '\n' : '') + block;
+}
+
+/** 刷新单仓 AGENTS.md 两个注入段(检索纪律 + 输出纪律),不碰 hooks/索引;init 与 deploySync 共用。 */
+function wireAgents(root) {
+  const agentsPath = path.join(root, 'AGENTS.md');
+  const rel = path.relative(root, here).split(path.sep).join('/');
+  const dataRel = path.relative(root, DATA_DIR).split(path.sep).join('/');
+  const block = disciplineBlock({ rel, dataRel, packed: PACKED_INSTALL });
+  const snippet = '\n' + block;
+  // 标记与标题之间允许空行(如 prettier 会插入),否则匹配失败会再追加一段
+  const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- (?:ponytail|output-diet)[^>]* -->|\r?\n## |$)/;
+  const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : null;
+  if (content && sectionRe.test(content)) {
+    const next = content.replace(sectionRe, block);
+    if (next === content) ok(`[${path.basename(root)}] AGENTS.md 纪律段已与当前模板一致,跳过`);
+    else {
+      fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
+      ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(10 条)`);
+    }
+  } else if (content) {
+    fs.appendFileSync(agentsPath, snippet);
+    ok(`[${path.basename(root)}] AGENTS.md 已追加检索纪律段(10 条)`);
+  } else {
+    fs.writeFileSync(agentsPath, block);
+    ok(`[${path.basename(root)}] AGENTS.md 已写入检索纪律段(10 条)`);
+  }
+  upsertDiet(agentsPath);
+}
+
+/** 追加或替换文末输出纪律段;旧 Ponytail 段一并剥离(实测反效果)。 */
+function upsertDiet(agentsPath) {
+  const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : '';
+  const next = applyDiet(content, dietBlock(here));
+  if (next === content) { ok(`[output-diet] 已在文末,跳过`); return; }
+  fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
+  ok(content.includes('output-diet') ? `[output-diet] 已按 output-diet.md 更新文末段落` : `[output-diet] 已追加到 AGENTS.md 末尾`);
+}
 
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 // 枢纽以本模块所在仓为准,不跟当前工作区走,避免在业务仓里跑 init 把 data 搞乱。
@@ -745,39 +800,23 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   ok(`[user] Qoder 用户级钩子已写入 ${settingsPath}`);
 }
 
-if (directRun) {
-const hookArg = parseInitArgs(args).hooks;
-const hookTools = resolveHookTargets(hookArg);
-{
-  const detected = detectAgent();
-  if (hookArg) ok(`hooks = ${hookTools.join(',')} (--hooks)`);
-  else if (detected) ok(`检测到当前为 ${detected},只接线该工具 hooks(其余可用 --hooks all 或 --hooks <名>)`);
-  else ok('未识别当前 agent,接线 Cursor/ZCode/Qoder(可用 --hooks 指定)');
-}
-log(`\n[4/5]+[5/5] 对每个 git 仓库 root 接线会话 hook + AGENTS.md 检索纪律`);
-
-/** 给一个 git 仓库根清理旧工作区钩子、AGENTS.md 纪律段(钩子本体在用户级,只在循环后装一次) */
-function wireRepo(root) {
-  if (hookTools.includes('zcode')) cleanZcodeWorkspaceHooks(root);
-  if (hookTools.includes('cursor')) cleanCursorWorkspaceHooks(root);
-  if (hookTools.includes('qoder')) cleanQoderWorkspaceHooks(root);
-  const agentsPath = path.join(root, 'AGENTS.md');
+/** AGENTS.md 检索纪律段(纯函数,供 init 与 deploySync 共用;内容即部署产物的事实来源)。
+ *  rel=本模块相对目标仓的路径;dataRel=data 相对路径;packed=npx 安装模式。 */
+export function disciplineBlock({ rel, dataRel, packed = false }) {
   const MARK_V2 = '<!-- code-index:v2 -->';
-  const rel = path.relative(root, here).split(path.sep).join('/');
-  const dataRel = path.relative(root, DATA_DIR).split(path.sep).join('/');
-  const searchCmd = PACKED_INSTALL
+  const searchCmd = packed
     ? 'npx tokensaver search <中英文关键词> --k 5'
     : 'cd ' + rel + ' && node search.mjs <中英文关键词> --k 5';
-  const statusCmd = PACKED_INSTALL ? 'npx tokensaver status' : 'node ' + rel + '/status.mjs';
-  const autoCmd = PACKED_INSTALL ? 'npx tokensaver auto' : 'cd ' + rel + ' && node auto.mjs';
-  const rebuildCmd = PACKED_INSTALL
+  const statusCmd = packed ? 'npx tokensaver status' : 'node ' + rel + '/status.mjs';
+  const autoCmd = packed ? 'npx tokensaver auto' : 'cd ' + rel + ' && node auto.mjs';
+  const rebuildCmd = packed
     ? 'npx tokensaver build && npx tokensaver embed'
     : 'cd ' + rel + ' && node build.mjs && node embed.mjs';
-  const embedCmd = PACKED_INSTALL ? 'npx tokensaver embed' : 'node embed.mjs';
-  const pathHint = PACKED_INSTALL
+  const embedCmd = packed ? 'npx tokensaver embed' : 'node embed.mjs';
+  const pathHint = packed
     ? '命令在仓库根执行(`npx tokensaver ...`),不要 cd 进 node_modules'
     : '派单/命令里的路径必须用正斜杠+引号(`cd "' + rel + '"`):git bash 下不带引号的反斜杠路径会被转义吞掉';
-  const toolLabel = PACKED_INSTALL ? 'npx tokensaver' : rel;
+  const toolLabel = packed ? 'npx tokensaver' : rel;
   const P = (n, t) => n + '. ' + t;
   const items = [
     P(1, '**全局背景**:先读 `' + dataRel + '/CODE_MAP.md`(架构速查模板,随使用逐步充实;或自行维护项目架构说明)'),
@@ -789,52 +828,29 @@ function wireRepo(root) {
     P(7, '**提交后保鲜**:执行 `git commit` 后,运行 `' + autoCmd + '`(HEAD 没变秒级跳过;有变更时 build 内联约 10s+嵌入转后台)——有 PostToolUse hook 的环境已自动做,重复触发零成本'),
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
     P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
+    P(10, '**部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `' + (packed ? 'npx tokensaver sync' : 'cd ' + rel + ' && node deploySync.mjs') + '` 校验一致性;不一致就重新运行 `' + (packed ? 'npx tokensaver init' : 'node init.mjs') + '` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致'),
   ];
   const snippet = `\n${MARK_V2}\n## 代码检索纪律(节约 token)\n\n本项目已部署本地语义索引(工具在 \`${toolLabel}\`,项目资产在 \`${dataRel}\`):\n\n${items.join('\n\n')}\n`;
-  const block = snippet.trim() + '\n';
-  // 标记与标题之间允许空行(如 prettier 会插入),否则匹配失败会再追加一段
-  const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- ponytail -->|\r?\n## |$)/;
-  const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : null;
-  if (content && sectionRe.test(content)) {
-    const next = content.replace(sectionRe, block);
-    if (next === content) ok(`[${path.basename(root)}] AGENTS.md 纪律段已与当前模板一致,跳过`);
-    else {
-      fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
-      ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(9 条)`);
-    }
-  } else if (content) {
-    fs.appendFileSync(agentsPath, snippet);
-    ok(`[${path.basename(root)}] AGENTS.md 已追加检索纪律段(9 条)`);
-  } else {
-    fs.writeFileSync(agentsPath, block);
-    ok(`[${path.basename(root)}] AGENTS.md 已写入检索纪律段(9 条)`);
-  }
-  upsertPonytail(agentsPath);
+  return snippet.trim() + '\n';
 }
 
-const PONYTAIL_MARK = '<!-- ponytail -->';
-
-function ponytailBlock() {
-  const body = fs.readFileSync(path.join(here, 'ponytail.md'), 'utf8').trim();
-  return `${PONYTAIL_MARK}\n## Ponytail 模式（懒惰资深开发者规则）\n\n${body}\n`;
+if (directRun) {
+const hookArg = parseInitArgs(args).hooks;
+const hookTools = resolveHookTargets(hookArg);
+{
+  const detected = detectAgent();
+  if (hookArg) ok(`hooks = ${hookTools.join(',')} (--hooks)`);
+  else if (detected) ok(`检测到当前为 ${detected},只接线该工具 hooks(其余可用 --hooks all 或 --hooks <名>)`);
+  else ok('未识别当前 agent,接线 Cursor/ZCode/Qoder(可用 --hooks 指定)');
 }
+log(`\n[4/5]+[5/5] 对每个 git 仓库 root 接线会话 hook + AGENTS.md 检索纪律`);
 
-/** 追加或替换文末 Ponytail 段。纪律段和其他原文不动。 */
-function upsertPonytail(agentsPath) {
-  const block = ponytailBlock();
-  let content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : '';
-  const re = /<!-- ponytail -->[\s\S]*$/;
-  if (re.test(content)) {
-    const next = content.replace(re, block);
-    if (next !== content) {
-      fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
-      ok(`[ponytail] 已按 ponytail.md 更新文末段落`);
-    } else ok(`[ponytail] 已在文末,跳过`);
-    return;
-  }
-  if (content && !content.endsWith('\n')) content += '\n';
-  fs.writeFileSync(agentsPath, content + (content ? '\n' : '') + block);
-  ok(`[ponytail] 已追加到 AGENTS.md 末尾`);
+/** 给一个 git 仓库根清理旧工作区钩子、刷新 AGENTS.md(钩子本体在用户级,只在循环后装一次) */
+function wireRepo(root) {
+  if (hookTools.includes('zcode')) cleanZcodeWorkspaceHooks(root);
+  if (hookTools.includes('cursor')) cleanCursorWorkspaceHooks(root);
+  if (hookTools.includes('qoder')) cleanQoderWorkspaceHooks(root);
+  wireAgents(root);
 }
 
 // 宿主仓库 + config 实际生效的每个 root(去重);root 不是 git 仓库(纯目录)则只索引不接线
@@ -844,13 +860,15 @@ const effRoots = (() => {
 })();
 const wireRoots = [...new Set([repoRoot, ...effRoots.map(r => path.resolve(r))])];
 for (const r of wireRoots) {
-  if (fs.existsSync(path.join(r, '.git'))) {
-    wireRepo(r);
-    const giEntries = r === repoRoot
-      ? gitignoreEntries({ packed: PACKED_INSTALL, repoRoot, moduleDir: here, dataDir: DATA_DIR })
-      : [...EDITOR_IGNORE];
-    ensureGitignore(r, giEntries);
-  } else console.error(`  [note] ${r} 非 git 仓库,只索引不接线(无 AGENTS.md/hooks)`);
+  if (!fs.existsSync(path.join(r, '.git'))) {
+    console.error(`  [note] ${r} 非 git 仓库,只索引不接线(无 AGENTS.md/hooks)`);
+    continue;
+  }
+  wireRepo(r);
+  const giEntries = r === repoRoot
+    ? gitignoreEntries({ packed: PACKED_INSTALL, repoRoot, moduleDir: here, dataDir: DATA_DIR })
+    : [...EDITOR_IGNORE];
+  ensureGitignore(r, giEntries);
 }
 
 // 钩子本体统一装在用户级:所有工作区共享一份,绝对路径直指本模块,不依赖各仓的 workspace 信任审批

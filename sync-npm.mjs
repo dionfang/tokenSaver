@@ -37,7 +37,7 @@ fs.writeFileSync(npmPkgPath, JSON.stringify(npmPkg, null, 2) + '\n')
 
 for (const n of fs.readdirSync(srcDir)) {
   if (SKIP_SRC.has(n) || n.endsWith('.test.mjs') || n === 'regress.mjs') continue
-  if (n.endsWith('.mjs') || n === 'ponytail.md') copy(n)
+  if (n.endsWith('.mjs') || n === 'ponytail.md' || n === 'output-diet.md') copy(n)
 }
 
 const deployDoc = fs.readFileSync(path.join(srcDir, '部署使用说明.txt'), 'utf8')
@@ -61,7 +61,7 @@ write(
  * npm bin 入口。子命令对应同目录 *.mjs,参数原样转发。
  *   npx tokensaver init [--roots ...] [--model-in ollama|local]
  *   npx tokensaver search 关键词 --rerank --k 5
- *   npx tokensaver status | build | embed | auto | warm | details
+ *   npx tokensaver status | build | embed | auto | warm | details | sync
  */
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -77,6 +77,7 @@ const COMMANDS = {
   auto: 'auto.mjs',
   warm: 'warm.mjs',
   details: 'details.mjs',
+  sync: 'deploySync.mjs',
 };
 
 const argv = process.argv.slice(2);

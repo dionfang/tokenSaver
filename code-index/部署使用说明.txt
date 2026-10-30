@@ -30,6 +30,11 @@ init 会安装依赖、写配置、接线当前 agent 的 hook(认不出则 Curs
    node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
 3. 确认是否就绪: node status.mjs
 
+改了纪律段/输出纪律段/钩子代码或 output-diet.md 模板后:先 npm test 全绿,再 node deploySync.mjs
+校验本仓 AGENTS.md 与代码库模板一致;不一致就重新运行 node init.mjs 全盘部署(幂等:重写 hooks
+与各仓 AGENTS.md,配置/依赖/索引同样按当前代码重建),再跑门禁确认。这是纪律段的第 10 条
+「部署产物同步」,防止部署与代码库漂移。部署后不要手改各仓 AGENTS.md——要改就改本仓模板再重部署。
+
 init 会写配置并安装依赖。
 参数名写错、缺少取值,或 --model-in / --hooks 取值非法时,报错退出且不改配置。
 --roots=路径 与 --model-in=local 这种写法也可以。
@@ -51,7 +56,7 @@ init 会写配置并安装依赖。
 --uninstall(卸载)
   node uninit.mjs —— 逐步回显状态地移除本模块部署的东西:
   ①用户级钩子(ZCode/Cursor/Qoder;含他人配置的文件只摘本模块条目,空壳整删,转发器一并清)
-  ②各项目工作区钩子残留 ③各项目 AGENTS.md 的注入段(纪律段+ponytail 段;剥后仅剩空白才整删,用户内容保留)
+  ②各项目工作区钩子残留 ③各项目 AGENTS.md 的注入段(纪律段+输出纪律段 v7;剥后仅剩空白才整删,用户内容保留;旧 ponytail 段一并剥离)
   ④运行时痕迹(data/.prefetch-last.json)。
   不动:data/(索引与节约账)、code-index/ 本体、CODE_MAP.md、.gitignore、用户自己的 skills 与其他工具的钩子。
 
@@ -111,6 +116,8 @@ You can also copy this directory into the target project (suggested: scripts\cod
 
 init installs dependencies, writes config, wires the current agent's hooks (if it cannot tell which agent, it wires Cursor, ZCode, and Qoder), then builds the index and warms models in the background. Check readiness: node status.mjs
 
+After changing the discipline sections, hook code, or the output-diet.md template: make npm test green first, then run node deploySync.mjs to verify this repo's AGENTS.md matches the templates in the codebase. On drift, rerun node init.mjs for a full redeploy (idempotent: it rewrites hooks and every repo's AGENTS.md, and rebuilds config/dependencies/index from the current code), then rerun the gate. This is discipline rule 10 "deployment artifact sync". Do not hand-edit deployed AGENTS.md files: change the templates here and redeploy.
+
 After cloning from GitCode, init is still the only step:
   git clone https://gitcode.com/dionfang/TokenSaver.git
   cd TokenSaver/code-index
@@ -145,7 +152,7 @@ A bad flag name, a missing value, or an illegal value for --model-in or --hooks 
 
 --uninstall
   node uninit.mjs — removes what this module deployed, printing one status line per step:
-  (1) user-level hooks (ZCode/Cursor/Qoder; files shared with other tools keep their other entries and lose only ours, pure skeletons are deleted, forwarders cleaned); (2) workspace hook leftovers per project; (3) the injected sections in each project's AGENTS.md (discipline + ponytail; the file is deleted only when nothing else remains — user content is preserved); (4) runtime traces (data/.prefetch-last.json).
+  (1) user-level hooks (ZCode/Cursor/Qoder; files shared with other tools keep their other entries and lose only ours, pure skeletons are deleted, forwarders cleaned); (2) workspace hook leftovers per project; (3) the injected sections in each project's AGENTS.md (discipline + output-diet v7; a legacy ponytail section is stripped too; the file is deleted only when nothing else remains — user content is preserved); (4) runtime traces (data/.prefetch-last.json).
   Untouched: data/ (index and ledger), code-index/ itself, CODE_MAP.md, .gitignore, your own skills, and other tools' hooks.
 
 --model-in

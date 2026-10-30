@@ -9,7 +9,7 @@
  *      Qoder ~/.qoder-cn/settings.json(+转发器,国际版 ~/.qoder)。文件只剩本模块骨架则整删;
  *      含其他配置(如 ZCode 的 plugins)只摘钩子条目,文件保留
  *   3) 防御性清理各项目工作区钩子残留(.zcode/.cursor/.qoder 里本模块的条目与转发器)
- *   4) 还原各项目 AGENTS.md:剥掉纪律段(<!-- code-index -->)与 ponytail 段;
+ *   4) 还原各项目 AGENTS.md:剥掉纪律段(<!-- code-index -->)与输出纪律段(<!-- output-diet -->;兼容剥旧 ponytail 段);
  *      剥完只剩空白 → 整文件删除;有用户内容 → 保留其余原文
  *   5) 清理运行时痕迹(data/.prefetch-last.json)
  *
@@ -134,11 +134,29 @@ export function uninstallQoderUserHooks({ home = os.homedir() } = {}) {
 
 // ---------- 步骤 4:AGENTS.md ----------
 
-/** 剥掉纪律段:<!-- code-index --> 标记起,至下一个 ponytail 标记或任意层级标题。 */
+/** 剥掉纪律段:<!-- code-index --> 标记起,至下一个注入段标记或任意层级标题。 */
 export function stripDisciplineSection(content) {
-  const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- ponytail -->|\r?\n#{2,6} |$)/;
+  const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- (?:ponytail|output-diet)[^>]* -->|\r?\n#{2,6} |$)/;
   if (!sectionRe.test(content)) return null;
   return content.replace(sectionRe, '');
+}
+
+/** 剥掉输出纪律段:优先按 init 写入的精确模板块移除(段后用户内容保留);
+ *  模板被改过无法识别时退化为从标记切到文末(与 ponytail 剥离同语义)。 */
+export function stripDietSection(content) {
+  const m = content.match(/<!-- output-diet[^>]* -->/);
+  if (!m) return { content, changed: false };
+  const idx = m.index;
+  let body = '';
+  try {
+    body = fs.readFileSync(path.join(here, 'output-diet.md'), 'utf8').trim();
+  } catch { /* 模板不在,退化为切到文末 */ }
+  if (body) {
+    const block = `${m[0]}\n${body}\n`;
+    const bIdx = content.indexOf(block);
+    if (bIdx >= 0) return { content: content.slice(0, bIdx) + content.slice(bIdx + block.length), changed: true };
+  }
+  return { content: content.slice(0, idx), changed: true };
 }
 
 /** 剥掉 ponytail 段:优先按 init 写入的精确模板块移除(段后用户内容保留);
@@ -168,9 +186,11 @@ export function stripAgentsFile(agentsPath) {
   let content = orig;
   const stripped = stripDisciplineSection(content);
   if (stripped !== null) content = stripped;
+  const diet = stripDietSection(content);
+  content = diet.content;
   const pony = stripPonytailSection(content);
   content = pony.content;
-  if (!pony.changed && stripped === null) return 'no-injection';
+  if (!pony.changed && !diet.changed && stripped === null) return 'no-injection';
   content = content.replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').trimEnd();
   if (!content.trim()) {
     rmIfExists(agentsPath);
@@ -227,7 +247,7 @@ function main() {
     if (st === 'absent') say(`  [skip] [${name}] 无 AGENTS.md`);
     else if (st === 'no-injection') say(`  [skip] [${name}] 无注入内容`);
     else if (st === 'deleted') say(`  [ok] [${name}] 文件仅含注入内容,已整文件删除`);
-    else say(`  [ok] [${name}] 已剥除纪律段与 ponytail 段,用户内容保留`);
+    else say(`  [ok] [${name}] 已剥除纪律段与输出纪律段(含旧 ponytail),用户内容保留`);
   }
 
   say('[5/5] 清理运行时痕迹');

@@ -21,6 +21,8 @@
 
 9. **文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文
 
+10. **部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `cd code-index && node deploySync.mjs` 校验一致性;不一致就重新运行 `node init.mjs` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致
+
 <!-- output-diet-v7 -->
 ## 输出纪律(省话不省工) / Output discipline: less talk, same work
 

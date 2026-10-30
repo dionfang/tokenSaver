@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-/** uninit 测试:用户级钩子移除(保留他人配置)、AGENTS.md 剥离/整删/跳过、运行时痕迹清理。全密闭。 启动:cd code-index && npm test(或 node ../test/uninit.test.mjs) */
+/** uninit 测试:用户级钩子移除(保留他人配置)、AGENTS.md 剥离(纪律/输出纪律/旧 ponytail)整删跳过、运行时痕迹清理。全密闭。 启动:cd code-index && npm test(或 node ../test/uninit.test.mjs) */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { uninstallZcodeUserHooks, uninstallCursorUserHooks, uninstallQoderUserHooks, stripAgentsFile, stripPonytailSection } from '../code-index/uninit.mjs';
+import { uninstallZcodeUserHooks, uninstallCursorUserHooks, uninstallQoderUserHooks, stripAgentsFile, stripPonytailSection, stripDietSection } from '../code-index/uninit.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-un-home-'));
@@ -36,6 +36,8 @@ fs.writeFileSync(path.join(home, '.qoder-cn', 'settings.json'), JSON.stringify({
 // ---- 种入 AGENTS.md(ponytail 块用真实模板,模拟 init 写入) ----
 const ponytailBody = fs.readFileSync(path.join(here, '..', 'code-index', 'ponytail.md'), 'utf8').trim();
 const ponytailBlock = `<!-- ponytail -->\n## Ponytail 模式（懒惰资深开发者规则）\n\n${ponytailBody}\n`;
+// diet 块按 init 的 upsertDiet 生成格式构造(标记行 + output-diet.md 全文)
+const dietBlock = `<!-- output-diet-v7 -->\n${fs.readFileSync(path.join(here, '..', 'code-index', 'output-diet.md'), 'utf8').trim()}\n`;
 const agentsA = [
   '# 项目说明',
   '',
@@ -53,13 +55,14 @@ const agentsA = [
   '',
 ].join('\n');
 fs.writeFileSync(path.join(rootA, 'AGENTS.md'), agentsA);
+// rootB:仅注入内容(纪律段 + 输出纪律段,模拟 init 写入)→ 整删
 fs.writeFileSync(path.join(rootB, 'AGENTS.md'), [
   '<!-- code-index:v2 -->',
   '## 代码检索纪律(节约 token)',
   '',
   '1. 先走索引',
   '',
-  ponytailBlock,
+  dietBlock,
 ].join('\n'));
 
 // ---- 执行 ----
@@ -93,6 +96,14 @@ assert.doesNotMatch(afterA, /<!-- ponytail -->|## Ponytail|代码检索纪律|la
 const stB = stripAgentsFile(path.join(rootB, 'AGENTS.md'));
 assert.equal(stB, 'deleted', '仅含注入内容 → 整文件删除');
 assert.equal(fs.existsSync(path.join(rootB, 'AGENTS.md')), false);
+
+// stripDietSection 纯函数:段后带标题的用户内容保留
+const dietRound = stripDietSection(`# 项目\n\n${dietBlock}\n## 用户尾段\n\n内容保留\n`);
+assert.equal(dietRound.changed, true);
+assert.match(dietRound.content, /## 用户尾段/);
+assert.doesNotMatch(dietRound.content, /output-diet|省话不省工/);
+// 无标记原样返回
+assert.equal(stripDietSection('# 纯内容\n').changed, false);
 
 assert.equal(stripAgentsFile(path.join(rootC, 'AGENTS.md')), 'absent');
 

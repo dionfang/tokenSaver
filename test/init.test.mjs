@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, cleanCursorWorkspaceHooks, cleanQoderWorkspaceHooks, cleanZcodeWorkspaceHooks, rewriteCursorUserHooks, rewriteQoderUserHooks, rewriteZcodeUserHooks, qoderUserDir, splitRoots, mergeRoots, healRoots, rollKnownAnnotations } from '../code-index/init.mjs';
+import { fileURLToPath } from 'node:url';
+import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, cleanCursorWorkspaceHooks, cleanQoderWorkspaceHooks, cleanZcodeWorkspaceHooks, rewriteCursorUserHooks, rewriteQoderUserHooks, rewriteZcodeUserHooks, qoderUserDir, splitRoots, mergeRoots, healRoots, rollKnownAnnotations, DIET_MARK, dietBlock, applyDiet } from '../code-index/init.mjs';
 
 assert.equal(parseInitArgs([]).modelIn, null);
 assert.equal(parseInitArgs(['--model-in', 'local']).modelIn, 'local');
@@ -232,6 +233,34 @@ assert.equal(userQoder2.hooks.PreToolUse.length, 1, '幂等');
 const intlHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-home2-'));
 fs.mkdirSync(path.join(intlHome, '.qoder'), { recursive: true });
 assert.equal(qoderUserDir(intlHome), path.join(intlHome, '.qoder'), '已有 ~/.qoder 时用国际版目录');
+
+// 输出纪律部署段:模板=实验 v7 源(防漂移);对已挂段幂等;旧 ponytail 段迁移剥离
+const here = path.dirname(fileURLToPath(import.meta.url));
+const hereDir = path.join(here, '..', 'code-index');
+const tpl = fs.readFileSync(path.join(hereDir, 'output-diet.md'), 'utf8').trim();
+const v7src = fs.readFileSync(path.join(here, 'scripts', 'ab', 'rules', 'output-diet-v7.md'), 'utf8').trim();
+assert.equal(tpl, v7src, 'code-index/output-diet.md 必须与 A/B 实验 v7 定稿一致');
+const blk = dietBlock(hereDir);
+assert.ok(blk.startsWith(DIET_MARK + '\n') && blk.includes(tpl), '块=标记行+模板全文');
+// 新环境:追加文末
+const fresh = applyDiet('# 项目\n\n说明\n', blk);
+assert.ok(fresh.endsWith(blk) && /5\./.test(fresh), '无段时追加文末');
+// 幂等:重复 apply 不变
+assert.equal(applyDiet(fresh, blk), fresh, '幂等');
+// 旧环境迁移:ponytail 段被剥离,diet 段在文末
+const legacy = applyDiet('# 项目\n\n<!-- ponytail -->\n## Ponytail 模式\n\nlazy...\n', blk);
+assert.ok(!legacy.includes('ponytail') && legacy.endsWith(blk), '迁移剥离旧 ponytail');
+// 本仓已挂段与部署模板逐字一致(证明手工段=init 输出);换行符归一后比较(本仓 AGENTS.md 为 CRLF)
+const realAgents = fs.readFileSync(path.join(here, '..', 'AGENTS.md'), 'utf8').replace(/\r\n/g, '\n');
+assert.ok(realAgents.includes(blk.trimEnd()) && !realAgents.includes('<!-- ponytail -->'), '本仓 AGENTS.md 输出纪律段=模板且无 ponytail');
+// npm 打包清单必须含输出纪律模板(npx 安装读不到会崩);镜像文件由 sync-npm 生成,存在则校验一致
+const npmPkg = JSON.parse(fs.readFileSync(path.join(here, '..', 'npm', 'package.json'), 'utf8'));
+assert.ok(npmPkg.files.includes('output-diet.md'), 'npm package files 含 output-diet.md');
+const npmDiet = path.join(here, '..', 'npm', 'output-diet.md');
+if (fs.existsSync(npmDiet)) {
+  assert.equal(fs.readFileSync(npmDiet, 'utf8'), fs.readFileSync(path.join(hereDir, 'output-diet.md'), 'utf8'), 'npm/output-diet.md 与源一致');
+  assert.ok(fs.readFileSync(path.join(here, '..', 'npm', 'init.mjs'), 'utf8').includes(DIET_MARK), 'npm/init.mjs 已同步 diet 逻辑');
+}
 
 fs.rmSync(hookDir, { recursive: true, force: true });
 fs.rmSync(fakeHome, { recursive: true, force: true });
