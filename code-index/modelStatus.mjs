@@ -7,6 +7,7 @@
  * 向量只认 data/vectors/<当前路径>/,不看另一条路径。两条路径都还要求块清单在、签名未过期、没有进行中的嵌入进程。
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DATA_DIR, loadConfig } from './config.mjs';
 import { ollamaProcessesRunning, resolveBase } from './ollamaGuard.mjs';
@@ -177,6 +178,309 @@ export function readDayReadInputTokens() {
   return readSavingsState().readInputTokens || 0;
 }
 
+const READ_EVENTS_PATH = path.join(DATA_DIR, 'read-guard', 'events.jsonl');
+const ROLLOUT_DIR = path.join(os.homedir(), '.zcode', 'cli', 'rollout');
+
+/** 事件留痕:一行一 JSON(拦截 deny/void、Search、SearchClaim)。失败静默,不影响主流程。 */
+export function appendReadEvent(entry) {
+  try {
+    fs.mkdirSync(path.dirname(READ_EVENTS_PATH), { recursive: true });
+    fs.appendFileSync(READ_EVENTS_PATH, JSON.stringify(entry) + '\n');
+  } catch { /* 留痕失败不影响主流程 */ }
+}
+
+/**
+ * 当日事件。返回三类:拦截事件(带 session)、Search 事件(session 暂空,待认领)、SearchClaim(归属指认)。
+ * 缺文件/坏行跳过。
+ */
+export function readReadEvents(eventsPath = READ_EVENTS_PATH, day = dayKey(Date.now())) {
+  let lines = [];
+  try { lines = fs.readFileSync(eventsPath, 'utf8').split('\n'); } catch { return []; }
+  const out = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const j = JSON.parse(line);
+      if (!j || dayKey(Number(j.at)) !== day) continue;
+      if (j.kind === 'SearchClaim') { out.push(j); continue; }
+      if (Number(j.bytes) > 0 && j.session) { out.push(j); continue; }
+      if (j.kind === 'Search' && Number(j.originalTokens) > 0) out.push(j);
+    } catch { /* 坏行跳过 */ }
+  }
+  return out;
+}
+
+/** Search 事件按 SearchClaim 归属(refAt 精确指认,先到先得);claim 本身不外传。 */
+export function attributeSearchEvents(events) {
+  const claimed = new Map();
+  for (const ev of events) {
+    if (ev.kind === 'SearchClaim' && ev.session && Number.isFinite(Number(ev.refAt))) {
+      const ref = Number(ev.refAt);
+      if (!claimed.has(ref)) claimed.set(ref, ev.session);
+    }
+  }
+  return events
+    .filter((ev) => ev.kind !== 'SearchClaim')
+    .map((ev) => (ev.kind === 'Search' && !ev.session && claimed.has(Number(ev.at)) ? { ...ev, session: claimed.get(Number(ev.at)) } : ev));
+}
+
+/** Bash 命令认领检索事件:命令含查询原文、120s 窗口内、未被认领,返回其 at;否则 null。 */
+export function findSearchEventRef(events, command, now, windowMs = 120000) {
+  const cmd = String(command || '');
+  if (!cmd.includes('search.mjs')) return null;
+  const claimed = new Set(events.filter((e) => e.kind === 'SearchClaim').map((e) => Number(e.refAt)));
+  let best = null;
+  for (const ev of events) {
+    if (ev.kind !== 'Search' || ev.session) continue;
+    const at = Number(ev.at);
+    if (!Number.isFinite(at) || at > now || now - at > windowMs) continue;
+    if (claimed.has(at)) continue;
+    if (cmd.includes(String(ev.file || '')) && (best === null || at > best)) best = at;
+  }
+  return best;
+}
+
+/** 会话 rollout 里事件之后发出的 main_turn 请求数;rollout 缺失(未清)返回 null。 */
+export function rolloutRowsAfter(rolloutDir, sessionId, sinceMs) {
+  const name = `model-io-${String(sessionId).replace(/[^\w.-]/g, '_')}.jsonl`;
+  let text;
+  try { text = fs.readFileSync(path.join(rolloutDir, name), 'utf8'); } catch { return null; }
+  let n = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const j = JSON.parse(line);
+      if (j?.type !== 'model_io' || j.error || !j.response?.usage) continue;
+      if (j.querySource !== 'main_turn') continue;
+      const t = Date.parse(j.startedAt);
+      if (Number.isFinite(t) && t >= sinceMs) n += 1;
+    } catch { /* 坏行跳过 */ }
+  }
+  return n;
+}
+
+// ---------- 水位化持久累计 ----------
+// 账本只记入口一次;"会话累计"靠每次运行把增量滚进账本。rollout 会被轮换清理,
+// 现场重放会让数字回落;水位(最后计入的 iteration)让已计入的部分永久留在账本里。
+
+const WATERMARK_PATH = path.join(DATA_DIR, 'read-guard', 'watermarks.json');
+
+/** 水位文件:{events:{key:{at,session,kind,file,tokens,counted,lastAt,lastKey,accumulated,voided}}}。 */
+export function readWatermarks(file = WATERMARK_PATH) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return j && typeof j.events === 'object' && j.events ? j.events : {};
+  } catch { return {}; }
+}
+
+/** 写水位(临时文件改名,避免半写)。 */
+export function writeWatermarks(events, file = WATERMARK_PATH) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, updatedAt: Date.now(), events }, null, 1));
+    fs.renameSync(tmp, file);
+  } catch { /* 水位写失败不影响记账 */ }
+}
+
+/** 事件键:kind+at+file。void 事件与原事件同键,便于配对与退款。 */
+export function eventKey(ev) {
+  return `${ev.kind || '?'}|${ev.at}|${ev.file || ''}`;
+}
+
+/**
+ * 会话 rollout 里边界之后的 main_turn iteration 数,并给出可续接的边界(时间戳+requestId)。
+ * 边界之后 = startedAt 更大,或同毫秒而 requestId 更大(同毫秒多个 iteration 时稳定续接)。
+ */
+export function rolloutIterationsAfter(rolloutDir, sessionId, sinceMs, sinceKey = '') {
+  const name = `model-io-${String(sessionId).replace(/[^\w.-]/g, '_')}.jsonl`;
+  let text;
+  try { text = fs.readFileSync(path.join(rolloutDir, name), 'utf8'); } catch { return null; }
+  let count = 0;
+  let lastAt = 0;
+  let lastKey = '';
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    if (!line.includes('"querySource":"main_turn"')) continue;
+    let j;
+    try { j = JSON.parse(line); } catch { continue; }
+    if (j?.type !== 'model_io' || j.error || !j.response?.usage) continue;
+    if (j.querySource !== 'main_turn') continue;
+    const t = Date.parse(j.startedAt);
+    if (!Number.isFinite(t)) continue;
+    const key = String(j.requestId || '');
+    const after = t > sinceMs || (t === sinceMs && key > sinceKey);
+    if (!after) continue;
+    count += 1;
+    if (t > lastAt || (t === lastAt && key > lastKey)) { lastAt = t; lastKey = key; }
+  }
+  return { count, lastAt, lastKey };
+}
+
+/**
+ * 纯计算:每个事件还差多少 iteration 没入账,以及应追加多少。
+ * 单次节约:Read/Bash = bytes/4;Search = 命中块原文 tokens − 结果 tokens。
+ * 无主(未认领)/voided(重发放行)不计;voided 需退回此前已入账的金额。
+ */
+export function computeAccumulation(events, watermarks = {}, rolloutDir = ROLLOUT_DIR) {
+  const voided = new Set();
+  for (const ev of events) {
+    if (ev.void) voided.add(`${ev.session}|${ev.file}|${ev.at}`);
+  }
+  const seen = new Set();
+  const detail = [];
+  let total = 0;
+  let refund = 0;
+  for (const ev of events) {
+    if (ev.void || ev.kind === 'SearchClaim') continue;
+    const key = eventKey(ev);
+    const tokens = ev.kind === 'Search'
+      ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
+      : Math.ceil(Number(ev.bytes) / 4);
+    const wm = watermarks[key] || null;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!ev.session) {
+      detail.push({ key, kind: ev.kind, file: ev.file, tokens, newIterations: 0, delta: 0, accumulated: wm?.accumulated || 0, unclaimed: true });
+      continue;
+    }
+    if (voided.has(`${ev.session}|${ev.file}|${ev.at}`)) {
+      // 重发放行 = 文件实际进了上下文:入口一次与已入账都要退,且只退一次
+      const back = wm?.accumulated || 0;
+      const entry = wm?.entryRefunded ? 0 : tokens;
+      refund += back + entry;
+      detail.push({ key, kind: ev.kind, file: ev.file, tokens, newIterations: 0, delta: 0, accumulated: 0, voided: true, refund: back + entry, entryRefund: entry, session: ev.session, at: Number(ev.at) });
+      continue;
+    }
+    const sinceMs = wm && Number.isFinite(wm.lastAt) ? wm.lastAt : Number(ev.at);
+    const sinceKey = wm ? String(wm.lastKey || '') : '';
+    const res = rolloutIterationsAfter(rolloutDir, ev.session, sinceMs, sinceKey);
+    if (!res) {
+      detail.push({ key, kind: ev.kind, file: ev.file, tokens, newIterations: 0, delta: 0, accumulated: wm?.accumulated || 0, rolloutMissing: true });
+      continue;
+    }
+    const delta = tokens * res.count;
+    total += delta;
+    detail.push({
+      key,
+      kind: ev.kind,
+      file: ev.file,
+      tokens,
+      newIterations: res.count,
+      delta,
+      accumulated: (wm?.accumulated || 0) + delta,
+      lastAt: res.lastAt,
+      lastKey: res.lastKey,
+      session: ev.session,
+      at: Number(ev.at),
+    });
+  }
+  return { total, refund, detail };
+}
+
+/** 把增量记进当日桶(originalTokens 与 savedTokens 同增,compressedTokens 不动)。 */
+export function addAccumulatedSavings(extra) {
+  const delta = Math.round(Number(extra) || 0);
+  if (!delta) return;
+  const state = readSavingsState();
+  const date = state.date || dayKey(Date.now());
+  const days = { ...(state.days || {}) };
+  const bucket = bucketOf(days[date]);
+  bucket.originalTokens = Math.max(0, bucket.originalTokens + delta);
+  bucket.savedTokens = Math.max(0, bucket.savedTokens + delta);
+  days[date] = bucket;
+  try { writeDoc({ updatedAt: Date.now(), days }); } catch { /* 写失败不影响本次 */ }
+}
+
+/**
+ * 水位化持久累计入口:把"自上次以来新发生的 iteration"折算的节约滚进账本,并推进水位。
+ * 已入账部分永久留在账本里,rollout 轮换后数字不回落;新增 iteration 只补差额,不重复计。
+ */
+export function applySessionAccumulation() {
+  const events = attributeSearchEvents(readReadEvents());
+  const watermarks = readWatermarks();
+  const { total, refund, detail } = computeAccumulation(events, watermarks);
+  let changed = false;
+  for (const d of detail) {
+    if (d.unclaimed) continue;
+    if (d.voided) {
+      const prev = watermarks[d.key] || {};
+      watermarks[d.key] = {
+        ...prev,
+        at: d.at,
+        session: d.session,
+        kind: d.kind,
+        file: d.file,
+        tokens: d.tokens,
+        counted: 0,
+        lastAt: d.at || 0,
+        lastKey: '',
+        accumulated: 0,
+        voided: true,
+        entryRefunded: true,
+      };
+      changed = true;
+      continue;
+    }
+    if (d.rolloutMissing) continue;
+    if (!d.newIterations) continue;
+    const prev = watermarks[d.key] || {};
+    watermarks[d.key] = {
+      ...prev,
+      at: d.at,
+      session: d.session,
+      kind: d.kind,
+      file: d.file,
+      tokens: d.tokens,
+      counted: (Number(prev.counted) || 0) + d.newIterations,
+      lastAt: d.lastAt,
+      lastKey: d.lastKey,
+      accumulated: d.accumulated,
+      voided: false,
+    };
+    changed = true;
+  }
+  if (changed) writeWatermarks(watermarks);
+  if (total) addAccumulatedSavings(total);
+  if (refund) addAccumulatedSavings(-refund);
+  return { total, refund, detail };
+}
+
+/**
+ * 会话累计口径修正:被拦文件/检索命中原文的反事实都会随历史被之后每个请求重复计费,
+ * 账本只记了入口一次。修正量 = Σ 单次节约 ×(其后请求数 − 1)。单次节约:
+ * Read/Bash = bytes/4;Search = 命中块原文 tokens − 结果 tokens。
+ * 只算 rollout 还在且已有会话归属的事件(宁缺勿滥);void(重发放行)按 session|file|at 配对作废。
+ */
+export function accumulateReadEvents(events, rolloutDir = ROLLOUT_DIR) {
+  const voided = new Set();
+  for (const ev of events) {
+    if (ev.void) voided.add(`${ev.session}|${ev.file}|${ev.at}`);
+  }
+  let extra = 0;
+  const detail = [];
+  for (const ev of events) {
+    if (ev.void || ev.kind === 'SearchClaim') continue;
+    const tokens = ev.kind === 'Search'
+      ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
+      : Math.ceil(Number(ev.bytes) / 4);
+    if (!ev.session) {
+      detail.push({ session: null, kind: ev.kind || '', file: ev.file || '', tokens, rowsAfter: null, add: 0, unclaimed: true });
+      continue;
+    }
+    if (voided.has(`${ev.session}|${ev.file}|${ev.at}`)) {
+      detail.push({ session: ev.session, kind: ev.kind || '', file: ev.file || '', bytes: Number(ev.bytes), tokens, rowsAfter: null, add: 0, voided: true });
+      continue;
+    }
+    let rowsAfter = null;
+    try { rowsAfter = rolloutRowsAfter(rolloutDir, ev.session, Number(ev.at)); } catch { rowsAfter = null; }
+    const add = rowsAfter == null || rowsAfter <= 1 ? 0 : tokens * (rowsAfter - 1);
+    extra += add;
+    detail.push({ session: ev.session, kind: ev.kind || '', file: ev.file || '', bytes: Number(ev.bytes), tokens, rowsAfter, add });
+  }
+  return { extra, detail };
+}
+
 let encodePromise = null;
 async function cacheTokenizer(model) {
   const entry = lookupModel(model);
@@ -212,13 +516,17 @@ function encoder() {
   return encodePromise;
 }
 
+/** 成对计 token:原文、压缩后(精确 qwen 口径)。 */
+export async function countInputTokensPair(originalText, compressedText) {
+  const count = await encoder();
+  return { original: count(String(originalText || '')), compressed: count(String(compressedText || '')) };
+}
+
 /** 先计原文 token,再计压缩后 token,差额并入当日累计。 */
 export async function measureInputSavings(originalText, compressedText) {
-  const original = String(originalText || '');
-  const compressed = String(compressedText || '');
-  if (!original) return readSessionSavings();
-  const count = await encoder();
-  return addInputSavings(count(original), count(compressed));
+  if (!String(originalText || '')) return readSessionSavings();
+  const { original, compressed } = await countInputTokensPair(originalText, compressedText);
+  return addInputSavings(original, compressed);
 }
 
 export function formatSavedClause(state) {
@@ -363,6 +671,9 @@ export async function assessModelStatus() {
     catch (e) { indexError = e.message; }
   }
   const embeddings = fileReady(vectorPaths(modelIn).emb);
+  // 会话累计口径已持久化进账本(水位化增量入账):先滚动入账,再读当日桶展示
+  try { applySessionAccumulation(); } catch { /* 入账失败按入口一次口径 */ }
+  const savings = readSavingsState();
   return renderModelStatus({
     ollama,
     base,
@@ -378,7 +689,7 @@ export async function assessModelStatus() {
     signatureStale: vectorSignatureStale(meta),
     residentReady,
     embedPid: readEmbedPid(),
-    ...readSavingsState(),
+    ...savings,
     models,
     modelIn,
     localEmbeddingReady: localOnnxCached(models.localEmbedding),

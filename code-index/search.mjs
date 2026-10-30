@@ -25,7 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, resolveBase } from './ollamaGuard.mjs';
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
-import { assessModelStatus, measureInputSavings, ollamaHasModel } from './modelStatus.mjs';
+import { assessModelStatus, addInputSavings, appendReadEvent, countInputTokensPair, ollamaHasModel } from './modelStatus.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
 import { residentEmbed, residentScorePairs } from './localResident.mjs';
 import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from './vectorStore.mjs';
@@ -376,8 +376,11 @@ if (vecScores && kept.length) {
     return nl >= 0 ? raw.slice(nl + 1) : raw;
   }).join('\n');
   try {
-    // 先计命中原文,再计本次实际送出的检索结果(压缩后)
-    await measureInputSavings(original, toolOutput);
+    // 入口一次:命中原文 vs 实际结果;同时落 Search 事件,read-nudge 的 PostToolUse(Bash)按命令认领回会话后,
+    // modelStatus 才能按 rollout 做"会话累计"口径修正(命中原文的反事实同样逐请求重复计费)。
+    const { original: oTok, compressed: cTok } = await countInputTokensPair(original, toolOutput);
+    addInputSavings(oTok, cTok);
+    appendReadEvent({ at: Date.now(), session: null, kind: 'Search', file: query.slice(0, 120), originalTokens: oTok, compressedTokens: cTok });
   } catch (e) {
     console.error(`[warn] 输入 token 记账跳过(${e.message})`);
   }

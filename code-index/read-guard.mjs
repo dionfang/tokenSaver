@@ -5,6 +5,8 @@
  * 终端/Bash 里各链式组末段的 cat 整读同规则拦;带 | 限量管道、> 重定向、cat 无文件参数则放行。
  * Cursor 终端走 beforeShellExecution(工具名常是 Shell,不进 preToolUse Bash);ZCode/Qoder 仍认 Bash。
  * 带 offset/limit 的区间读放行。刚拦过同一目标 5 分钟内再发则放行。
+ * 拦截同时追加事件到 data/read-guard/events.jsonl({at,session,kind,file,bytes}),
+ * 供 modelStatus 在状态句里做"会话累计"口径修正(账本 savedTokens 仍是入口一次,不改动)。
  * Cursor 输出 {permission};ZCode/Qoder 输出 hookSpecificOutput.permissionDecision。
  * 自身出错 fail-open:Cursor 写 {permission:allow}(缺字段会被拦);Claude 系写 {}(allow 不短路权限链)。
  * 不拦重复读,不做差分。
@@ -90,6 +92,14 @@ async function recordBlockedBytes(bytes) {
     const { addInputSavings } = await import('./modelStatus.mjs');
     addInputSavings(tokens, 0);
   } catch { /* 记账失败仍拒绝 */ }
+}
+
+/** 拦截留痕经 modelStatus.appendReadEvent 落 events.jsonl;动态导入避免顶层循环依赖。 */
+async function trackEvent(entry) {
+  try {
+    const { appendReadEvent } = await import('./modelStatus.mjs');
+    appendReadEvent(entry);
+  } catch { /* 留痕失败不影响拦截 */ }
 }
 
 export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd }) {
@@ -240,6 +250,8 @@ async function bashGuard(input, dialect) {
     statFile,
   });
   if (decision.override) {
+    const d = key ? denials[key] : null;
+    if (d && d.bytes) await trackEvent({ at: d.at, session: convId, kind: 'Bash', file: d.file || key, bytes: d.bytes, void: true });
     delete denials[key];
     try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
     return emit(dialect, 'allow');
@@ -255,12 +267,13 @@ async function bashGuard(input, dialect) {
   });
   const body = formatDecision(dialect, 'deny', msg);
   try {
-    denials[key] = { at: now, agentType: detectAgentType(input), response: body };
+    denials[key] = { at: now, agentType: detectAgentType(input), response: body, bytes: size, kind: 'Bash', file: decision.files.join(' ') };
     saveDenials(convId, denials);
   } catch {
     return emit(dialect, 'allow');
   }
   await recordBlockedBytes(size);
+  await trackEvent({ at: now, session: convId, kind: 'Bash', file: decision.files.join(' '), bytes: size });
   respond(body);
   return body;
 }
@@ -317,6 +330,8 @@ export async function runReadGuard({ stdinText } = {}) {
   });
 
   if (decision.override) {
+    const d = denials[file];
+    if (d && d.bytes) await trackEvent({ at: d.at, session: convId, kind: 'Read', file, bytes: d.bytes, void: true });
     delete denials[file];
     try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
     return emit(dialect, 'allow');
@@ -332,12 +347,13 @@ export async function runReadGuard({ stdinText } = {}) {
     });
     const body = formatDecision(dialect, 'deny', msg);
     try {
-      denials[file] = { at: now, agentType: detectAgentType(input), response: body };
+      denials[file] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Read' };
       saveDenials(convId, denials);
     } catch {
       return emit(dialect, 'allow');
     }
     await recordBlockedBytes(st.size);
+    await trackEvent({ at: now, session: convId, kind: 'Read', file, bytes: st.size });
     respond(body);
     return body;
   }
