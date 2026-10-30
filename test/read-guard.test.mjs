@@ -6,8 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { rewriteCursorUserHooks } from '../code-index/init.mjs';
-import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, markHookRewrite, oversizeGuidance, OVERRIDE_WINDOW_MS, rewriteBody, rewriteGuidance, tokensFromBlockedBytes, bytesOfLines } from '../code-index/read-guard.mjs';
+import { rewriteCursorUserHooks, rewriteQoderUserHooks } from '../code-index/init.mjs';
+import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, markHookRewrite, oversizeGuidance, OVERRIDE_WINDOW_MS, rewriteBody, rewriteGuidance, supportsRewrite, tokensFromBlockedBytes, bytesOfLines } from '../code-index/read-guard.mjs';
 import { pickSpan, pathMatchesChunk } from '../code-index/rangePick.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -22,6 +22,9 @@ assert.equal(detectAgentType({}, { QODER_PROJECT_DIR: 'D:/p' }), 'qoder');
 assert.equal(detectAgentType({}, { CURSOR_AGENT: '1' }), 'cursor');
 assert.equal(detectAgentType({ hook_event_name: 'preToolUse' }, {}), 'cursor');
 assert.equal(detectAgentType({ hook_event_name: 'PreToolUse' }, {}), 'unknown');
+assert.equal(supportsRewrite({}, { ZCODE_SESSION_ID: 's' }), true);
+assert.equal(supportsRewrite({}, { QODER_PROJECT_DIR: 'D:/p' }), true, 'Qoder 实测采纳 updatedInput');
+assert.equal(supportsRewrite({}, { CURSOR_AGENT: '1' }), false);
 assert.equal(formatDecision('cursor', 'allow').permission, 'allow');
 assert.equal(formatDecision('claude', 'allow').hookSpecificOutput, undefined);
 assert.equal(formatDecision('claude', 'deny', 'x').hookSpecificOutput.permissionDecision, 'deny');
@@ -377,8 +380,12 @@ fs.rmSync(hookRoot, { recursive: true, force: true });
   assert.equal(g1.hookSpecificOutput.updatedInput.pattern, 'foo', '原入参其余键保留');
   assert.match(g1.hookSpecificOutput.additionalContext, /head_limit=100/);
   assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g2', tool_name: 'Grep', tool_input: { pattern: 'foo', head_limit: 5 }, cwd: tmp2 }).stdout), {}, '已带 head_limit 放行');
+  // Qoder 同走 Claude 方言且实测采纳 updatedInput → 同样补封顶
+  const gq = JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g4', tool_name: 'Grep', tool_input: { pattern: 'foo', path: tmp2 }, cwd: tmp2 }, { ...env2, QODER_SESSION_ID: 'q-g' }).stdout);
+  assert.equal(gq.hookSpecificOutput.updatedInput.head_limit, 100);
+  assert.equal(gq.hookSpecificOutput.updatedInput.pattern, 'foo');
   // Cursor/无宿主环境不改 Grep
-  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g3', tool_name: 'Grep', tool_input: { pattern: 'foo' }, cwd: tmp2 }, env2).stdout), {}, '非 ZCode 不改写');
+  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g3', tool_name: 'Grep', tool_input: { pattern: 'foo' }, cwd: tmp2 }, env2).stdout), {}, '非 ZCode/Qoder 不改写');
 
   // 开着改写但无意图向量(chunk/模型不可用同路径)→ 落回 deny,fail-safe
   const rw = JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'c-rw', tool_name: 'Read', tool_input: { file_path: big2 }, cwd: tmp2 }).stdout);
@@ -403,6 +410,21 @@ fs.rmSync(hookRoot, { recursive: true, force: true });
     assert.equal(j.reads['D:/keep.ts'].ranges, 1, '已有 reads 状态保留');
     markHookRewrite('sess_mk', 'D:/a/b.js', 456, st); // 幂等覆盖同文件标记
     assert.equal(JSON.parse(fs.readFileSync(st, 'utf8')).hookRewrites['D:/a/b.js'], 456);
+  }
+
+  // Qoder 转发器:改写体(updatedInput)必须透传,不能被当成"无 permissionDecision"吞掉
+  {
+    const qHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-rg-qh-'));
+    rewriteQoderUserHooks({ home: qHome });
+    const qFwd = path.join(qHome, '.qoder-cn', 'hooks', 'read-guard.mjs');
+    const qRun = (payload) => spawnSync(process.execPath, [qFwd], {
+      input: JSON.stringify(payload), encoding: 'utf8', env: { ...env2, QODER_SESSION_ID: 'q-fwd' }, windowsHide: true,
+    });
+    const qOut = JSON.parse(qRun({ hook_event_name: 'PreToolUse', session_id: 'q-fwd', tool_name: 'Grep', tool_input: { pattern: 'foo' }, cwd: tmp2 }).stdout);
+    assert.equal(qOut.hookSpecificOutput.updatedInput.head_limit, 100, 'Qoder 转发器透传改写体');
+    fs.writeFileSync(path.join(tmp2, 'small.js'), 'const a = 1;\n');
+    assert.deepEqual(JSON.parse(qRun({ hook_event_name: 'PreToolUse', session_id: 'q-allow', tool_name: 'Read', tool_input: { file_path: path.join(tmp2, 'small.js') }, cwd: tmp2 }).stdout), {}, '放行时输出 {}');
+    fs.rmSync(qHome, { recursive: true, force: true });
   }
 
   fs.rmSync(tmp2, { recursive: true, force: true });

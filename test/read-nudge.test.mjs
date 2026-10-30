@@ -127,6 +127,23 @@ assert.equal(r.accountTokens, undefined, '关闭时不记账');
   fs.rmSync(stateDir, { recursive: true, force: true });
 }
 
+// Qoder 载荷:Claude 形状(tool_response.file.content)也能算字节;失败事件带 error 无 tool_response
+{
+  const r3 = evaluateNudge({
+    hookEventName: 'PostToolUse', toolName: 'Read', toolInput: { file_path: 'D:/q/d.ts', offset: 1, limit: 10 },
+    toolResponse: { type: 'text', file: { content: 'x'.repeat(4000), numLines: 10, startLine: 1 } },
+    history: {}, now, config: cfg,
+  });
+  assert.equal(r3.accountTokens, 1000, 'Qoder file.content 折算 token');
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-nudge-q-'));
+  const qf = await runReadNudge({
+    stdinText: JSON.stringify({ session_id: 'q-fail', hook_event_name: 'PostToolUseFailure', tool_name: 'Read', tool_input: { file_path: 'D:/gone.ts' }, error: 'Exit code 1' }),
+    stateDir, account: false,
+  });
+  assert.match(qf.additionalContext, /search\.mjs/, 'Qoder 失败导航端到端');
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
+
 // Cursor 的事件名是小写驼峰 postToolUseFailure,失败导航要认
 {
   const r2 = evaluateNudge({

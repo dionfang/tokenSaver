@@ -26,7 +26,8 @@
  *      默认只装当前 agent(Cursor/ZCode/Qoder)那一套;认不出则三套都装。
  *      Cursor 另接 beforeSubmitPrompt → prompt-guard(会话中改嵌入模型才会后台重嵌)。
  *      三套都接 Read/终端整读拦截(超行数 deny,区间读放行,5 分钟内重试放行,出错 fail-open):
- *      Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$。
+ *      Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$|^Grep$
+ *      (ZCode/Qoder 另有 PostToolUse/PostToolUseFailure ^Read$|^Bash$ → read-nudge 导航与记账)。
  *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具的用户级配置里本模块的钩子;
  *      同文件里的其他钩子保留。JSON 解析失败则不改该文件。
  *   5) AGENTS.md:已有 code-index 标记则替换纪律段(含文档英文一条),没有则追加;文件不存在则新建。
@@ -192,21 +193,27 @@ export function applyDiet(content, block) {
   return content + (content ? '\n' : '') + block;
 }
 
+/** 注入段跟随目标文件行尾:模板恒为 LF,仓内多是 CRLF,混用会让整文件显示为已改。 */
+export function withEol(text, eol) {
+  return eol === '\r\n' ? text.replace(/\r?\n/g, '\r\n') : text;
+}
+
 /** 刷新单仓 AGENTS.md 两个注入段(检索纪律 + 输出纪律),不碰 hooks/索引;init 与 deploySync 共用。 */
 function wireAgents(root) {
   const agentsPath = path.join(root, 'AGENTS.md');
   const rel = path.relative(root, here).split(path.sep).join('/');
   const dataRel = path.relative(root, DATA_DIR).split(path.sep).join('/');
-  const block = disciplineBlock({ rel, dataRel, packed: PACKED_INSTALL });
-  const snippet = '\n' + block;
+  const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : null;
+  const eol = content && content.includes('\r\n') ? '\r\n' : '\n';
+  const block = withEol(disciplineBlock({ rel, dataRel, packed: PACKED_INSTALL }), eol);
+  const snippet = eol + block;
   // 标记与标题之间允许空行(如 prettier 会插入),否则匹配失败会再追加一段
   const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- (?:ponytail|output-diet)[^>]* -->|\r?\n## |$)/;
-  const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : null;
   if (content && sectionRe.test(content)) {
     const next = content.replace(sectionRe, block);
     if (next === content) ok(`[${path.basename(root)}] AGENTS.md 纪律段已与当前模板一致,跳过`);
     else {
-      fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
+      fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + eol);
       ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(10 条)`);
     }
   } else if (content) {
@@ -222,9 +229,10 @@ function wireAgents(root) {
 /** 追加或替换文末输出纪律段;旧 Ponytail 段一并剥离(实测反效果)。 */
 function upsertDiet(agentsPath) {
   const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : '';
-  const next = applyDiet(content, dietBlock(here));
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  const next = withEol(applyDiet(content, dietBlock(here)), eol);
   if (next === content) { ok(`[output-diet] 已在文末,跳过`); return; }
-  fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + '\n');
+  fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + eol);
   ok(content.includes('output-diet') ? `[output-diet] 已按 output-diet.md 更新文末段落` : `[output-diet] 已追加到 AGENTS.md 末尾`);
 }
 
@@ -420,10 +428,10 @@ function ensureGitignore(root, entries) {
 /** 只认本模块的脚本。项目里别的 auto.mjs / warm.mjs 不碰。目录名不限(复制部署常用 code-index)。 */
 export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
-  // output-savings 已下线,仍匹配以便 rewrite 时卸掉旧钩子
-  if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard|read-nudge)\.mjs$/.test(s)) return true;
+  // output-savings 已下线,仍匹配以便 rewrite 时卸掉旧钩子;尾部允许附加事件名参数(read-nudge 复用同一转发器)
+  if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard|read-nudge)\.mjs(?:\s+\S+)?$/.test(s)) return true;
   // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
-  if (/(?:^|[\s/"'])\.qoder(?:-cn)?\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard|read-nudge)\.mjs$/.test(s)) return true;
+  if (/(?:^|[\s/"'])\.qoder(?:-cn)?\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard|read-nudge)\.mjs(?:\s+\S+)?$/.test(s)) return true;
   if (/(?:^|[\s/"'])\.zcode\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const names = 'auto|commit-refresh|prompt-guard|read-guard|read-nudge|warm|output-savings';
@@ -490,15 +498,15 @@ child.on('error', () => { process.stdout.write('{}'); process.exit(0) })
 child.on('exit', () => {
   const s = String(out).trim()
   try {
-    const j = JSON.parse(s)
-    const d = j && j.hookSpecificOutput && j.hookSpecificOutput.permissionDecision
-    if (d === 'deny' || d === 'allow' || d === 'ask') process.stdout.write(s)
+    const o = JSON.parse(s).hookSpecificOutput
+    // deny 与 updatedInput(语义区间改写)都要透传;其余(含 allow 的 {})一律 {} fail-open
+    if (o && (o.permissionDecision || o.updatedInput)) process.stdout.write(s)
     else process.stdout.write('{}')
   } catch { process.stdout.write('{}') }
   process.exit(0)
 })
 `;
-  return hookScript(hooksDir, 'read-guard.mjs', 'Qoder PreToolUse Read: 转发 read-guard.mjs。无合法 permissionDecision 则 {} fail-open。', body);
+  return hookScript(hooksDir, 'read-guard.mjs', 'Qoder PreToolUse: 透传 read-guard.mjs 的 deny/区间改写;无 hookSpecificOutput 则 {} fail-open。', body);
 }
 
 /** 清理后若整个文件只剩空骨架(无任何他人配置),连文件一起删,目录空了就回收。 */
@@ -606,15 +614,16 @@ export function cleanZcodeWorkspaceHooks(root) {
 }
 
 function qoderWrapSource(hooksDir, scriptName, eventName) {
-  return hookScript(hooksDir, scriptName, `Qoder ${eventName}: 转发 ${scriptName},把 additionalContext 包成 hookSpecificOutput。`, `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
+  return hookScript(hooksDir, scriptName, `Qoder ${eventName}: 转发 ${scriptName},把 additionalContext 包成 hookSpecificOutput(argv[2] 可覆盖事件名)。`, `const child = spawn(process.execPath, [entry], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
 let out = ''
 child.stdout.on('data', (d) => { out += d })
 child.on('error', () => process.exit(0))
 child.on('exit', (code) => {
+  const eventName = process.argv[2] || ${JSON.stringify(eventName)}
   try {
     const j = JSON.parse(String(out).trim() || '{}')
     const ctx = j.additionalContext || j.hookSpecificOutput && j.hookSpecificOutput.additionalContext
-    if (ctx) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: ${JSON.stringify(eventName)}, additionalContext: ctx } }))
+    if (ctx) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: eventName, additionalContext: ctx } }))
   } catch { /* 无 JSON 则静默 */ }
   process.exit(code || 0)
 })
@@ -656,7 +665,7 @@ export function cleanQoderWorkspaceHooks(root) {
       }
     } catch { /* JSON 坏了不动,只删转发器 */ }
   }
-  for (const f of ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'output-savings.mjs']) {
+  for (const f of ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'output-savings.mjs']) {
     try { fs.rmSync(path.join(hooksDir, f), { force: true }); } catch { /* 无该文件 */ }
   }
   try { fs.rmdirSync(hooksDir); } catch { /* 非空或不存在 */ }
@@ -773,6 +782,7 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   fs.writeFileSync(path.join(hooksDir, 'prompt-guard.mjs'), qoderWrapSource(hooksDir, 'prompt-guard.mjs', 'UserPromptSubmit'));
   fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), qoderPassthroughSource(hooksDir, 'commit-refresh.mjs'));
   fs.writeFileSync(path.join(hooksDir, 'read-guard.mjs'), qoderReadGuardSource(hooksDir));
+  fs.writeFileSync(path.join(hooksDir, 'read-nudge.mjs'), qoderWrapSource(hooksDir, 'read-nudge.mjs', 'PostToolUse'));
   try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
   const settingsPath = path.join(userDir, 'settings.json');
   let cfg = { hooks: {} };
@@ -793,9 +803,12 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   const prepend = (name, group) => { hooks[name] = [group, ...(Array.isArray(hooks[name]) ? hooks[name] : [])]; };
   const fwd = f => path.join(hooksDir, f).split(path.sep).join('/');
   prepend('SessionStart', { hooks: [qoderCmd(fwd('session-start.mjs'), 420, '索引保鲜检查+预热本地检索模型')] });
+  prepend('PostToolUse', { matcher: '^Read$|^Bash$', hooks: [qoderCmd(fwd('read-nudge.mjs'), 10, '连续读导航+工具结果记账')] });
   prepend('PostToolUse', { matcher: 'Bash|Shell', hooks: [qoderCmd(fwd('commit-refresh.mjs'), 10, '提交后索引保鲜')] });
+  // PostToolUseFailure 实测只认字面量工具名(^Read$|^Bash$ 这类锚定正则不触发)
+  prepend('PostToolUseFailure', { matcher: 'Read|Bash', hooks: [qoderCmd(fwd('read-nudge.mjs') + ' PostToolUseFailure', 10, '读取失败导航')] });
   prepend('UserPromptSubmit', { hooks: [qoderCmd(fwd('prompt-guard.mjs'), 10, '模型变更检测')] });
-  prepend('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [qoderCmd(fwd('read-guard.mjs'), 10, '超行数全量 Read/Bash 拦截')] });
+  prepend('PreToolUse', { matcher: '^Read$|^Bash$|^Grep$', hooks: [qoderCmd(fwd('read-guard.mjs'), 10, '超行数全量 Read/Bash 拦截(Grep 补 head_limit)')] });
   fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] Qoder 用户级钩子已写入 ${settingsPath}`);
 }

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, cleanCursorWorkspaceHooks, cleanQoderWorkspaceHooks, cleanZcodeWorkspaceHooks, rewriteCursorUserHooks, rewriteQoderUserHooks, rewriteZcodeUserHooks, qoderUserDir, splitRoots, mergeRoots, healRoots, rollKnownAnnotations, DIET_MARK, dietBlock, applyDiet } from '../code-index/init.mjs';
+import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, cleanCursorWorkspaceHooks, cleanQoderWorkspaceHooks, cleanZcodeWorkspaceHooks, rewriteCursorUserHooks, rewriteQoderUserHooks, rewriteZcodeUserHooks, qoderUserDir, splitRoots, mergeRoots, healRoots, rollKnownAnnotations, DIET_MARK, dietBlock, applyDiet, withEol } from '../code-index/init.mjs';
 
 assert.equal(parseInitArgs([]).modelIn, null);
 assert.equal(parseInitArgs(['--model-in', 'local']).modelIn, 'local');
@@ -222,12 +222,22 @@ assert.equal(userCursor2.hooks.postToolUse.length, 1, '幂等:postToolUse 不累
 rewriteQoderUserHooks({ home: fakeHome });
 assert.equal(qoderUserDir(fakeHome), path.join(fakeHome, '.qoder-cn'), 'CN 目录优先');
 const userQoder = JSON.parse(fs.readFileSync(path.join(fakeHome, '.qoder-cn', 'settings.json'), 'utf8'));
-assert.equal(userQoder.hooks.PreToolUse[0].matcher, '^Read$|^Bash$');
+assert.equal(userQoder.hooks.PreToolUse[0].matcher, '^Read$|^Bash$|^Grep$');
 const qCmd = userQoder.hooks.PreToolUse[0].hooks[0].command.replace(/^node /, '');
 assert.ok(fs.existsSync(qCmd), 'Qoder 用户级转发器真实存在');
+assert.equal(userQoder.hooks.PostToolUse.length, 2, 'PostToolUse:commit-refresh + read-nudge');
+assert.equal(userQoder.hooks.PostToolUse[1].matcher, '^Read$|^Bash$');
+const qNudge = userQoder.hooks.PostToolUse[1].hooks[0].command.replace(/^node /, '');
+assert.ok(fs.existsSync(qNudge), 'Qoder read-nudge 转发器真实存在');
+assert.ok(qNudge.endsWith('.qoder-cn/hooks/read-nudge.mjs'));
+assert.equal(userQoder.hooks.PostToolUseFailure[0].matcher, 'Read|Bash', '失败事件只认字面量工具名');
+assert.match(userQoder.hooks.PostToolUseFailure[0].hooks[0].command, /read-nudge\.mjs PostToolUseFailure$/, '同一转发器带事件名参数');
+assert.ok(isCodeIndexHookRef(userQoder.hooks.PostToolUseFailure[0].hooks[0].command), '带参数的命令仍能识别清理');
 rewriteQoderUserHooks({ home: fakeHome });
 const userQoder2 = JSON.parse(fs.readFileSync(path.join(fakeHome, '.qoder-cn', 'settings.json'), 'utf8'));
 assert.equal(userQoder2.hooks.PreToolUse.length, 1, '幂等');
+assert.equal(userQoder2.hooks.PostToolUse.length, 2, '幂等:PostToolUse 不累积');
+assert.equal(userQoder2.hooks.PostToolUseFailure.length, 1, '幂等:PostToolUseFailure 不累积');
 
 // 用户级是国际化版目录时择 ~/.qoder
 const intlHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-home2-'));
@@ -242,6 +252,10 @@ const v7src = fs.readFileSync(path.join(here, 'scripts', 'ab', 'rules', 'output-
 assert.equal(tpl, v7src, 'code-index/output-diet.md 必须与 A/B 实验 v7 定稿一致');
 const blk = dietBlock(hereDir);
 assert.ok(blk.startsWith(DIET_MARK + '\n') && blk.includes(tpl), '块=标记行+模板全文');
+// 注入段跟随目标文件行尾:CRLF 仓不再被写成混合行尾
+assert.equal(withEol('a\nb\n', '\r\n'), 'a\r\nb\r\n');
+assert.equal(withEol('a\r\nb\n', '\r\n'), 'a\r\nb\r\n', '已 CRLF 的行不重复加 \\r');
+assert.equal(withEol('a\n', '\n'), 'a\n');
 // 新环境:追加文末
 const fresh = applyDiet('# 项目\n\n说明\n', blk);
 assert.ok(fresh.endsWith(blk) && /5\./.test(fresh), '无段时追加文末');
@@ -250,9 +264,10 @@ assert.equal(applyDiet(fresh, blk), fresh, '幂等');
 // 旧环境迁移:ponytail 段被剥离,diet 段在文末
 const legacy = applyDiet('# 项目\n\n<!-- ponytail -->\n## Ponytail 模式\n\nlazy...\n', blk);
 assert.ok(!legacy.includes('ponytail') && legacy.endsWith(blk), '迁移剥离旧 ponytail');
-// 本仓已挂段与部署模板逐字一致(证明手工段=init 输出);换行符归一后比较(本仓 AGENTS.md 为 CRLF)
-const realAgents = fs.readFileSync(path.join(here, '..', 'AGENTS.md'), 'utf8').replace(/\r\n/g, '\n');
-assert.ok(realAgents.includes(blk.trimEnd()) && !realAgents.includes('<!-- ponytail -->'), '本仓 AGENTS.md 输出纪律段=模板且无 ponytail');
+// 本仓已挂段与部署模板逐字一致(证明手工段=init 输出);两边换行符都归一后比较(Windows 检出为 CRLF)
+const lf = (s) => s.replace(/\r\n/g, '\n');
+const realAgents = lf(fs.readFileSync(path.join(here, '..', 'AGENTS.md'), 'utf8'));
+assert.ok(realAgents.includes(lf(blk).trimEnd()) && !realAgents.includes('<!-- ponytail -->'), '本仓 AGENTS.md 输出纪律段=模板且无 ponytail');
 // npm 打包清单必须含输出纪律模板(npx 安装读不到会崩);镜像文件由 sync-npm 生成,存在则校验一致
 const npmPkg = JSON.parse(fs.readFileSync(path.join(here, '..', 'npm', 'package.json'), 'utf8'));
 assert.ok(npmPkg.files.includes('output-diet.md'), 'npm package files 含 output-diet.md');

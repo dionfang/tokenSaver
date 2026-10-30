@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * Read/Bash 拦截:Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$(ZCode 另接 ^Grep$)。
- * 全量 Read 超过 readMaxLines×1.25 → ZCode 优先改写为语义区间读(rangePick 选段,updatedInput),
- *   选不出区间或非 ZCode 时退回 deny(指路 search + 区间读)。
- * Grep(ZCode):不带 head_limit 的调用补 head_limit 封顶(PreToolUse 拿不到结果量,此路不记账)。
+ * Read/Bash 拦截:Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$|^Grep$。
+ * 全量 Read 超过 readMaxLines×1.25 → ZCode/Qoder 优先改写为语义区间读(rangePick 选段,updatedInput),
+ *   选不出区间或 Cursor 时退回 deny(指路 search + 区间读)。
+ * Grep(ZCode/Qoder):不带 head_limit 的调用补 head_limit 封顶(PreToolUse 拿不到结果量,此路不记账)。
  * 终端/Bash 里各链式组末段的 cat 整读同规则拦;带 | 限量管道、> 重定向、cat 无文件参数则放行。
  * Cursor 终端走 beforeShellExecution(工具名常是 Shell,不进 preToolUse Bash);ZCode/Qoder 仍认 Bash。
  * 带 offset/limit 的区间读放行。刚拦过同一目标 5 分钟内再发则放行(deny 专属;改写幂等,重发即再改写)。
  * 拦截/改写同时追加事件到 data/read-guard/events.jsonl(deny:{bytes};Rewrite:{bytes,rangeBytes,s,e}),
  *   供 modelStatus 按 rollout 回放做"会话累计"口径修正;入口账 deny 记 (bytes/4,0)、Rewrite 记 (bytes/4,区间/4)。
  * Cursor 输出 {permission};ZCode/Qoder 输出 hookSpecificOutput.permissionDecision;改写走
- *   hookSpecificOutput.updatedInput(ZCode 实测采纳;未文档化能力,失效时关 readGuard.rewrite 即回 deny)。
+ *   hookSpecificOutput.updatedInput(ZCode/Qoder 实测采纳;未文档化能力,失效时关 readGuard.rewrite 即回 deny)。
  * 自身出错 fail-open:Cursor 写 {permission:allow}(缺字段会被拦);Claude 系写 {}(allow 不短路权限链)。
  * 不拦重复读,不做差分。
  */
@@ -59,6 +59,12 @@ export function detectAgentType(input, env = process.env) {
   if (env.CURSOR_AGENT || env.CURSOR_CONVERSATION_ID) return 'cursor';
   const ev = String(input?.hook_event_name || input?.hookEventName || '');
   return (ev === 'preToolUse' || ev === 'beforeShellExecution') ? 'cursor' : 'unknown';
+}
+
+/** updatedInput 改写仅 Claude 系且实测采纳:ZCode/Qoder;Cursor 无此能力。 */
+export function supportsRewrite(input, env = process.env) {
+  const t = detectAgentType(input, env);
+  return t === 'zcode' || t === 'qoder';
 }
 
 export function evaluateReadGuard({
@@ -284,11 +290,11 @@ function emit(dialect, permission, reason) {
   return body;
 }
 
-/** Grep(ZCode):未带 head_limit 的调用补封顶,防大仓库匹配倾倒。PreToolUse 无结果量,不记账。 */
+/** Grep(ZCode/Qoder):未带 head_limit 的调用补封顶,防大仓库匹配倾倒。PreToolUse 无结果量,不记账。 */
 function grepGuard(input, dialect) {
   const rc = rewriteConfig();
   const ti = input.tool_input || {};
-  if (rc.rewrite && rc.grepHeadLimit > 0 && ti.head_limit == null && detectAgentType(input) === 'zcode') {
+  if (rc.rewrite && rc.grepHeadLimit > 0 && ti.head_limit == null && supportsRewrite(input)) {
     const body = rewriteBody(
       { ...ti, head_limit: rc.grepHeadLimit },
       `[code-index] 已给本次 Grep 补 head_limit=${rc.grepHeadLimit} 封顶输出(原调用未带)。` +
@@ -369,7 +375,7 @@ export async function runReadGuard({ stdinText } = {}) {
   const dialect = detectDialect(input || {});
   const ev = String(input?.hook_event_name || input?.hookEventName || '');
   const tool = input?.tool_name;
-  // ZCode/Qoder:Bash;Grep(ZCode 改写封顶);Cursor:beforeShellExecution,偶发 Shell preToolUse。
+  // ZCode/Qoder:Bash;Grep(ZCode/Qoder 改写封顶);Cursor:beforeShellExecution,偶发 Shell preToolUse。
   if (tool === 'Bash' || tool === 'Shell' || ev === 'beforeShellExecution') {
     return bashGuard(input, dialect);
   }
@@ -418,9 +424,9 @@ export async function runReadGuard({ stdinText } = {}) {
   }
 
   if (decision.permission === 'deny') {
-    // ZCode 改写路径:选得出语义区间就改写入参,选不出(无意图/索引缺失/不相关)落回 deny
+    // ZCode/Qoder 改写路径:选得出语义区间就改写入参,选不出(无意图/索引缺失/不相关)落回 deny
     const rc = rewriteConfig();
-    if (rc.rewrite && detectAgentType(input) === 'zcode') {
+    if (rc.rewrite && supportsRewrite(input)) {
       let range = null;
       try {
         const { pickRangeForFile } = await import('./rangePick.mjs');
