@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * Read/Bash 拦截:Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$。
- * 全量 Read 超过 readMaxLines×1.25 → deny,指路 search + 区间读。
+ * Read/Bash 拦截:Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$(ZCode 另接 ^Grep$)。
+ * 全量 Read 超过 readMaxLines×1.25 → ZCode 优先改写为语义区间读(rangePick 选段,updatedInput),
+ *   选不出区间或非 ZCode 时退回 deny(指路 search + 区间读)。
+ * Grep(ZCode):不带 head_limit 的调用补 head_limit 封顶(PreToolUse 拿不到结果量,此路不记账)。
  * 终端/Bash 里各链式组末段的 cat 整读同规则拦;带 | 限量管道、> 重定向、cat 无文件参数则放行。
  * Cursor 终端走 beforeShellExecution(工具名常是 Shell,不进 preToolUse Bash);ZCode/Qoder 仍认 Bash。
- * 带 offset/limit 的区间读放行。刚拦过同一目标 5 分钟内再发则放行。
- * 拦截同时追加事件到 data/read-guard/events.jsonl({at,session,kind,file,bytes}),
- * 供 modelStatus 在状态句里做"会话累计"口径修正(账本 savedTokens 仍是入口一次,不改动)。
- * Cursor 输出 {permission};ZCode/Qoder 输出 hookSpecificOutput.permissionDecision。
+ * 带 offset/limit 的区间读放行。刚拦过同一目标 5 分钟内再发则放行(deny 专属;改写幂等,重发即再改写)。
+ * 拦截/改写同时追加事件到 data/read-guard/events.jsonl(deny:{bytes};Rewrite:{bytes,rangeBytes,s,e}),
+ *   供 modelStatus 按 rollout 回放做"会话累计"口径修正;入口账 deny 记 (bytes/4,0)、Rewrite 记 (bytes/4,区间/4)。
+ * Cursor 输出 {permission};ZCode/Qoder 输出 hookSpecificOutput.permissionDecision;改写走
+ *   hookSpecificOutput.updatedInput(ZCode 实测采纳;未文档化能力,失效时关 readGuard.rewrite 即回 deny)。
  * 自身出错 fail-open:Cursor 写 {permission:allow}(缺字段会被拦);Claude 系写 {}(allow 不短路权限链)。
  * 不拦重复读,不做差分。
  */
@@ -151,14 +154,29 @@ export function bashOversizeGuidance({ files, lines, size, readMaxLines, searchC
   const kb = Math.max(1, Math.round((size || 0) / 1024));
   const cap = readMaxLines;
   const slack = Math.floor(cap * 1.25);
-  const target = files.length === 1 ? files[0] : files.join(' ');
+  const target = files.length === 1 ? files[0] : `${files[0]}(多文件请逐个)`;
   return (
-    `code-index: Bash 整读 ${target} 共 ${lines} 行(~${kb} KB),超过全量读上限 ${cap} 行(宽限至 ${slack} 行)。不要用 cat 整读大文件。替代方案:` +
+    `code-index: Bash 整读 ${files.join(' ')} 共 ${lines} 行(~${kb} KB),超过全量读上限 ${cap} 行(宽限至 ${slack} 行)。不要用 cat 整读大文件。替代方案:` +
     `① 先检索 \`${searchCmd} <关键词> --k 5\` 定位内容(命中的 file:起-止即大纲);` +
-    `② 看片段改用 Read 的 offset/limit,或给命令加限量管道 \`sed -n '起,止p' 文件\` / \`head -n N\`;` +
-    `③ 按内容定位用 \`grep -n <关键词> 文件\` 拿行号后再区间读。` +
+    `② 看片段可直接照抄 \`sed -n '1,${cap}p' ${target}\`(首 ${cap} 行,后续段改起止行号),或改用 Read 的 offset/limit;` +
+    `③ 按内容定位用 \`grep -n <关键词> ${target}\` 拿行号后再区间读。` +
     `确实需要全量输出时,5 分钟内重发同一命令即放行。`
   );
+}
+
+/** 改写预置标记:写进 read-nudge 的 <会话>.reads.json(hookRewrites[文件]=时刻),
+ *  PostToolUse 消费标记后跳过本次钩子注入读的"连续区间读"计数(字节记账保留)。失败静默。 */
+export function markHookRewrite(sessionId, absFile, at = Date.now(), stateFile) {
+  try {
+    const p = stateFile || path.join(DATA_DIR, 'read-guard', `${String(sessionId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80)}.reads.json`);
+    let j = {};
+    try { j = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { /* 新文件 */ }
+    if (!j || typeof j !== 'object' || Array.isArray(j)) j = {};
+    j.hookRewrites = { ...(j.hookRewrites || {}), [absFile]: at };
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(j));
+    return true;
+  } catch { return false; }
 }
 
 export function resolveReadMaxLines() {
@@ -168,6 +186,51 @@ export function resolveReadMaxLines() {
     if (Number.isFinite(n) && n > 0) return n;
   } catch { /* 缺文件或坏 JSON:用默认,不走 loadConfig(它会 process.exit) */ }
   return DEFAULT_CONFIG.readMaxLines;
+}
+
+/** 改写路径配置:readGuard.rewrite 总开关;grepHeadLimit 给 Grep 补封顶(0=关)。默认全关。 */
+export function rewriteConfig() {
+  try {
+    const j = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const rg = j.readGuard && typeof j.readGuard === 'object' ? j.readGuard : {};
+    const gh = Number(rg.grepHeadLimit);
+    return {
+      rewrite: rg.rewrite === true,
+      grepHeadLimit: Number.isFinite(gh) && gh > 0 ? gh : 0,
+    };
+  } catch { return { rewrite: false, grepHeadLimit: 0 }; }
+}
+
+/** 改写输出体(claude 方言)。updatedInput 会替换执行入参;additionalContext 随工具结果注入。 */
+export function rewriteBody(updatedInput, context) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      updatedInput,
+      additionalContext: context,
+    },
+  };
+}
+
+export function rewriteGuidance({ file, lines, size, range, searchCmd }) {
+  const kb = Math.max(1, Math.round((size || 0) / 1024));
+  return (
+    `[code-index] ${file} 共 ${lines} 行(~${kb} KB),超过全量 Read 上限。` +
+    `已按你的提问改写为语义最相关区间 ${range.s}-${range.e} 行(${range.src === 'rerank' ? '精排' : '余弦'}选段)。` +
+    `这不是全文:要读其他区间用 Read 的 offset/limit,确需全文用 offset=1 limit=${lines},` +
+    `或先检索 \`${searchCmd} <符号> --k 5\` 拿大纲再精准跳。`
+  );
+}
+
+/** [s,e] 行的字节数;超 8MB 的大文件按行数比例估,不整读。 */
+export function bytesOfLines(file, totalLines, s, e) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size > 8 * 1024 * 1024 || totalLines <= 0) return Math.ceil(st.size * Math.min(1, (e - s + 1) / totalLines));
+    const content = fs.readFileSync(file, 'utf8');
+    const all = content.split('\n');
+    return Buffer.byteLength(all.slice(s - 1, e).join('\n'), 'utf8');
+  } catch { return 0; }
 }
 
 function searchCmd() {
@@ -219,6 +282,22 @@ function emit(dialect, permission, reason) {
   const body = formatDecision(dialect, permission, reason);
   respond(body);
   return body;
+}
+
+/** Grep(ZCode):未带 head_limit 的调用补封顶,防大仓库匹配倾倒。PreToolUse 无结果量,不记账。 */
+function grepGuard(input, dialect) {
+  const rc = rewriteConfig();
+  const ti = input.tool_input || {};
+  if (rc.rewrite && rc.grepHeadLimit > 0 && ti.head_limit == null && detectAgentType(input) === 'zcode') {
+    const body = rewriteBody(
+      { ...ti, head_limit: rc.grepHeadLimit },
+      `[code-index] 已给本次 Grep 补 head_limit=${rc.grepHeadLimit} 封顶输出(原调用未带)。` +
+      `要更多命中请分目录或加 glob 缩小,确需更多时显式带 head_limit 重发。`,
+    );
+    respond(body);
+    return body;
+  }
+  return emit(dialect, 'allow');
 }
 
 async function bashGuard(input, dialect) {
@@ -290,10 +369,11 @@ export async function runReadGuard({ stdinText } = {}) {
   const dialect = detectDialect(input || {});
   const ev = String(input?.hook_event_name || input?.hookEventName || '');
   const tool = input?.tool_name;
-  // ZCode/Qoder:Bash;Cursor:beforeShellExecution,偶发 Shell preToolUse。
+  // ZCode/Qoder:Bash;Grep(ZCode 改写封顶);Cursor:beforeShellExecution,偶发 Shell preToolUse。
   if (tool === 'Bash' || tool === 'Shell' || ev === 'beforeShellExecution') {
     return bashGuard(input, dialect);
   }
+  if (tool === 'Grep') return grepGuard(input, dialect);
   if (!input || (tool && tool !== 'Read')) return emit(dialect, 'allow');
   const ti = input.tool_input || {};
   const rawPath = ti.file_path || ti.path || ti.target_file;
@@ -338,6 +418,34 @@ export async function runReadGuard({ stdinText } = {}) {
   }
 
   if (decision.permission === 'deny') {
+    // ZCode 改写路径:选得出语义区间就改写入参,选不出(无意图/索引缺失/不相关)落回 deny
+    const rc = rewriteConfig();
+    if (rc.rewrite && detectAgentType(input) === 'zcode') {
+      let range = null;
+      try {
+        const { pickRangeForFile } = await import('./rangePick.mjs');
+        range = await pickRangeForFile(file, convId, { maxLines: Math.floor(resolveReadMaxLines() * 1.25) });
+      } catch { /* 选段失败落回 deny */ }
+      if (range) {
+        const s = Math.max(1, range.s);
+        const limit = Math.min(range.e, lines) - s + 1;
+        if (limit > 0) {
+          const rangeBytes = bytesOfLines(file, lines, s, Math.min(range.e, lines));
+          const body = rewriteBody(
+            { ...ti, offset: s, limit },
+            rewriteGuidance({ file, lines, size: st.size, range, searchCmd: searchCmd() }),
+          );
+          try {
+            const { addInputSavings } = await import('./modelStatus.mjs');
+            addInputSavings(tokensFromBlockedBytes(st.size), Math.ceil(rangeBytes / 4));
+          } catch { /* 记账失败仍改写 */ }
+          await trackEvent({ at: now, session: convId, kind: 'Rewrite', file, bytes: st.size, rangeBytes, s, e: Math.min(range.e, lines) });
+          markHookRewrite(convId, file, now);
+          respond(body);
+          return body;
+        }
+      }
+    }
     const msg = oversizeGuidance({
       file,
       lines,

@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, DATA_DIR } from './config.mjs';
 import { vectorStoreNeedsEmbed, wantEmbedModel } from './vectorStore.mjs';
 import { pidAlive, spawnLogged, LOCK_TTL_MS } from './proc.mjs';
+import { embedIntent } from './rangePick.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const self = fileURLToPath(import.meta.url);
@@ -139,6 +140,23 @@ function embedRunning() {
   } catch { return false; }
 }
 
+/** 意图落盘:read-guard 的改写路径用它挑语义区间。best-effort,失败不注入也不报错。 */
+async function storeIntentVector(payload) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8'));
+    const rg = cfg.readGuard && typeof cfg.readGuard === 'object' ? cfg.readGuard : {};
+    if (rg.rewrite !== true) return; // 改写未启用就不花嵌入时间
+    const prompt = extractPrompt(payload);
+    if (prompt.length < 12) return;
+    const v = await embedIntent(prompt);
+    if (!v) return;
+    const sid = String(payload.sessionId || payload.session_id || payload.conversation_id || '_global').replace(/[^\w.-]/g, '_');
+    const dest = path.join(DATA_DIR, 'read-guard', `${sid}.intent.json`);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, JSON.stringify({ v, text: prompt.slice(0, 1000), at: Date.now() }));
+  } catch { /* 意图存不上不影响注入 */ }
+}
+
 async function main() {
   const raw = await readStdin();
   // 签名检查分离后台拉起,不阻塞注入
@@ -152,8 +170,11 @@ async function main() {
     child.unref();
   } catch { /* 拉不起就不保鲜 */ }
 
+  let payload = {};
+  try { payload = JSON.parse(raw || '{}'); } catch { /* 坏载荷只跳过预取 */ }
   let ctx = null;
-  try { ctx = prefetchContext(JSON.parse(raw || '{}')); } catch { /* 预取失败静默 */ }
+  try { ctx = prefetchContext(payload); } catch { /* 预取失败静默 */ }
+  await storeIntentVector(payload);
   // 必须输出 {additionalContext} 对象;裸字符串宿主解析不出注入字段
   process.stdout.write(JSON.stringify(ctx ? { additionalContext: ctx } : {}) + '\n');
   process.exit(0);

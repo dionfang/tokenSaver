@@ -336,7 +336,9 @@ export function computeAccumulation(events, watermarks = {}, rolloutDir = ROLLOU
     const key = eventKey(ev);
     const tokens = ev.kind === 'Search'
       ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
-      : Math.ceil(Number(ev.bytes) / 4);
+      : ev.kind === 'Rewrite'
+        ? Math.max(0, Math.ceil((Number(ev.bytes) - Number(ev.rangeBytes || 0)) / 4))
+        : Math.ceil(Number(ev.bytes) / 4);
     const wm = watermarks[key] || null;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -463,7 +465,9 @@ export function accumulateReadEvents(events, rolloutDir = ROLLOUT_DIR) {
     if (ev.void || ev.kind === 'SearchClaim') continue;
     const tokens = ev.kind === 'Search'
       ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
-      : Math.ceil(Number(ev.bytes) / 4);
+      : ev.kind === 'Rewrite'
+        ? Math.max(0, Math.ceil((Number(ev.bytes) - Number(ev.rangeBytes || 0)) / 4))
+        : Math.ceil(Number(ev.bytes) / 4);
     if (!ev.session) {
       detail.push({ session: null, kind: ev.kind || '', file: ev.file || '', tokens, rowsAfter: null, add: 0, unclaimed: true });
       continue;

@@ -7,7 +7,8 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { rewriteCursorUserHooks } from '../code-index/init.mjs';
-import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, oversizeGuidance, OVERRIDE_WINDOW_MS, tokensFromBlockedBytes } from '../code-index/read-guard.mjs';
+import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, markHookRewrite, oversizeGuidance, OVERRIDE_WINDOW_MS, rewriteBody, rewriteGuidance, tokensFromBlockedBytes, bytesOfLines } from '../code-index/read-guard.mjs';
+import { pickSpan, pathMatchesChunk } from '../code-index/rangePick.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hook = path.join(here, '..', 'code-index', 'read-guard.mjs');
@@ -324,4 +325,87 @@ assert.equal(fwdState.denials[big].response.permission, 'deny');
 
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(hookRoot, { recursive: true, force: true });
+
+// ---------- 改写路径(ZCode):Grep 补 head_limit;无意图时 Read 落回 deny ----------
+{
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-rg-rw-'));
+  const big2 = path.join(tmp2, 'big2.js');
+  fs.writeFileSync(big2, Array.from({ length: 800 }, (_, i) => `const m${i} = ${i};`).join('\n'));
+  const dataDir2 = path.join(tmp2, 'data');
+  fs.mkdirSync(dataDir2, { recursive: true });
+  // 打开改写开关后才走 rewrite 分支;默认(无配置)全关
+  fs.writeFileSync(path.join(dataDir2, 'code-index.config.json'), JSON.stringify({ readGuard: { rewrite: true, grepHeadLimit: 100 } }));
+  const env2 = { ...process.env, CODE_INDEX_DATA_DIR: dataDir2 };
+  for (const k of Object.keys(env2)) if (/^(QODER_|ZCODE_|CURSOR_)/.test(k)) delete env2[k];
+  const zEnv = { ...env2, ZCODE_SESSION_ID: 'zs-rw' };
+  const run2 = (input, e = zEnv) => spawnSync(process.execPath, [hook], {
+    input: JSON.stringify(input), encoding: 'utf8', env: e, windowsHide: true,
+  });
+
+  // 纯函数:选段
+  let sp = pickSpan([{ s: 1, e: 50, score: 0.3 }, { s: 60, e: 120, score: 0.8 }, { s: 400, e: 500, score: 0.5 }], { maxLines: 625, topK: 3, gap: 40 });
+  assert.equal(sp.s, 1, '近邻块合并');
+  assert.equal(sp.e, 120);
+  assert.equal(sp.topScore, 0.8);
+  sp = pickSpan([{ s: 1, e: 100, score: 0.2 }, { s: 2000, e: 2100, score: 0.9 }], { maxLines: 150, topK: 2, gap: 40 });
+  assert.equal(sp.s, 2000, '远块不合并,锚定最高分簇');
+  assert.equal(sp.e, 2100, '簇宽 101 ≤ maxLines 不外扩');
+  sp = pickSpan([{ s: 2000, e: 2400, score: 0.9 }], { maxLines: 150, topK: 2, gap: 40 });
+  assert.equal(sp.s, 2000, '簇超宽从锚块起截');
+  assert.equal(sp.e, 2149, '封顶到 maxLines');
+  assert.equal(pickSpan([]), null);
+  assert.equal(pickSpan([{ s: 1, e: 2, score: 0 }]), null, '非正分不选');
+
+  // 纯函数:路径匹配与区间字节
+  assert.ok(pathMatchesChunk('D:/a/B/c.MJS', 'B/c.mjs'));
+  assert.ok(!pathMatchesChunk('D:/a/b/c.mjs', 'b/c.tsx'));
+  assert.ok(bytesOfLines(big2, 800, 1, 10) > 0);
+  assert.ok(bytesOfLines(big2, 800, 1, 10) < fs.statSync(big2).size);
+
+  // 纯函数:改写输出体与回执
+  const rb = rewriteBody({ file_path: 'x', offset: 1, limit: 3 }, 'ctx');
+  assert.equal(rb.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.equal(rb.hookSpecificOutput.updatedInput.limit, 3);
+  assert.equal(rb.hookSpecificOutput.additionalContext, 'ctx');
+  assert.match(rewriteGuidance({ file: 'f', lines: 900, size: 9000, range: { s: 1, e: 9, src: 'rerank' }, searchCmd: 'node s' }), /语义最相关区间 1-9 行\(精排选段\)/);
+  assert.match(rewriteGuidance({ file: 'f', lines: 900, size: 9000, range: { s: 1, e: 9, src: 'vec' }, searchCmd: 'node s' }), /offset=1 limit=900/);
+
+  // Grep 未带 head_limit → ZCode 补封顶;已带 → 不动
+  const g1 = JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g1', tool_name: 'Grep', tool_input: { pattern: 'foo', path: tmp2 }, cwd: tmp2 }).stdout);
+  assert.equal(g1.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.equal(g1.hookSpecificOutput.updatedInput.head_limit, 100);
+  assert.equal(g1.hookSpecificOutput.updatedInput.pattern, 'foo', '原入参其余键保留');
+  assert.match(g1.hookSpecificOutput.additionalContext, /head_limit=100/);
+  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g2', tool_name: 'Grep', tool_input: { pattern: 'foo', head_limit: 5 }, cwd: tmp2 }).stdout), {}, '已带 head_limit 放行');
+  // Cursor/无宿主环境不改 Grep
+  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g3', tool_name: 'Grep', tool_input: { pattern: 'foo' }, cwd: tmp2 }, env2).stdout), {}, '非 ZCode 不改写');
+
+  // 开着改写但无意图向量(chunk/模型不可用同路径)→ 落回 deny,fail-safe
+  const rw = JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'c-rw', tool_name: 'Read', tool_input: { file_path: big2 }, cwd: tmp2 }).stdout);
+  assert.equal(rw.hookSpecificOutput.permissionDecision, 'deny', '选不出区间仍 deny');
+  assert.match(rw.hookSpecificOutput.permissionDecisionReason, /offset\/limit/);
+  const evts = fs.readFileSync(path.join(dataDir2, 'read-guard', 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(evts.every((e) => e.kind !== 'Rewrite'), '降级路径不产 Rewrite 事件');
+  assert.ok(evts.some((e) => e.kind === 'Read' && e.session === 'c-rw'));
+
+  // Bash 拒绝文案带可照抄的具体命令(不再是占位符)
+  assert.match(bashOversizeGuidance({ files: ['D:/a/b.js'], lines: 900, size: 9000, readMaxLines: 500, searchCmd: 'node s' }), /sed -n '1,500p' D:\/a\/b\.js/);
+  assert.match(bashOversizeGuidance({ files: ['D:/a/b.js', 'D:/a/c.js'], lines: 900, size: 9000, readMaxLines: 500, searchCmd: 'node s' }), /多文件请逐个/);
+
+  // 改写预置标记:写进 read-nudge 状态文件,已有内容合并不覆盖
+  {
+    const st = path.join(dataDir2, 'read-guard', 'sess_mk.reads.json');
+    fs.mkdirSync(path.dirname(st), { recursive: true });
+    fs.writeFileSync(st, JSON.stringify({ reads: { 'D:/keep.ts': { ranges: 1, bytes: 10, lastAt: 1, nudgedAt: 0 } } }));
+    assert.equal(markHookRewrite('sess_mk', 'D:/a/b.js', 123, st), true);
+    const j = JSON.parse(fs.readFileSync(st, 'utf8'));
+    assert.equal(j.hookRewrites['D:/a/b.js'], 123);
+    assert.equal(j.reads['D:/keep.ts'].ranges, 1, '已有 reads 状态保留');
+    markHookRewrite('sess_mk', 'D:/a/b.js', 456, st); // 幂等覆盖同文件标记
+    assert.equal(JSON.parse(fs.readFileSync(st, 'utf8')).hookRewrites['D:/a/b.js'], 456);
+  }
+
+  fs.rmSync(tmp2, { recursive: true, force: true });
+}
+
 console.log('ok');

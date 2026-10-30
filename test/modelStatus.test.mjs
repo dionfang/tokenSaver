@@ -201,6 +201,13 @@ assert.equal(typeof mod.accumulateSavings, 'function');
   const wmVoided = { [mod.eventKey(ev)]: { ...wm[mod.eventKey(ev)], accumulated: 0, voided: true, entryRefunded: true } };
   const voided2 = mod.computeAccumulation([ev, { ...ev, void: true }], wmVoided, rollDir);
   assert.equal(voided2.refund, 0, '不重复退');
+  // Rewrite 事件:单次节约 = (bytes − rangeBytes)/4,同样按其后 iteration 数累计
+  writeRows(2);
+  const rwEv = { at: t0 + 500, session: sid, kind: 'Rewrite', file: 'w2.txt', bytes: 40000, rangeBytes: 10000 };
+  const rwAcc = mod.computeAccumulation([rwEv], {}, rollDir);
+  assert.equal(rwAcc.detail[0].tokens, 7500, '(40000−10000)/4 = 7500');
+  assert.equal(rwAcc.total, 7500 * 4, '事件后 4 个 main_turn iteration(t0+500 之后)');
+
   // 水位文件读写
   const wmFile = path.join(dir, 'wm.json');
   mod.writeWatermarks({ k: { accumulated: 5 } }, wmFile);

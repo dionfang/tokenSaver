@@ -7,6 +7,7 @@
  *   PostToolUseFailure(Read/Bash 失败) → 指回 search 找正确文件
  * 记账:Read 实际进入上下文的字节数按 bytes/4 折 token,记入 session-savings.json
  *   当日桶的 readInputTokens(独立字段,不进 savedTokens,不影响现有口径)。
+ *   read-guard 改写注入的区间读(history.hookRewrites 标记)只记账、不进连续读计数。
  * 状态:data/read-guard/<会话>.reads.json;所有失败 fail-open(输出空对象)。
  */
 import fs from 'node:fs';
@@ -20,6 +21,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const HUGE_BYTES = 8 * 1024 * 1024;
 const READ_WINDOW_MS = 10 * 60 * 1000;
 const FAILURE_WINDOW_MS = 5 * 60 * 1000;
+const HOOK_REWRITE_WINDOW_MS = 5 * 60 * 1000;
 const DEFAULT_DUMP_BYTES = 24 * 1024;
 
 function readJson(file) {
@@ -73,6 +75,17 @@ export function evaluateNudge({ hookEventName, toolName, toolInput, toolResponse
     const st = h.reads && typeof h.reads[key] === 'object' ? { ...h.reads[key] } : { ranges: 0, bytes: 0, lastAt: 0, nudgedAt: 0 };
     let context;
     if (ranged) {
+      const markedAt = h.hookRewrites && Number.isFinite(h.hookRewrites[key]) ? h.hookRewrites[key] : null;
+      if (markedAt != null) {
+        delete h.hookRewrites[key]; // 一次性消费(过期的也顺手清掉)
+        if (now - markedAt < HOOK_REWRITE_WINDOW_MS) {
+          // read-guard 改写注入的区间读:不进"连续区间读"启发式(那会把钩子行为算成 agent 意图),
+          // 字节照常记账(内容实际进入了上下文)。
+          st.lastAt = now;
+          h.reads = { ...(h.reads || {}), [key]: st };
+          return { history: h, accountTokens: Math.ceil(bytes / 4) };
+        }
+      }
       st.ranges += 1;
       st.bytes += bytes;
       st.lastAt = now;

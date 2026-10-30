@@ -224,7 +224,7 @@ async function eventsReport() {
   const acc = computeAccumulation(events, watermarks);
   const replayByKey = new Map(replay.detail.map((d) => [`${d.kind}|${d.session}|${d.file}|${d.at}`, d]));
   const nfmt2 = (n) => Number.isFinite(n) ? Math.round(n).toLocaleString('en-US') : '—';
-  const label = { Read: '拦截', Bash: 'Bash拦截', Search: '检索' };
+  const label = { Read: '拦截', Bash: 'Bash拦截', Search: '检索', Rewrite: '改写' };
   const statusOf = (d) => d.voided ? 'voided(重发放行)' : d.unclaimed ? '无主(未认领)' : d.rolloutMissing ? 'rollout 已清(已入账保留)' : '已入账';
   const md = [
     '# 会话累计口径报表(水位化持久累计)',

@@ -19,7 +19,7 @@ cd TokenSaver/code-index
 | `init.test.mjs` | init 接线 Cursor / Qoder / ZCode 用户级与工作区钩子、roots 合并自愈 |
 | `uninit.test.mjs` | uninit 移除用户级钩子（保留他人配置）、AGENTS.md 剥离、痕迹清理 |
 | `ollamaGuard.test.mjs` | Ollama 模型名比对与替换探测 |
-| `read-guard.test.mjs` | 超行数 Read / Bash cat 拦截、offset/limit 放行、5 分钟重试、fail-open |
+| `read-guard.test.mjs` | 超行数 Read / Bash cat 拦截、offset/limit 放行、5 分钟重试、fail-open；ZCode 改写路径（选段纯函数、Grep 补 head_limit、无意图降级 deny） |
 | `read-nudge.test.mjs` | 连续区间读导航、全量读清零、大输出限频、记账字节数 |
 | `prompt-guard.test.mjs` | 提交前模型变更检测（进程级 spawn）|
 | `prefetch.test.mjs` | 语义预取：载荷提取、bm25 命中、格式化、开关/去重/短话跳过 |

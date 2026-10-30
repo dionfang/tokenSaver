@@ -186,7 +186,7 @@ rewriteZcodeUserHooks({ home: fakeHome });
 const userZcode = JSON.parse(fs.readFileSync(path.join(fakeHome, '.zcode', 'cli', 'config.json'), 'utf8'));
 assert.deepEqual(userZcode.plugins, { somePlugin: true }, '用户级其他键保留');
 assert.equal(userZcode.hooks.enabled, true);
-assert.equal(userZcode.hooks.events.PreToolUse[0].matcher, '^Read$|^Bash$');
+assert.equal(userZcode.hooks.events.PreToolUse[0].matcher, '^Read$|^Bash$|^Grep$');
 const zcArg = userZcode.hooks.events.PreToolUse[0].hooks[0].args[0].replace(/\\/g, '/');
 assert.match(zcArg, /code-index\/read-guard\.mjs$/, '绝对路径直指 hub 脚本');
 assert.ok(path.isAbsolute(zcArg));

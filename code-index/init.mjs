@@ -651,7 +651,7 @@ export function rewriteZcodeUserHooks({ home = os.homedir() } = {}) {
   push('PostToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '连续读导航+工具结果记账')] });
   push('PostToolUseFailure', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '读取失败导航')] });
   push('UserPromptSubmit', { hooks: [zcodeProcess(path.join(here, 'prompt-guard.mjs'), 10000, '模型变更检测+语义预取')] });
-  push('PreToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(path.join(here, 'read-guard.mjs'), 10000, '超行数全量 Read/Bash 拦截')] });
+  push('PreToolUse', { matcher: '^Read$|^Bash$|^Grep$', hooks: [zcodeProcess(path.join(here, 'read-guard.mjs'), 10000, '超行数全量 Read/Bash 拦截(ZCode 改写为语义区间;Grep 补 head_limit)')] });
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] ZCode 用户级钩子已写入 ${cfgPath}(绝对路径直指本模块)`);

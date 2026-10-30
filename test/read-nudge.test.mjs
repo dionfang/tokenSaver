@@ -144,4 +144,47 @@ assert.equal(r.accountTokens, undefined, '关闭时不记账');
   fs.rmSync(stateDir, { recursive: true, force: true });
 }
 
+// hook 改写注入的区间读(hookRewrites 标记):只记账、不进连续读计数,标记一次性消费
+{
+  const mk = 'D:/y/b.ts';
+  let hh = { hookRewrites: { [mk]: now } };
+  let rr = evaluateNudge({
+    hookEventName: 'PostToolUse', toolName: 'Read',
+    toolInput: { file_path: mk, offset: 1, limit: 99 },
+    toolResponse: { stdoutBytes: 4533 },
+    history: hh, now, config: cfg,
+  });
+  assert.equal(rr.context, undefined, '钩子注入读不触发提示');
+  assert.equal(rr.accountTokens, 1134, '字节照常记账');
+  assert.equal(rr.history.reads[mk].ranges, 0, '不进连续读计数');
+  assert.equal(rr.history.hookRewrites[mk], undefined, '标记已消费');
+
+  // agent 随后的真实区间读:从 1 起算,到 2 段才提示(钩子那次不再叠加)
+  rr = evaluateNudge({
+    hookEventName: 'PostToolUse', toolName: 'Read',
+    toolInput: { file_path: mk, offset: 392, limit: 60 },
+    toolResponse: { stdoutBytes: 4096 },
+    history: rr.history, now: now + 1000, config: cfg,
+  });
+  assert.equal(rr.context, undefined, 'agent 第一段(计数 1)不提示');
+  rr = evaluateNudge({
+    hookEventName: 'PostToolUse', toolName: 'Read',
+    toolInput: { file_path: mk, offset: 500, limit: 60 },
+    toolResponse: { stdoutBytes: 4096 },
+    history: rr.history, now: now + 2000, config: cfg,
+  });
+  assert.match(rr.context, /连续区间读 2 段/, '真实两段才提示');
+
+  // 过期标记:顺手清除,按正常区间读计
+  hh = { hookRewrites: { [mk]: now - 10 * 60 * 1000 }, reads: {} };
+  rr = evaluateNudge({
+    hookEventName: 'PostToolUse', toolName: 'Read',
+    toolInput: { file_path: mk, offset: 1, limit: 10 },
+    toolResponse: { stdoutBytes: 400 },
+    history: hh, now, config: cfg,
+  });
+  assert.equal(rr.history.reads[mk].ranges, 1, '过期标记不抑制');
+  assert.equal(rr.history.hookRewrites[mk], undefined, '过期标记已清');
+}
+
 console.log('ok');
