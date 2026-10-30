@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseInitArgs, isCodeIndexHookRef, gitignoreEntries, detectAgent, resolveHookTargets, cleanCursorWorkspaceHooks, cleanQoderWorkspaceHooks, cleanZcodeWorkspaceHooks, rewriteCursorUserHooks, rewriteQoderUserHooks, rewriteZcodeUserHooks, qoderUserDir, splitRoots, mergeRoots, healRoots, rollKnownAnnotations, DIET_MARK, dietBlock, applyDiet, withEol } from '../code-index/init.mjs';
+import { runCommitRefresh } from '../code-index/commit-refresh.mjs';
 
 assert.equal(parseInitArgs([]).modelIn, null);
 assert.equal(parseInitArgs(['--model-in', 'local']).modelIn, 'local');
@@ -52,6 +53,7 @@ assert.equal(isCodeIndexHookRef('node_modules/@dionfang/tokensaver/warm.mjs'), t
 assert.equal(isCodeIndexHookRef('.cursor/hooks/warm-code-index.mjs'), true);
 assert.equal(isCodeIndexHookRef('.cursor/hooks/prompt-guard.mjs'), true);
 assert.equal(isCodeIndexHookRef('.cursor/hooks/read-guard.mjs'), true);
+assert.equal(isCodeIndexHookRef('.cursor/hooks/commit-refresh.mjs'), true);
 assert.equal(isCodeIndexHookRef('.qoder/hooks/session-start.mjs'), true);
 assert.equal(isCodeIndexHookRef('.qoder/hooks/read-guard.mjs'), true);
 assert.equal(isCodeIndexHookRef('node .qoder/hooks/session-start.mjs'), true);
@@ -205,10 +207,17 @@ assert.equal(userZcode2.hooks.events.PostToolUse.length, 2, '幂等:PostToolUse 
 rewriteCursorUserHooks({ home: fakeHome });
 const userCursor = JSON.parse(fs.readFileSync(path.join(fakeHome, '.cursor', 'hooks.json'), 'utf8'));
 assert.equal(userCursor.hooks.preToolUse[0].matcher, 'Read', 'matcher 只能是字面工具名,正则会被 Cursor 整组跳过');
+assert.equal(userCursor.hooks.preToolUse[1].matcher, 'Grep', 'Grep 封顶单独一条字面 matcher,不并进正则');
+assert.equal(userCursor.hooks.preToolUse[0].command, userCursor.hooks.preToolUse[1].command);
 assert.ok(userCursor.hooks.preToolUse[0].command.startsWith('node '), 'Cursor preToolUse 用转发器命令');
 const userCursorFwd = userCursor.hooks.preToolUse[0].command.replace(/^node /, '');
 assert.ok(fs.existsSync(userCursorFwd), 'Cursor 转发器真实存在');
 assert.equal(userCursor.hooks.postToolUse[0].matcher, 'Read|Bash', 'postToolUse matcher:Bash 会被映射为 Shell');
+assert.equal(userCursor.hooks.postToolUse[1].matcher, 'Bash', '提交保鲜单独一条字面 Bash,Cursor 映射为 Shell');
+assert.ok(fs.existsSync(userCursor.hooks.postToolUse[1].command.replace(/^node /, '')), 'commit-refresh 转发器真实存在');
+assert.equal(runCommitRefresh('{"tool_input":{"command":"git status"}}'), false);
+assert.equal(runCommitRefresh('{"command":"git log --grep=commit"}'), false);
+assert.equal(runCommitRefresh('not-json'), false);
 const nudgeFwd = userCursor.hooks.postToolUse[0].command.replace(/^node /, '');
 assert.ok(fs.existsSync(nudgeFwd), 'read-nudge 转发器真实存在');
 assert.ok(nudgeFwd.endsWith('.cursor/hooks/read-nudge.mjs'));
@@ -216,8 +225,8 @@ assert.equal(userCursor.hooks.postToolUseFailure[0].matcher, undefined, 'postToo
 assert.ok(fs.existsSync(userCursor.hooks.postToolUseFailure[0].command.replace(/^node /, '')));
 rewriteCursorUserHooks({ home: fakeHome });
 const userCursor2 = JSON.parse(fs.readFileSync(path.join(fakeHome, '.cursor', 'hooks.json'), 'utf8'));
-assert.equal(userCursor2.hooks.preToolUse.length, 1, '幂等');
-assert.equal(userCursor2.hooks.postToolUse.length, 1, '幂等:postToolUse 不累积');
+assert.equal(userCursor2.hooks.preToolUse.length, 2, '幂等:Read + Grep 不累积');
+assert.equal(userCursor2.hooks.postToolUse.length, 2, '幂等:read-nudge + commit-refresh 不累积');
 
 rewriteQoderUserHooks({ home: fakeHome });
 assert.equal(qoderUserDir(fakeHome), path.join(fakeHome, '.qoder-cn'), 'CN 目录优先');

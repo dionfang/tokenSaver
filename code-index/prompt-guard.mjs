@@ -143,9 +143,6 @@ function embedRunning() {
 /** 意图落盘:read-guard 的改写路径用它挑语义区间。best-effort,失败不注入也不报错。 */
 async function storeIntentVector(payload) {
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8'));
-    const rg = cfg.readGuard && typeof cfg.readGuard === 'object' ? cfg.readGuard : {};
-    if (rg.rewrite !== true) return; // 改写未启用就不花嵌入时间
     const prompt = extractPrompt(payload);
     if (prompt.length < 12) return;
     const v = await embedIntent(prompt);

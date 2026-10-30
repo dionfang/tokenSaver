@@ -52,8 +52,8 @@ function rmdirIfEmpty(dir) {
 
 // ---------- 步骤 2:用户级钩子 ----------
 
-const CURSOR_FORWARDERS = ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'output-savings.mjs'];
-const QODER_FORWARDERS = ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'output-savings.mjs'];
+const CURSOR_FORWARDERS = ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'output-savings.mjs'];
+const QODER_FORWARDERS = ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'output-savings.mjs'];
 
 export function uninstallZcodeUserHooks({ home = os.homedir() } = {}) {
   const file = path.join(home, '.zcode', 'cli', 'config.json');

@@ -181,7 +181,7 @@ export function readDayReadInputTokens() {
 const READ_EVENTS_PATH = path.join(DATA_DIR, 'read-guard', 'events.jsonl');
 const ROLLOUT_DIR = path.join(os.homedir(), '.zcode', 'cli', 'rollout');
 
-/** 事件留痕:一行一 JSON(拦截 deny/void、Search、SearchClaim)。失败静默,不影响主流程。 */
+/** 事件留痕:一行一 JSON(拦截 deny、Search、SearchClaim;void 仅历史遗留,read-guard 已不再产生)。失败静默,不影响主流程。 */
 export function appendReadEvent(entry) {
   try {
     fs.mkdirSync(path.dirname(READ_EVENTS_PATH), { recursive: true });

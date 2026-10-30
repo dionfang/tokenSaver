@@ -1,7 +1,7 @@
 /**
- * PostToolUse / PostToolUseFailure 钩子(^Read$|^Bash$):连续读导航 + 工具结果记账。
- * ZCode 用户级直呼本脚本;Qoder 用户级经 ~/.qoder-cn/hooks/read-nudge.mjs 转发(additionalContext 包成 hookSpecificOutput);
- * Cursor 用户级经 ~/.cursor/hooks/read-nudge.mjs 同进程转发器调 runReadNudge。
+ * PostToolUse / PostToolUseFailure:连续读导航 + 工具结果记账。
+ * ZCode 直呼本脚本,matcher 为 ^Read$|^Bash$。Qoder 的 PostToolUse 用同一正则,失败事件只用字面 Read|Bash,转发器把 additionalContext 包成 hookSpecificOutput。
+ * Cursor 的 postToolUse matcher 为字面 Read|Bash,失败事件不带 matcher,经 ~/.cursor/hooks/read-nudge.mjs 同进程调 runReadNudge。
  * 不拦截任何调用,只在必要时输出 additionalContext(实测 ZCode/Cursor 都注入到对话):
  *   Read 区间读同一文件 ≥2 段 → 提示合并为一次读完,或先 search 拿大纲
  *   Bash 输出超过 bashDumpBytes → 提示改用 Read offset/limit 或先检索

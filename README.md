@@ -18,7 +18,7 @@ BM25 词法（标识符拆分、中文二元组）加向量余弦。需要更准
 
 #### 读取守卫
 
-默认拦截过长的整文件读取（`readMaxLines` 默认 500，超过其 1.25 倍由钩子拦截）。带 `offset` / `limit` 的区间读不受限。同一文件 5 分钟内再试一次即放行。钩子出错不阻断会话。
+过长的整文件 Read 先改写为语义最相关区间（`readMaxLines` 默认 500，超过其 1.25 倍才处理），选不出区间才拒绝，并给出检索与区间读的替代方案。Cursor、ZCode、Qoder 都这样，改写恒开，无需配置。带 `offset` / `limit` 的区间读不受限。Bash 里 cat 整读大文件直接拒绝。不带 `head_limit` 的 Grep 三端都补成 100。同一目标 5 分钟内再试一次全量即放行，且不倒扣已入账的拒绝或改写。钩子出错不阻断会话。Cursor 的 preToolUse 用字面 matcher `Read` 与 `Grep`（正则会被整组跳过）。git commit 之后做索引保鲜：Cursor 用字面 `Bash`（映射为 Shell），ZCode 用 `Bash`，Qoder 用 `Bash|Shell`。
 
 #### 索引保鲜
 
@@ -160,7 +160,7 @@ There are two embedding paths. The default is local transformers.js, which does 
 
 #### Read guard
 
-Full-file reads that are too long are blocked. `readMaxLines` defaults to 500, and the hook blocks a read past 1.25 times that limit. Reads that pass `offset` / `limit` are not limited. One retry of the same file within five minutes is allowed. A hook error does not block the session.
+An over-long full-file Read is rewritten to the semantically closest line range. `readMaxLines` defaults to 500, and the hook acts past 1.25 times that limit; it denies the read only when no range can be picked, and the denial carries index-search and ranged-read alternatives. Cursor, ZCode, and Qoder all do this. Rewriting is always on and needs no configuration. Reads that pass `offset` / `limit` are not limited. A Bash cat of a whole large file is denied. A Grep call without `head_limit` is capped at 100 on all three. One retry of the same target within five minutes is allowed, and that retry does not reverse accounting already recorded for the denial or the rewrite. A hook error does not block the session. Cursor preToolUse uses the literal matchers `Read` and `Grep` (a regex matcher is skipped as a whole group). After git commit, index refresh runs from Cursor with the literal matcher `Bash` (mapped to Shell), from ZCode with `Bash`, and from Qoder with `Bash|Shell`.
 
 #### Index freshness
 

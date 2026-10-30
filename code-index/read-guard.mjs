@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 /**
- * Read/Bash 拦截:Cursor preToolUse(Read)+beforeShellExecution(cat);ZCode/Qoder PreToolUse ^Read$|^Bash$|^Grep$。
- * 全量 Read 超过 readMaxLines×1.25 → ZCode/Qoder 优先改写为语义区间读(rangePick 选段,updatedInput),
- *   选不出区间或 Cursor 时退回 deny(指路 search + 区间读)。
- * Grep(ZCode/Qoder):不带 head_limit 的调用补 head_limit 封顶(PreToolUse 拿不到结果量,此路不记账)。
+ * Read/Bash 拦截:Cursor preToolUse 两条字面 matcher(Read、Grep)+beforeShellExecution(cat);
+ *   ZCode/Qoder PreToolUse ^Read$|^Bash$|^Grep$。Cursor 的 matcher 不写正则,正则会整组跳过。
+ * 全量 Read 超过 readMaxLines×1.25 → 三端都优先改写为语义区间读(rangePick 选段)。
+ *   ZCode/Qoder 走 hookSpecificOutput.updatedInput;Cursor 走 preToolUse 的 updated_input。
+ *   选不出区间则 deny(指路 search + 区间读)。改写是默认路径,不由配置开关。
+ * Grep:不带 head_limit 的调用补 head_limit 封顶(拿不到结果量,此路不记账)。三端都改。
  * 终端/Bash 里各链式组末段的 cat 整读同规则拦;带 | 限量管道、> 重定向、cat 无文件参数则放行。
  * Cursor 终端走 beforeShellExecution(工具名常是 Shell,不进 preToolUse Bash);ZCode/Qoder 仍认 Bash。
- * 带 offset/limit 的区间读放行。刚拦过同一目标 5 分钟内再发则放行(deny 专属;改写幂等,重发即再改写)。
+ * 带 offset/limit 的区间读放行。刚拦过或改写过同一目标,5 分钟内再发全量则放行。
+ *   5 分钟放行不倒扣已入账的 deny 或改写:放行只删记录,不发票据。
  * 拦截/改写同时追加事件到 data/read-guard/events.jsonl(deny:{bytes};Rewrite:{bytes,rangeBytes,s,e}),
  *   供 modelStatus 按 rollout 回放做"会话累计"口径修正;入口账 deny 记 (bytes/4,0)、Rewrite 记 (bytes/4,区间/4)。
- * Cursor 输出 {permission};ZCode/Qoder 输出 hookSpecificOutput.permissionDecision;改写走
- *   hookSpecificOutput.updatedInput(ZCode/Qoder 实测采纳;未文档化能力,失效时关 readGuard.rewrite 即回 deny)。
+ * Cursor 拒绝输出 {permission:deny};放行/改写输出 {permission:allow,updated_input,agent_message}。
+ *   ZCode/Qoder 拒绝走 hookSpecificOutput.permissionDecision;改写走 updatedInput。
  * 自身出错 fail-open:Cursor 写 {permission:allow}(缺字段会被拦);Claude 系写 {}(allow 不短路权限链)。
  * 不拦重复读,不做差分。
  */
@@ -52,7 +55,7 @@ export function formatDecision(dialect, permission, reason) {
   return ALLOW;
 }
 
-/** 记录拒绝时来自哪个宿主。环境变量优先,事件名只能区分 Cursor 与 Claude 系。 */
+/** 判定宿主。环境变量优先,事件名只能区分 Cursor 与 Claude 系。 */
 export function detectAgentType(input, env = process.env) {
   if (env.ZCODE_PROJECT_DIR || env.ZCODE_SESSION_ID || env.ZCODE_PLUGIN_ROOT) return 'zcode';
   if (env.QODER_PROJECT_DIR || env.QODER_CONFIG_DIR || env.QODER_SESSION_ID || env.QODER_CWD) return 'qoder';
@@ -61,10 +64,10 @@ export function detectAgentType(input, env = process.env) {
   return (ev === 'preToolUse' || ev === 'beforeShellExecution') ? 'cursor' : 'unknown';
 }
 
-/** updatedInput 改写仅 Claude 系且实测采纳:ZCode/Qoder;Cursor 无此能力。 */
+/** 改写入参:ZCode/Qoder 的 updatedInput,Cursor preToolUse 的 updated_input。无宿主标记则不改。 */
 export function supportsRewrite(input, env = process.env) {
   const t = detectAgentType(input, env);
-  return t === 'zcode' || t === 'qoder';
+  return t === 'zcode' || t === 'qoder' || t === 'cursor';
 }
 
 export function evaluateReadGuard({
@@ -194,18 +197,8 @@ export function resolveReadMaxLines() {
   return DEFAULT_CONFIG.readMaxLines;
 }
 
-/** 改写路径配置:readGuard.rewrite 总开关;grepHeadLimit 给 Grep 补封顶(0=关)。默认全关。 */
-export function rewriteConfig() {
-  try {
-    const j = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    const rg = j.readGuard && typeof j.readGuard === 'object' ? j.readGuard : {};
-    const gh = Number(rg.grepHeadLimit);
-    return {
-      rewrite: rg.rewrite === true,
-      grepHeadLimit: Number.isFinite(gh) && gh > 0 ? gh : 0,
-    };
-  } catch { return { rewrite: false, grepHeadLimit: 0 }; }
-}
+/** Grep 补封顶上限:写死,不走配置(防大仓库匹配倾倒;PreToolUse 拿不到结果量,此路不记账)。 */
+export const GREP_HEAD_LIMIT = 100;
 
 /** 改写输出体(claude 方言)。updatedInput 会替换执行入参;additionalContext 随工具结果注入。 */
 export function rewriteBody(updatedInput, context) {
@@ -216,6 +209,14 @@ export function rewriteBody(updatedInput, context) {
       additionalContext: context,
     },
   };
+}
+
+/** 按方言选改写体。Cursor 用 updated_input;agent_message 把选段说明送回模型。 */
+export function rewriteFor(dialect, updatedInput, context) {
+  if (dialect === 'cursor') {
+    return { permission: 'allow', updated_input: updatedInput, agent_message: context };
+  }
+  return rewriteBody(updatedInput, context);
 }
 
 export function rewriteGuidance({ file, lines, size, range, searchCmd }) {
@@ -290,14 +291,14 @@ function emit(dialect, permission, reason) {
   return body;
 }
 
-/** Grep(ZCode/Qoder):未带 head_limit 的调用补封顶,防大仓库匹配倾倒。PreToolUse 无结果量,不记账。 */
+/** Grep:未带 head_limit 的调用补封顶,防大仓库匹配倾倒。拿不到结果量,不记账。 */
 function grepGuard(input, dialect) {
-  const rc = rewriteConfig();
   const ti = input.tool_input || {};
-  if (rc.rewrite && rc.grepHeadLimit > 0 && ti.head_limit == null && supportsRewrite(input)) {
-    const body = rewriteBody(
-      { ...ti, head_limit: rc.grepHeadLimit },
-      `[code-index] 已给本次 Grep 补 head_limit=${rc.grepHeadLimit} 封顶输出(原调用未带)。` +
+  if (ti.head_limit == null && supportsRewrite(input)) {
+    const body = rewriteFor(
+      dialect,
+      { ...ti, head_limit: GREP_HEAD_LIMIT },
+      `[code-index] 已给本次 Grep 补 head_limit=${GREP_HEAD_LIMIT} 封顶输出(原调用未带)。` +
       `要更多命中请分目录或加 glob 缩小,确需更多时显式带 head_limit 重发。`,
     );
     respond(body);
@@ -335,8 +336,7 @@ async function bashGuard(input, dialect) {
     statFile,
   });
   if (decision.override) {
-    const d = key ? denials[key] : null;
-    if (d && d.bytes) await trackEvent({ at: d.at, session: convId, kind: 'Bash', file: d.file || key, bytes: d.bytes, void: true });
+    // 5 分钟内重发同一命令 → 放行。放行不倒扣之前 deny 的累计记账(不发票据)。
     delete denials[key];
     try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
     return emit(dialect, 'allow');
@@ -375,7 +375,7 @@ export async function runReadGuard({ stdinText } = {}) {
   const dialect = detectDialect(input || {});
   const ev = String(input?.hook_event_name || input?.hookEventName || '');
   const tool = input?.tool_name;
-  // ZCode/Qoder:Bash;Grep(ZCode/Qoder 改写封顶);Cursor:beforeShellExecution,偶发 Shell preToolUse。
+  // Bash/Shell 与 Cursor beforeShellExecution 走整读拦截;Grep 三端补 head_limit。
   if (tool === 'Bash' || tool === 'Shell' || ev === 'beforeShellExecution') {
     return bashGuard(input, dialect);
   }
@@ -416,17 +416,15 @@ export async function runReadGuard({ stdinText } = {}) {
   });
 
   if (decision.override) {
-    const d = denials[file];
-    if (d && d.bytes) await trackEvent({ at: d.at, session: convId, kind: 'Read', file, bytes: d.bytes, void: true });
+    // 5 分钟内重发同一文件 → 放行。不倒扣已入账的 deny 或改写(不发票据)。
     delete denials[file];
     try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
     return emit(dialect, 'allow');
   }
 
   if (decision.permission === 'deny') {
-    // ZCode/Qoder 改写路径:选得出语义区间就改写入参,选不出(无意图/索引缺失/不相关)落回 deny
-    const rc = rewriteConfig();
-    if (rc.rewrite && supportsRewrite(input)) {
+    // 三端改写路径(默认):选得出语义区间就改写入参,选不出(无意图/索引缺失/不相关)落回 deny
+    if (supportsRewrite(input)) {
       let range = null;
       try {
         const { pickRangeForFile } = await import('./rangePick.mjs');
@@ -437,7 +435,8 @@ export async function runReadGuard({ stdinText } = {}) {
         const limit = Math.min(range.e, lines) - s + 1;
         if (limit > 0) {
           const rangeBytes = bytesOfLines(file, lines, s, Math.min(range.e, lines));
-          const body = rewriteBody(
+          const body = rewriteFor(
+            dialect,
             { ...ti, offset: s, limit },
             rewriteGuidance({ file, lines, size: st.size, range, searchCmd: searchCmd() }),
           );
@@ -447,6 +446,11 @@ export async function runReadGuard({ stdinText } = {}) {
           } catch { /* 记账失败仍改写 */ }
           await trackEvent({ at: now, session: convId, kind: 'Rewrite', file, bytes: st.size, rangeBytes, s, e: Math.min(range.e, lines) });
           markHookRewrite(convId, file, now);
+          // 改写也登记一次拦截:5 分钟内重发同一文件即放行全文(与 deny 同口径的逃生舱)
+          try {
+            denials[file] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Rewrite', file };
+            saveDenials(convId, denials);
+          } catch { /* 登记不上不影响改写 */ }
           respond(body);
           return body;
         }

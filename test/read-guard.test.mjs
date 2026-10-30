@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { rewriteCursorUserHooks, rewriteQoderUserHooks } from '../code-index/init.mjs';
-import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, markHookRewrite, oversizeGuidance, OVERRIDE_WINDOW_MS, rewriteBody, rewriteGuidance, supportsRewrite, tokensFromBlockedBytes, bytesOfLines } from '../code-index/read-guard.mjs';
+import { bashOversizeGuidance, catDumpPieces, detectAgentType, detectDialect, evaluateBashGuard, evaluateReadGuard, formatDecision, markHookRewrite, oversizeGuidance, OVERRIDE_WINDOW_MS, rewriteBody, rewriteFor, rewriteGuidance, supportsRewrite, tokensFromBlockedBytes, bytesOfLines } from '../code-index/read-guard.mjs';
 import { pickSpan, pathMatchesChunk } from '../code-index/rangePick.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -24,7 +24,8 @@ assert.equal(detectAgentType({ hook_event_name: 'preToolUse' }, {}), 'cursor');
 assert.equal(detectAgentType({ hook_event_name: 'PreToolUse' }, {}), 'unknown');
 assert.equal(supportsRewrite({}, { ZCODE_SESSION_ID: 's' }), true);
 assert.equal(supportsRewrite({}, { QODER_PROJECT_DIR: 'D:/p' }), true, 'Qoder 实测采纳 updatedInput');
-assert.equal(supportsRewrite({}, { CURSOR_AGENT: '1' }), false);
+assert.equal(supportsRewrite({}, { CURSOR_AGENT: '1' }), true, 'Cursor preToolUse 采纳 updated_input');
+assert.equal(supportsRewrite({ hook_event_name: 'PreToolUse' }, {}), false, '无宿主标记不改写');
 assert.equal(formatDecision('cursor', 'allow').permission, 'allow');
 assert.equal(formatDecision('claude', 'allow').hookSpecificOutput, undefined);
 assert.equal(formatDecision('claude', 'deny', 'x').hookSpecificOutput.permissionDecision, 'deny');
@@ -182,7 +183,11 @@ assert.equal(day.savedTokens, blockedTokens);
 const second = runHook(payload);
 assert.equal(JSON.parse(second.stdout).permission, 'allow');
 const ledgerAfterAllow = JSON.parse(fs.readFileSync(path.join(dataDir, 'session-savings.json'), 'utf8'));
-assert.equal(Object.values(ledgerAfterAllow.days)[0].savedTokens, blockedTokens);
+assert.equal(Object.values(ledgerAfterAllow.days)[0].savedTokens, blockedTokens, '5 分钟放行不倒扣之前 deny 的累计记账');
+// 放行只删放行记录,不发票据(没有 void 事件):deny 的账保留在账本里
+const evtsAfterAllow = fs.readFileSync(path.join(dataDir, 'read-guard', 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+assert.ok(evtsAfterAllow.every((e) => !e.void), '放行不发票据,不做 void 退款');
+assert.ok(evtsAfterAllow.some((e) => e.kind === 'Read' && e.session === 'c1'), '原 deny 事件仍在,账保留');
 
 const bom = spawnSync(process.execPath, [hook], {
   input: `\uFEFF${JSON.stringify({ ...payload, conversation_id: 'c-bom' })}`,
@@ -329,15 +334,15 @@ assert.equal(fwdState.denials[big].response.permission, 'deny');
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(hookRoot, { recursive: true, force: true });
 
-// ---------- 改写路径(ZCode):Grep 补 head_limit;无意图时 Read 落回 deny ----------
+// ---------- 改写路径:Grep 补 head_limit;无意图时 Read 落回 deny ----------
 {
   const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-rg-rw-'));
   const big2 = path.join(tmp2, 'big2.js');
   fs.writeFileSync(big2, Array.from({ length: 800 }, (_, i) => `const m${i} = ${i};`).join('\n'));
   const dataDir2 = path.join(tmp2, 'data');
   fs.mkdirSync(dataDir2, { recursive: true });
-  // 打开改写开关后才走 rewrite 分支;默认(无配置)全关
-  fs.writeFileSync(path.join(dataDir2, 'code-index.config.json'), JSON.stringify({ readGuard: { rewrite: true, grepHeadLimit: 100 } }));
+  // 改写与 Grep 封顶都恒开:配置里不再有 readGuard 段
+  fs.writeFileSync(path.join(dataDir2, 'code-index.config.json'), JSON.stringify({ readMaxLines: 500 }));
   const env2 = { ...process.env, CODE_INDEX_DATA_DIR: dataDir2 };
   for (const k of Object.keys(env2)) if (/^(QODER_|ZCODE_|CURSOR_)/.test(k)) delete env2[k];
   const zEnv = { ...env2, ZCODE_SESSION_ID: 'zs-rw' };
@@ -370,6 +375,11 @@ fs.rmSync(hookRoot, { recursive: true, force: true });
   assert.equal(rb.hookSpecificOutput.hookEventName, 'PreToolUse');
   assert.equal(rb.hookSpecificOutput.updatedInput.limit, 3);
   assert.equal(rb.hookSpecificOutput.additionalContext, 'ctx');
+  const crb = rewriteFor('cursor', { file_path: 'x', offset: 1, limit: 3 }, 'ctx');
+  assert.equal(crb.permission, 'allow');
+  assert.equal(crb.updated_input.limit, 3);
+  assert.equal(crb.agent_message, 'ctx');
+  assert.equal(crb.hookSpecificOutput, undefined, 'Cursor 改写不走 hookSpecificOutput');
   assert.match(rewriteGuidance({ file: 'f', lines: 900, size: 9000, range: { s: 1, e: 9, src: 'rerank' }, searchCmd: 'node s' }), /语义最相关区间 1-9 行\(精排选段\)/);
   assert.match(rewriteGuidance({ file: 'f', lines: 900, size: 9000, range: { s: 1, e: 9, src: 'vec' }, searchCmd: 'node s' }), /offset=1 limit=900/);
 
@@ -384,8 +394,17 @@ fs.rmSync(hookRoot, { recursive: true, force: true });
   const gq = JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g4', tool_name: 'Grep', tool_input: { pattern: 'foo', path: tmp2 }, cwd: tmp2 }, { ...env2, QODER_SESSION_ID: 'q-g' }).stdout);
   assert.equal(gq.hookSpecificOutput.updatedInput.head_limit, 100);
   assert.equal(gq.hookSpecificOutput.updatedInput.pattern, 'foo');
-  // Cursor/无宿主环境不改 Grep
-  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g3', tool_name: 'Grep', tool_input: { pattern: 'foo' }, cwd: tmp2 }, env2).stdout), {}, '非 ZCode/Qoder 不改写');
+  // 无宿主环境不改 Grep;Cursor 用 updated_input,且已带 head_limit 时放行
+  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'g3', tool_name: 'Grep', tool_input: { pattern: 'foo' }, cwd: tmp2 }, env2).stdout), {}, '无宿主不改写');
+  const gc = JSON.parse(run2({ hook_event_name: 'preToolUse', conversation_id: 'g5', tool_name: 'Grep', tool_input: { pattern: 'foo', path: tmp2 }, cwd: tmp2 }, { ...env2, CURSOR_AGENT: '1' }).stdout);
+  assert.equal(gc.permission, 'allow');
+  assert.equal(gc.updated_input.head_limit, 100);
+  assert.equal(gc.updated_input.pattern, 'foo', 'Cursor 改写保留原入参');
+  assert.match(gc.agent_message, /head_limit=100/);
+  assert.deepEqual(JSON.parse(run2({ hook_event_name: 'preToolUse', conversation_id: 'g6', tool_name: 'Grep', tool_input: { pattern: 'foo', head_limit: 5 }, cwd: tmp2 }, { ...env2, CURSOR_AGENT: '1' }).stdout), { permission: 'allow' }, 'Cursor 已带 head_limit 放行');
+  const cDeny = JSON.parse(run2({ hook_event_name: 'preToolUse', conversation_id: 'c-cur', tool_name: 'Read', tool_input: { file_path: big2 }, cwd: tmp2 }, { ...env2, CURSOR_AGENT: '1' }).stdout);
+  assert.equal(cDeny.permission, 'deny', 'Cursor 选不出区间仍 deny');
+  assert.match(cDeny.agent_message, /offset\/limit/);
 
   // 开着改写但无意图向量(chunk/模型不可用同路径)→ 落回 deny,fail-safe
   const rw = JSON.parse(run2({ hook_event_name: 'PreToolUse', session_id: 'c-rw', tool_name: 'Read', tool_input: { file_path: big2 }, cwd: tmp2 }).stdout);
@@ -394,6 +413,21 @@ fs.rmSync(hookRoot, { recursive: true, force: true });
   const evts = fs.readFileSync(path.join(dataDir2, 'read-guard', 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(evts.every((e) => e.kind !== 'Rewrite'), '降级路径不产 Rewrite 事件');
   assert.ok(evts.some((e) => e.kind === 'Read' && e.session === 'c-rw'));
+
+  // 改写恒开:配置里没有 rewrite 开关,ZCode/Qoder 下仍走改写分支
+  // (选段依赖意图向量与索引,此处无 → 落回 deny;分支归属由 updatedInput 缺席 + deny 判定体现)
+  {
+    const noCfgDir = path.join(tmp2, 'data-nocfg');
+    fs.mkdirSync(noCfgDir, { recursive: true });
+    const noCfgEnv = { ...env2, CODE_INDEX_DATA_DIR: noCfgDir };
+    const out = JSON.parse(spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'nocfg', tool_name: 'Read', tool_input: { file_path: big2 }, cwd: tmp2 }),
+      encoding: 'utf8', env: noCfgEnv, windowsHide: true,
+    }).stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny', '无配置时选不出区间仍落 deny');
+    const ncEvts = fs.readFileSync(path.join(noCfgDir, 'read-guard', 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.ok(ncEvts.some((e) => e.kind === 'Read' && e.session === 'nocfg'), '无配置也走拦截路径并记账');
+  }
 
   // Bash 拒绝文案带可照抄的具体命令(不再是占位符)
   assert.match(bashOversizeGuidance({ files: ['D:/a/b.js'], lines: 900, size: 9000, readMaxLines: 500, searchCmd: 'node s' }), /sed -n '1,500p' D:\/a\/b\.js/);
