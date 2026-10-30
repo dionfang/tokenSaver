@@ -135,7 +135,6 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 | 目录 | 用途 |
 |---|---|
 | [`code-index/`](code-index/) | 运行时。直接部署、在本仓运行，或复制到目标项目的就是这一份 |
-| [`test/`](test/) | 单元测试与全量检索回归。不随 `code-index/` 复制，不进 npm 包 |
 | [`npm/`](npm/) | npm 发布骨架。只含 `package.json` 等基本文件；发布前由 `sync-npm.mjs` 生成运行时 |
 
 ### 许可
@@ -277,7 +276,6 @@ Runtime scripts are maintained only in `code-index/`. On npm publish, `prepack` 
 | Directory | Role |
 |---|---|
 | [`code-index/`](code-index/) | Runtime. This is what you deploy directly, run in this repo, or copy into a target project |
-| [`test/`](test/) | Unit tests and full retrieval regression. Not copied with `code-index/`, and not in the npm package |
 | [`npm/`](npm/) | npm publish skeleton. Only `package.json` and a few basic files; `sync-npm.mjs` generates the runtime before publish |
 
 ### License

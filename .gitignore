@@ -11,3 +11,6 @@ hf-cache/
 /.cursor/
 /.qoder/
 /data/
+
+# 开发期测试,不入库、不随仓库发给使用者
+/test/
