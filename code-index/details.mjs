@@ -51,12 +51,9 @@ out.push('> 符号后数字 = 该符号所在起始行(由切块推断,近似值
 out.push('> 检索建议:先 CODE_MAP.md 看架构,再本清单找符号,或直接 search.mjs 语义定位。');
 out.push('');
 
-const projOrder = ['foodFocus', 'Node.js', 'foodfocusAdmin'];
-for (const proj of [...tree.keys()].sort((a, b) => {
-  const ia = projOrder.indexOf(a);
-  const ib = projOrder.indexOf(b);
-  return (ia < 0 ? projOrder.length : ia) - (ib < 0 ? projOrder.length : ib);
-})) {
+// 项目排序按代码量降序(大项目在前),同量按名;不写死具体项目名——清单是本仓库生成的,换仓库也要成立
+const projLines = (p) => [...tree.get(p).keys()].reduce((sum, d) => sum + tree.get(p).get(d).reduce((s, f) => s + (lineMap.get(f) || 0), 0), 0);
+for (const proj of [...tree.keys()].sort((a, b) => projLines(b) - projLines(a) || a.localeCompare(b))) {
   const dirs = tree.get(proj);
   const pFiles = [...dirs.values()].flat();
   const pLines = pFiles.reduce((s, f) => s + (lineMap.get(f) || 0), 0);

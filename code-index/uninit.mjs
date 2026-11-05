@@ -7,7 +7,8 @@
  *   1) 读取部署清单(data/code-index.config.json 的 roots + 工具仓自身)
  *   2) 移除用户级钩子:ZCode ~/.zcode/cli/config.json、Cursor ~/.cursor/hooks.json(+转发器)、
  *      Qoder ~/.qoder-cn/settings.json(+转发器,国际版 ~/.qoder)。文件只剩本模块骨架则整删;
- *      含其他配置(如 ZCode 的 plugins)只摘钩子条目,文件保留
+ *      含其他配置(如 ZCode 的 plugins)只摘钩子条目,文件保留;
+ *      同时移除 init 播种的虚拟供应商条目(ZCode tokenSaverModel 与 Qoder tokensaver-auto,真实供应商不动)
  *   3) 防御性清理各项目工作区钩子残留(.zcode/.cursor/.qoder 里本模块的条目与转发器)
  *   4) 还原各项目 AGENTS.md:剥掉纪律段(<!-- code-index -->)与输出纪律段(<!-- output-diet -->;兼容剥旧 ponytail 段);
  *      剥完只剩空白 → 整文件删除;有用户内容 → 保留其余原文
@@ -52,8 +53,8 @@ function rmdirIfEmpty(dir) {
 
 // ---------- 步骤 2:用户级钩子 ----------
 
-const CURSOR_FORWARDERS = ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'output-savings.mjs'];
-const QODER_FORWARDERS = ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'output-savings.mjs'];
+const CURSOR_FORWARDERS = ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'agent-usage.mjs', 'output-savings.mjs'];
+const QODER_FORWARDERS = ['session-start.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'agent-usage-scan.mjs', 'turn-close.mjs', 'output-savings.mjs'];
 
 export function uninstallZcodeUserHooks({ home = os.homedir() } = {}) {
   const file = path.join(home, '.zcode', 'cli', 'config.json');
@@ -159,21 +160,20 @@ export function stripDietSection(content) {
   return { content: content.slice(0, idx), changed: true };
 }
 
-/** 剥掉 ponytail 段:优先按 init 写入的精确模板块移除(段后用户内容保留);
- *  模板被用户改过无法识别时退化为从标记切到文末(此时无法区分模板与段后内容)。 */
+/** 剥掉 ponytail 段(2026-11-03:模板文件已删,不再按精确块匹配):
+ *  按写入形态切——标记 + 固定标题起,到下一个二级以上标题或文末,段后用户内容保留;
+ *  形态不符(标记存在但找不到该标题)才退化为从标记切到文末(无法区分模板与段后内容)。
+ *  旧实现的文件缺失退化路径会误删段后用户内容,此处一并修掉。 */
 export function stripPonytailSection(content) {
   const idx = content.indexOf(PONYTAIL_MARK);
   if (idx < 0) return { content, changed: false };
-  let body = '';
-  try {
-    body = fs.readFileSync(path.join(here, 'ponytail.md'), 'utf8').trim();
-  } catch { /* 模板不在,退化为切到文末 */ }
-  if (body) {
-    const block = `${PONYTAIL_MARK}\n## Ponytail 模式（懒惰资深开发者规则）\n\n${body}\n`;
-    const bIdx = content.indexOf(block);
-    if (bIdx >= 0) return { content: content.slice(0, bIdx) + content.slice(bIdx + block.length), changed: true };
-  }
-  return { content: content.slice(0, idx), changed: true };
+  const headingStart = content.indexOf('## Ponytail 模式', idx);
+  if (headingStart < 0) return { content: content.slice(0, idx), changed: true };
+  const headingEnd = content.indexOf('\n', headingStart);
+  const after = headingEnd >= 0 ? content.slice(headingEnd + 1) : '';
+  const m = after.match(/\r?\n#{2,6} /);
+  const end = m ? headingEnd + 1 + m.index : content.length;
+  return { content: content.slice(0, idx) + content.slice(end), changed: true };
 }
 
 /**
@@ -214,6 +214,38 @@ function collectRoots() {
   return roots;
 }
 
+/** 移除 init 播种的虚拟供应商条目(ZCode=tokenSaverModel,连同 providerOrder/modelRules 引用;
+ *  Qoder=tokensaver-auto,providers 键下条目),真实供应商与其他配置不动。 */
+export function removeVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', qoder = false } = {}) {
+  let file;
+  if (qoder) {
+    const dir = fs.existsSync(path.join(home, '.qoder-cn')) ? '.qoder-cn' : '.qoder';
+    file = path.join(home, dir, 'settings.json');
+  } else {
+    file = path.join(home, '.zcode', 'v2', 'provider_config.json');
+  }
+  const raw = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  if (!raw) return { removed: false, note: qoder ? '无 Qoder settings.json' : '无 provider_config' };
+  let pc;
+  try { pc = JSON.parse(raw); } catch { return { removed: false, note: '宿主配置非合法 JSON,不动' }; }
+  if (qoder) {
+    if (!pc || typeof pc !== 'object' || !pc.providers || typeof pc.providers !== 'object' || !pc.providers[providerId]) return { removed: false, note: '无该条目' };
+    fs.copyFileSync(file, file + '.bak-tokensaver');
+    delete pc.providers[providerId];
+    fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+    return { removed: true, file };
+  }
+  const rules = pc?.config?.providerConfigRules?.providerRules;
+  if (!Array.isArray(rules) || !rules.some((r) => r?.providerId === providerId)) return { removed: false, note: '无该条目' };
+  fs.copyFileSync(file, file + '.bak-tokensaver');
+  pc.config.providerConfigRules.providerRules = rules.filter((r) => r?.providerId !== providerId);
+  if (Array.isArray(pc.config.providerOrder)) pc.config.providerOrder = pc.config.providerOrder.filter((id) => id !== providerId);
+  const modelRules = pc.config.modelConfigRules?.providerModelRules;
+  if (Array.isArray(modelRules)) pc.config.modelConfigRules.providerModelRules = modelRules.filter((x) => x?.providerId !== providerId);
+  fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+  return { removed: true, file };
+}
+
 function main() {
   say('==== TokenSaver 卸载部署 ====');
 
@@ -225,10 +257,14 @@ function main() {
   say('[2/5] 移除用户级钩子(无 workspace 信任门控的那份)');
   const zk = uninstallZcodeUserHooks();
   say(`  [ok] ZCode:${zk.touched ? `移除 ${zk.groups} 组钩子` : '无本模块钩子'}${zk.fileDeleted ? ',空壳配置已删除' : ''}(${zk.file})`);
+  const vp = removeVirtualProviderEntry();
+  say(`  [ok] ZCode:${vp.removed ? '已移除虚拟供应商条目 tokenSaverModel' : `虚拟供应商条目:${vp.note}`}`);
   const cu = uninstallCursorUserHooks();
   say(`  [ok] Cursor:${cu.touched ? `移除 ${cu.groups} 组钩子、${cu.forwarders} 个转发器` : '无本模块钩子'}${cu.fileDeleted ? ',空壳配置已删除' : ''}(${cu.file})`);
   const qd = uninstallQoderUserHooks();
   say(`  [ok] Qoder:${qd.touched ? `移除 ${qd.groups} 组钩子、${qd.forwarders} 个转发器` : '无本模块钩子'}${qd.fileDeleted ? ',空壳配置已删除' : ''}(${qd.file})`);
+  const vq = removeVirtualProviderEntry({ providerId: 'tokensaver-auto', qoder: true });
+  say(`  [ok] Qoder:${vq.removed ? '已移除虚拟供应商条目 tokensaver-auto' : `虚拟供应商条目:${vq.note}`}`);
 
   say('[3/5] 清理各项目工作区钩子残留');
   for (const r of roots) {

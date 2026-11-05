@@ -1,195 +1,212 @@
-TokenSaver 直接部署
+TokenSaver 部署使用说明
 
-Direct deploy. Requires Node.js >= 18 and git. Ollama, if used, must already be installed, started, and have its models pulled by you; this tool does not start the service or pull models. The local path needs no Ollama. Model names are set in config.mjs in this directory. Ollama weights are not copied with this directory. The two transformers.js models live in hf-cache (about 439MB) and should be copied along. Preferred: run init inside TokenSaver\code-index. Index data is written to TokenSaver\data, not into the repositories you index. You can also copy this directory into a target project (suggested scripts\code-index); data then sits in a sibling data\ directory. If this directory is itself the git root, data is written to data\ inside it. Override the location with CODE_INDEX_DATA_DIR. An npm install always uses the repo's scripts\data. init installs dependencies, writes config, attaches hooks for the current agent (Cursor, ZCode, and Qoder when it cannot tell which), and builds and warms the index in the background. Check readiness with node status.mjs.
+======================================================================
+一、部署前提
+======================================================================
 
-前提: Node.js >= 18、git。
-用 ollama 时,本机需已安装并自行启动 Ollama,并先手工 pull 模型。本工具不拉起服务,也不自动 pull。
-用 local 时不需要 Ollama。模型名改本目录 config.mjs。
-Ollama 模型不随本目录复制。transformers.js 两个 local 模型在本目录 hf-cache(约 439MB),请一起复制。
+1. Node.js ≥ 18 与 git。
+2. 嵌入/精排模型二选一(默认 local):
+   - local(推荐,无需外部服务):模型权重缓存在 code-index/hf-cache(约 439MB,
+     复制部署需整目录带走;npm 安装缓存在 ~/.tokensaver/hf-cache),缺失时首次使用自动下载;
+   - ollama:本机自行安装并启动 Ollama,再手工 pull(本工具不代拉、不自动启动):
+       ollama pull qwen3-embedding:0.6b
+       ollama pull sam860/qwen3-reranker:0.6b-F16
+3. 动态模型路由(可选功能)仅 ZCode 与 Qoder 两个客户端支持,且要求自定义模型
+   以 Anthropic Messages 协议接入(见三、配置说明)。
 
-作为独立工具(推荐):在 TokenSaver\code-index 执行 init。数据写在 TokenSaver\data,不写进业务仓。
-  node init.mjs --roots "D:/业务仓A,D:/业务仓B"
-以后改 data\code-index.config.json 的 roots,再跑一次不带参数的:
-  node init.mjs
-即可把新目录编进索引并给那些 git 仓挂钩子。
+======================================================================
+二、安装介绍
+======================================================================
 
-也可把本目录复制到目标项目(建议 scripts\code-index),数据则在与本目录平级的 data\。若本目录本身就是 git 根,则写在本目录 data\。可用环境变量 CODE_INDEX_DATA_DIR 改位置。npm 安装固定用仓库 scripts\data。
-
-init 会安装依赖、写配置、接线当前 agent 的 hook(认不出则 Cursor/ZCode/Qoder 都接),并后台建索引+预热。确认就绪: node status.mjs
-
-从 GitCode 拉源码后同样只跑 init:
+方式 A:源码仓直装(推荐)
   git clone https://gitcode.com/dionfang/TokenSaver.git
   cd TokenSaver/code-index
+  node init.mjs --roots "D:/app-a,D:/app-b"
+  数据写在 TokenSaver/data,不写入被索引的项目。
+
+方式 B:复制部署
+  把 code-index/ 整目录复制到目标项目(建议 scripts/code-index;hf-cache 必须带上,
+  不带 node_modules 与 data/),在该目录执行:
   node init.mjs
+  不传 --roots 时自动把当前项目(git 仓库根)列为索引目录;要额外索引其他目录才传
+  --roots "其他路径"。数据落在旁边 data/(npm 安装固定 scripts/data/)。
 
-复制细节
+方式 C:npm 安装
+  npm i -D @dionfang/tokensaver
+  npx tokensaver init --roots "D:/app-a,D:/app-b"
+  数据固定写在仓库 scripts/data/。
 
-1. 复制的是本目录。可放在项目任意位置,建议 scripts\code-index。
-   必须带上 hf-cache(两个 local 模型)。不要带 node_modules,不要带 data\。
-2. 在该目录执行:
-   node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
-3. 确认是否就绪: node status.mjs
+安装参数:
+  node init.mjs [--roots "路径1[,路径2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
 
-改了纪律段/输出纪律段/钩子代码或 output-diet.md 模板后:先 npm test 全绿,再 node deploySync.mjs
-校验本仓 AGENTS.md 与代码库模板一致;不一致就重新运行 node init.mjs 全盘部署(幂等:重写 hooks
-与各仓 AGENTS.md,配置/依赖/索引同样按当前代码重建),再跑门禁确认。这是纪律段的第 10 条
-「部署产物同步」,防止部署与代码库漂移。部署后不要手改各仓 AGENTS.md——要改就改本仓模板再重部署。
+  --roots     要索引的目录,逗号分隔;再次运行会合并新增目录;要删除目录,改 JSON 后重跑。
+  --model-in  嵌入模型来源:ollama 或 local(默认)。
+  --hooks     只装指定客户端的钩子。省耗记账功能三端都装;动态模型路由只装 ZCode 与 Qoder。
 
-init 会写配置并安装依赖。
-参数名写错、缺少取值,或 --model-in / --hooks 取值非法时,报错退出且不改配置。
---roots=路径 与 --model-in=local 这种写法也可以。
+验证安装:node status.mjs(或 npx tokensaver status)
+日常检索:node search.mjs 关键词 --k 5(或 npx tokensaver search 关键词 --k 5)
 
---roots
-  逗号分隔的扫描目录,写入本工具仓 data\code-index.config.json。路径用 D:/proj 或 D:\proj。
-  不传且还没有配置:用工具仓 git 根。
-  不传且已有配置:按文件里的 roots 自愈(仍存在的保留,失踪的按兄弟目录猜一次);要让工具自身代码入索引,把工具仓写进 roots(或 --roots)即可;然后给这些 git 仓挂钩子并后台建索引。
-  传入:与已有 roots 合并(纳入,不去掉旧的)。不存在的路径跳过。要删目录请改 JSON 后重跑不带参的 init。
+======================================================================
+三、配置说明
+======================================================================
 
---hooks
-  all | cursor | zcode | qoder。只写选中工具的用户级会话 hook,不改其他工具已有文件。
-  钩子统一装在用户级配置(ZCode ~/.zcode/cli/config.json;Cursor ~/.cursor/hooks.json;
-  Qoder ~/.qoder-cn/settings.json,国际版 ~/.qoder),绝对路径直指本模块,所有项目共享一份,
-  并清理各项目 .zcode/.cursor/.qoder 里本模块的旧工作区钩子(用户级没有 workspace 信任门控,派发稳定)。
-  不传:能从环境变量认出当前 agent 就只装那一套(Cursor: CURSOR_AGENT;Qoder/ZCode: 各自 PROJECT_DIR)。
-  认不出(例如系统终端里跑):三套都装。
+配置文件有两处:
 
---uninstall(卸载)
-  node uninit.mjs —— 逐步回显状态地移除本模块部署的东西:
-  ①用户级钩子(ZCode/Cursor/Qoder;含他人配置的文件只摘本模块条目,空壳整删,转发器一并清)
-  ②各项目工作区钩子残留 ③各项目 AGENTS.md 的注入段(纪律段+输出纪律段 v7;剥后仅剩空白才整删,用户内容保留;旧 ponytail 段一并剥离)
-  ④运行时痕迹(data/.prefetch-last.json)。
-  不动:data/(索引与节约账)、code-index/ 本体、CODE_MAP.md、.gitignore、用户自己的 skills 与其他工具的钩子。
+1) code-index/config.mjs —— 模型部署。data 里 JSON 的同名项对这里无效。
+2) data/code-index.config.json —— 项目级配置(与 code-index/ 平级;未写的键用默认值)。
 
---model-in
-  ollama 或 local。写入 modelIn,不改模型名。
-  新建配置时不传则为 local。已有配置时不传则保持原路径。
-  ollama 需先执行:
-    ollama pull qwen3-embedding:0.6b
-    ollama pull sam860/qwen3-reranker:0.6b-F16
-  模型名若在 config.mjs 里改过,pull 改为改后的名字。
-  local 的两个模型已放在本目录 hf-cache;缺失时才下载。
+模型部署字段(改 config.mjs):
+  models.embedding / models.reranker              ollama 模型名(默认 qwen3-embedding:0.6b、
+                                                  sam860/qwen3-reranker:0.6b-F16)
+  models.localEmbedding / models.localReranker    local 模型名
+  ollamaBase                                      Ollama 地址(默认 http://localhost:11434)
+  gpu                                             auto / cpu / gpu
+  OLLAMA_KEEP_ALIVE / OLLAMA_NUM_CTX              Ollama 保活时长 / 上下文长度
 
-配置
+项目级字段(data/code-index.config.json):
+  roots               要索引的目录列表
+  modelIn             ollama 或 local
+  skipDirs            跳过的目录名(整表替换)
+  exts                收录的扩展名
+  jsonWhitelist       允许收录的 json 文件名
+  maxFileBytes        单文件上限(默认 819200)
+  readMaxLines        整文件 Read 行数上限(默认 500,设很大等于关闭拦截)
+  chunk               分块参数(targetLines/maxLines/overlapLines/minTail)
+  staleNonGitMs       非 git 目录重建间隔(默认 86400000 毫秒)
+  knownAnnotations    "项目名/相对路径" → 一句职责说明
 
-模型部署只改本目录 config.mjs。data JSON 里的同名项无效。
-  models.embedding        默认 qwen3-embedding:0.6b
-  models.reranker         默认 sam860/qwen3-reranker:0.6b-F16
-  models.localEmbedding   默认 Xenova/jina-embeddings-v2-base-zh
-  models.localReranker    默认 Xenova/bge-reranker-base
-  ollamaBase              默认 http://localhost:11434
-  gpu                     auto | cpu | gpu,默认 auto
-  OLLAMA_KEEP_ALIVE       默认 2h
-  OLLAMA_NUM_CTX          默认 4096
+动态模型路由(可选;init 已自动生成 modelRouting 段,已有配置不会被覆盖):
 
-项目配置在与本目录平级的 data\code-index.config.json(建议路径下即 scripts\data;可用环境变量 CODE_INDEX_DATA_DIR 改位置)。未写的键用 config.mjs 的默认值。
-  roots              扫描目录。--roots > 环境变量 CODE_INDEX_ROOTS > 本文件
-  modelIn            ollama | local。--model-in > 本文件 > local
-  skipDirs           跳过的目录名。写了就整表替换,不是追加
-  exts               收录的扩展名,不带点
-  jsonWhitelist      允许收录的 json 文件名。默认 package.json、pages.json、manifest.json、tsconfig.json
-  maxFileBytes       单文件上限。默认 819200
-  readMaxLines       全量读行数上限,默认 500。超过 ×1.25 由 Cursor preToolUse / ZCode·Qoder PreToolUse 处理,对象是全量 Read 与 Bash 里各链式组末段的 cat 整读(带 | 限量管道、> 重定向放行);Read 带 offset/limit 的区间读不受限。cat 整读直接拒绝,拒绝信息自带替代方案(检索 / 区间读 / grep -n)。同一目标 5 分钟内重试一次即放行,且放行不倒扣已入账的拒绝或改写。设很大等于关掉。
-  改写               Cursor·ZCode·Qoder 下超限全量 Read 默认改写为语义最相关区间(按提问选段),选不出区间才退回拒绝。恒开,无配置项。Cursor 用 preToolUse 的 updated_input;ZCode·Qoder 用 updatedInput。改写按改写记账(全文 bytes/4 记 original、区间 bytes/4 记 compressed);退回拒绝则按拒绝记账(bytes/4,0)。Grep 未带 head_limit 时三端补 100(不记账)。Cursor 的 preToolUse 用两条字面 matcher(Read 与 Grep),不写正则,正则会被判全部工具不支持并整组跳过。git commit 后做索引保鲜:Cursor postToolUse 字面 matcher Bash(映射为 Shell);ZCode PostToolUse matcher Bash;Qoder PostToolUse matcher Bash|Shell。
-  prefetch           用户消息语义预取(ZCode UserPromptSubmit)。默认开:bm25 快路径对原话查索引,把 top 命中(file:行号)作为 additionalContext 注入,agent 第一步就带大纲开工。enabled=false 关闭;k 命中数(≤5,默认 3);minChars 短于该长度不注入(默认 12)。只走 bm25,不写节约账;相同原话 10 分钟内不重复注入。
-  nudge               连续读导航(ZCode PostToolUse/PostToolUseFailure ^Read$|^Bash$;Qoder PostToolUse ^Read$|^Bash$、PostToolUseFailure 字面 Read|Bash;Cursor postToolUse 字面 Read|Bash,其中 Bash 映射为 Shell,postToolUseFailure 不带 matcher)。同一文件短窗口内区间读 ≥2 段 → 提示合并一次读完或先检索;Bash 输出超 bashDumpBytes(默认 24KB)→ 提示改用 Read offset/limit;Read/Bash 失败 → 指回检索。read-guard 改写注入的区间读只记账、不进连续读计数。enabled=false 关闭;windowMs 提示限频窗(默认 10 分钟)。Read 实际读入字节数按 /4 折 token 记入当日账 readInputTokens(信息字段,不影响 savedTokens)。
-  chunk              targetLines 70,maxLines 120,overlapLines 10,minTail 15
-  staleNonGitMs      非 git 目录多久重建一次,毫秒。默认 86400000
-  knownAnnotations   "项目名/相对路径" → 一句职责
+  启用三步:
+    ① init 已自动在 ZCode/Qoder 客户端播种 auto 虚拟模型;
+    ② 会话里把模型切换到 auto,即对该会话启用;
+    ③ 建议把 modelRouting.enabled 设为 true(只影响定档建议行,不影响路由本身)。
 
-skipDirs 默认已跳过依赖、构建产物和编辑器目录。新生成的配置还会加上 code-index、.cursor、.zcode。
+  接入要求:自定义模型必须以 Anthropic Messages 协议接入——
+    ZCode:供应商类型选 anthropic-messages,baseUrl 指向供应商的 anthropic 网关;
+    Qoder:条目 protocol 填 anthropic,baseUrl 指向 anthropic 兼容网关。
+
+  modelRouting 可配置字段(data/code-index.config.json):
+    enabled                    总开关(默认 false;只影响定档建议行,不影响路由)
+    brandPriority              同档品牌的调用优先序
+    providerPriority           同名模型挂多供应商时的取序
+    retryOnRateLimit/maxRetries  上游失败时同轮换模型重试(默认 true/2)
+    maxPhaseTurns              升档阶段最多持续的人类轮数(默认 4)
+    switchGuard                上下文过厚时不升档(默认开,阈值 20 万 tokens;
+                               同会话连拦 3 次自动放行,拦截时客户端会收到压缩建议)
+    l2Shadow / l2              语义近邻投票开关与阈值
+    decisionModel              自动打标签用的判定模型(enabled/model/providers/chunkSize)
+    tierOptimize               自进化:自动学习定档参数(enabled 默认 false)
 
 English
 
-TokenSaver direct deploy
+TokenSaver deployment guide
 
-Requirements: Node.js >= 18 and git.
-For Ollama, install it, start it yourself, and pull the models by hand. This tool does not start the server and does not pull models.
-local does not need Ollama. Change model names in config.mjs in this directory.
-Ollama models are not copied with this directory. The two transformers.js local models live in hf-cache (about 439MB); copy that directory too.
+======================================================================
+1. Prerequisites
+======================================================================
 
-Standalone tool (recommended): run init in TokenSaver\code-index. Data is written to TokenSaver\data, not into application repos.
-  node init.mjs --roots "D:/app-a,D:/app-b"
-Later, edit roots in data\code-index.config.json and run init again with no arguments:
-  node init.mjs
-That indexes the new directories and installs hooks in those git repos.
+1. Node.js >= 18 and git.
+2. Embedding/reranker models, pick one (local by default):
+   - local (recommended, no external service): weights cached in code-index/hf-cache
+     (~439MB — copy the whole directory when copy-deploying; npm installs cache to
+     ~/.tokensaver/hf-cache). Missing models download automatically on first use.
+   - ollama: install and start Ollama yourself, then pull by hand (this tool never
+     starts Ollama or pulls for you):
+       ollama pull qwen3-embedding:0.6b
+       ollama pull sam860/qwen3-reranker:0.6b-F16
+3. Dynamic model routing (optional) supports ZCode and Qoder only, and requires
+   custom models wired in via the Anthropic Messages protocol (see 3. Configuration).
 
-You can also copy this directory into the target project (suggested: scripts\code-index). Data then lives in data\ next to this directory. If this directory is itself the git root, data is written to data\ inside it. Override the location with CODE_INDEX_DATA_DIR. An npm install always uses the repo's scripts\data.
+======================================================================
+2. Installation
+======================================================================
 
-init installs dependencies, writes config, wires the current agent's hooks (if it cannot tell which agent, it wires Cursor, ZCode, and Qoder), then builds the index and warms models in the background. Check readiness: node status.mjs
-
-After changing the discipline sections, hook code, or the output-diet.md template: make npm test green first, then run node deploySync.mjs to verify this repo's AGENTS.md matches the templates in the codebase. On drift, rerun node init.mjs for a full redeploy (idempotent: it rewrites hooks and every repo's AGENTS.md, and rebuilds config/dependencies/index from the current code), then rerun the gate. This is discipline rule 10 "deployment artifact sync". Do not hand-edit deployed AGENTS.md files: change the templates here and redeploy.
-
-After cloning from GitCode, init is still the only step:
+Option A: install from the source repo (recommended)
   git clone https://gitcode.com/dionfang/TokenSaver.git
   cd TokenSaver/code-index
+  node init.mjs --roots "D:/app-a,D:/app-b"
+  Data is written to TokenSaver/data, not into your application repos.
+
+Option B: copy deployment
+  Copy the whole code-index/ directory into the target project (scripts/code-index
+  suggested; include hf-cache, exclude node_modules and data/), then run there:
   node init.mjs
+  Without --roots the current project (its git root) is indexed automatically; pass
+  --roots "other/path" only to index additional directories. Data lands in a data/
+  directory beside it (npm installs always use scripts/data/).
 
-Copying
+Option C: npm install
+  npm i -D @dionfang/tokensaver
+  npx tokensaver init --roots "D:/app-a,D:/app-b"
+  Data is always written to the repo's scripts/data/.
 
-1. Copy this directory. It can sit anywhere in the project; scripts\code-index is the suggested path.
-   hf-cache (the two local models) must come along. Do not copy node_modules or data\.
-2. In that directory run:
-   node init.mjs [--roots "<path1>[,<path2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
-3. Check readiness: node status.mjs
+init options:
+  node init.mjs [--roots "path1[,path2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
 
-init writes config and installs dependencies.
-A bad flag name, a missing value, or an illegal value for --model-in or --hooks exits with an error and does not change config.
---roots=path and --model-in=local are also accepted.
+  --roots     Directories to index, comma-separated; re-running merges new ones; to
+              remove a directory, edit the JSON and re-run.
+  --model-in  Embedding source: ollama or local (default).
+  --hooks     Install hooks for the selected client only. The Token Ledger installs on
+              all three clients; dynamic model routing on ZCode and Qoder only.
 
---roots
-  Comma-separated scan directories, written to data\code-index.config.json in this tool repo. Use D:/proj or D:\proj.
-  Omitted, and no config yet: the tool repo's git root.
-  Omitted, and config already exists: heal roots from the file (keep paths that still exist; guess a missing one once from a sibling directory). To index the tool's own code, list the tool repo in roots (or pass --roots). Then install hooks in those git repos and build the index in the background.
-  Passed: merge into the existing roots (add, do not drop old ones). Skip paths that do not exist. To remove a directory, edit the JSON and run init again with no arguments.
+Verify: node status.mjs (or npx tokensaver status)
+Daily search: node search.mjs keywords --k 5 (or npx tokensaver search keywords --k 5)
 
---hooks
-  all | cursor | zcode | qoder. Wires the user-level session hooks of the selected tools only; other tools' files are untouched.
-  Hooks are installed once at user level (ZCode ~/.zcode/cli/config.json; Cursor ~/.cursor/hooks.json;
-  Qoder ~/.qoder-cn/settings.json, or ~/.qoder for the international build), with absolute paths pointing at this module,
-  shared by all projects; this module's old workspace hooks under each project's .zcode/.cursor/.qoder are cleaned up
-  (user-level hooks have no workspace trust gate, so dispatch is stable).
-  Omitted: if the environment identifies the current agent, install only that set (Cursor: CURSOR_AGENT; Qoder/ZCode: their own PROJECT_DIR).
-  If it cannot tell (for example a system terminal): install all three.
+======================================================================
+3. Configuration
+======================================================================
 
---uninstall
-  node uninit.mjs — removes what this module deployed, printing one status line per step:
-  (1) user-level hooks (ZCode/Cursor/Qoder; files shared with other tools keep their other entries and lose only ours, pure skeletons are deleted, forwarders cleaned); (2) workspace hook leftovers per project; (3) the injected sections in each project's AGENTS.md (discipline + output-diet v7; a legacy ponytail section is stripped too; the file is deleted only when nothing else remains — user content is preserved); (4) runtime traces (data/.prefetch-last.json).
-  Untouched: data/ (index and ledger), code-index/ itself, CODE_MAP.md, .gitignore, your own skills, and other tools' hooks.
+Two config files:
 
---model-in
-  ollama or local. Writes modelIn and does not change model names.
-  Omitted on a new config: local. Omitted when config already exists: keep the current path.
-  ollama requires, first:
-    ollama pull qwen3-embedding:0.6b
-    ollama pull sam860/qwen3-reranker:0.6b-F16
-  If the names were changed in config.mjs, pull the new names.
-  The two local models are already in hf-cache in this directory; they are downloaded only when missing.
+1) code-index/config.mjs — model deployment. Same-named keys in the data JSON have
+   no effect on this file.
+2) data/code-index.config.json — project-level settings (beside code-index/; omitted
+   keys use the defaults).
 
-Configuration
+Model deployment fields (edit config.mjs):
+  models.embedding / models.reranker              ollama model names
+  models.localEmbedding / models.localReranker    local model names
+  ollamaBase                                      Ollama URL (default http://localhost:11434)
+  gpu                                             auto / cpu / gpu
+  OLLAMA_KEEP_ALIVE / OLLAMA_NUM_CTX              Ollama keep-alive / context size
 
-Model deployment is edited only in config.mjs in this directory. The same keys in the data JSON are ignored.
-  models.embedding        default qwen3-embedding:0.6b
-  models.reranker         default sam860/qwen3-reranker:0.6b-F16
-  models.localEmbedding   default Xenova/jina-embeddings-v2-base-zh
-  models.localReranker    default Xenova/bge-reranker-base
-  ollamaBase              default http://localhost:11434
-  gpu                     auto | cpu | gpu, default auto
-  OLLAMA_KEEP_ALIVE       default 2h
-  OLLAMA_NUM_CTX          default 4096
+Project-level fields (data/code-index.config.json):
+  roots               directories to index
+  modelIn             ollama or local
+  skipDirs            directories to skip (replaces the whole list)
+  exts                file extensions to index
+  jsonWhitelist       json filenames allowed into the index
+  maxFileBytes        per-file size cap (default 819200)
+  readMaxLines        full-file Read line cap (default 500; a huge value disables it)
+  chunk               chunking parameters (targetLines/maxLines/overlapLines/minTail)
+  staleNonGitMs       non-git rebuild interval (default 86400000 ms)
+  knownAnnotations    "project/relative-path" → one-line description
 
-Project config is data\code-index.config.json next to this directory (under the suggested path that is scripts\data; override with CODE_INDEX_DATA_DIR). Missing keys use the defaults in config.mjs.
-  roots              Scan directories. --roots > env CODE_INDEX_ROOTS > this file
-  modelIn            ollama | local. --model-in > this file > local
-  skipDirs           Directory names to skip. When set, the list replaces the default; it is not appended
-  exts               Extensions to index, without the dot
-  jsonWhitelist      JSON file names allowed in the index. Default: package.json, pages.json, manifest.json, tsconfig.json
-  maxFileBytes       Per-file size cap. Default 819200
-  readMaxLines       Full-read line cap, default 500. Above ×1.25, Cursor preToolUse / ZCode and Qoder PreToolUse handle both a full Read and a trailing-pipeline cat in Bash (piped limiters like head/grep and > redirects pass). A ranged read with offset/limit is not capped. A cat of a whole file is denied, and the denial carries alternatives (index search / ranged read / grep -n). One retry of the same target within 5 minutes is allowed, and that retry does not reverse accounting already recorded for the denial or the rewrite. A very large value turns the cap off.
-  rewrite             Under Cursor, ZCode, and Qoder, an over-limit full Read is rewritten by default into the semantically most relevant range (picked from the current prompt); it falls back to a denial only when no range can be picked. Always on, with no configuration key. Cursor sends preToolUse updated_input; ZCode and Qoder send updatedInput. A rewrite is accounted as a rewrite (full-file bytes/4 as original, range bytes/4 as compressed); a fallback denial is accounted as a denial (bytes/4, 0). A Grep call without head_limit is capped at 100 on all three (not accounted). Cursor preToolUse uses two literal matchers, Read and Grep; a regex matcher is treated as "no supported tools" and the whole group is skipped. After git commit, index refresh runs from Cursor postToolUse with the literal matcher Bash (mapped to Shell), from ZCode PostToolUse with matcher Bash, and from Qoder PostToolUse with matcher Bash|Shell.
-  prefetch           Semantic prefetch on each user message (ZCode UserPromptSubmit). On by default: a bm25 fast path searches the index for the prompt text and injects the top hits (file:lines) as additionalContext, so the agent starts with an outline. enabled=false turns it off; k = number of hits (max 5, default 3); minChars = skip prompts shorter than this (default 12). bm25 only, never writes the savings ledger; the same prompt is not re-injected within 10 minutes.
-  nudge              Consecutive-read navigation (ZCode PostToolUse/PostToolUseFailure ^Read$|^Bash$; Qoder PostToolUse ^Read$|^Bash$, PostToolUseFailure literal Read|Bash; Cursor postToolUse literal Read|Bash, where Bash is mapped to Shell, and postToolUseFailure has no matcher). Two or more ranged reads of the same file in a short window → suggests one combined read or a search first; Bash output above bashDumpBytes (default 24KB) → suggests Read offset/limit; a failed Read/Bash → points back to search. A ranged read injected by a read-guard rewrite is accounted but does not count toward the consecutive-read nudge. enabled=false turns it off; windowMs = nudge rate-limit window (default 10 minutes). Bytes actually read via Read are counted as /4 into the day's readInputTokens (informational, does not affect savedTokens).
-  chunk              targetLines 70, maxLines 120, overlapLines 10, minTail 15
-  staleNonGitMs      How often a non-git directory is rebuilt, in milliseconds. Default 86400000
-  knownAnnotations   "project/relative-path" → one line on what the file does
+Dynamic model routing (optional; init generates the modelRouting section, and an
+existing config is never overwritten):
 
-skipDirs already skips dependencies, build output, and editor directories. Newly generated config also adds code-index, .cursor, and .zcode.
+  Three steps to enable:
+    (1) init already seeded the auto virtual model in ZCode/Qoder;
+    (2) switch the session model to auto — routing is on for that session;
+    (3) recommended: set modelRouting.enabled to true (only affects the tier line).
+
+  Wiring requirement: custom models must use the Anthropic Messages protocol —
+    ZCode: provider type anthropic-messages, baseUrl pointing at the provider's
+    anthropic gateway;
+    Qoder: entry protocol set to anthropic, baseUrl pointing at an anthropic-compatible
+    gateway.
+
+  modelRouting fields (data/code-index.config.json):
+    enabled                    master switch (default false; only affects the tier line)
+    brandPriority              brand call order within a tier
+    providerPriority           ordering when one model spans several providers
+    retryOnRateLimit/maxRetries  same-turn model retry on upstream failures (true/2)
+    maxPhaseTurns              max human turns an upgrade phase lasts (default 4)
+    switchGuard                no upgrades on very thick context (on by default,
+                               threshold 200k tokens; auto-released after 3 consecutive
+                               blocks; the client receives a compression suggestion)
+    l2Shadow / l2              semantic neighbor voting switch and thresholds
+    decisionModel              judge model for auto-labeling (enabled/model/providers/chunkSize)
+    tierOptimize               self-evolution: learns tiering parameters automatically
+                               (enabled default false)

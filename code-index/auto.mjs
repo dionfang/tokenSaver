@@ -85,6 +85,18 @@ function embedPidAlive() {
 async function main() {
   if (!takeJsonLock(lockPath)) process.exit(0);
   try {
+    // 决策模型断路器自动探活(2026-11-03):仅"开关开 ∧ 断路器开着"才后台拉起 --probe-if-tripped
+    // (成功自动复位/失败续跳留痕);健康路径零开销零网关;detached 不占会话启动,拉起失败不影响会话。
+    try {
+      const { autoProbeDue } = await import('./decisionModel.mjs');
+      if (autoProbeDue()) {
+        const child = spawn(process.execPath, [path.join(here, 'decisionModel.mjs'), '--probe-if-tripped'], {
+          cwd: here, stdio: 'ignore', detached: true, windowsHide: true,
+        });
+        child.unref();
+        console.error('[decision-model] 断路器开启,已后台探活(成功自动复位,失败保持跳闸;留痕 data/routing/decision-model-breaker.json)');
+      }
+    } catch { /* 探活判定/拉起失败不影响会话 */ }
     const f = evalFreshness();
     if (f.need) {
       console.error(`[index] 保鲜判定:需要处理(${f.reason})`);
@@ -110,12 +122,13 @@ async function main() {
     if (warmCode !== 0) console.error(`[warn] 模型预热退出码 ${warmCode}`);
     // 模型状态注入:按 Ollama / 已下载模型 / 索引文件逐项判定,禁止只凭预热退出码报「已启动」。
     // stdout 始终输出严格 JSON(hook 契约);Cursor 转发器忽略 stdout,互不影响
+    // 每轮 UserPromptSubmit 会注入带会话累计的最新状态句,本句只作首轮兜底。
     const assessed = await assessModelStatus();
     try {
       fs.writeFileSync(path.join(DATA_DIR, 'last-status.txt'), `${assessed.relay}\n`);
     } catch { /* 写失败不影响会话 */ }
     process.stdout.write(JSON.stringify({
-      additionalContext: `[code-index] 请在每次回复末尾原样附上这一句:"${assessed.relay}"`,
+      additionalContext: `[code-index] 请以每轮 UserPromptSubmit 注入的"[code-index] 状态(本轮实时值…)"里的 ⚙ 整句为准,原样附在回复末尾;本句仅作首轮兜底:"${assessed.relay}"`,
     }));
   } finally {
     releaseJsonLock(lockPath);

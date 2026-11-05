@@ -1,25 +1,42 @@
 # @dionfang/tokensaver
 
-本目录只放 npm 发布骨架（`package.json` / 本 README / `.gitignore`）。
+本机 Agent 提效工具,两大功能:
 
-运行时脚本、`cli.mjs`、`部署使用说明.txt` 都由仓库根 `sync-npm.mjs` 从 `code-index/` 生成。不要在这里改逻辑。
+- **省耗记账**:语义索引 + 读取守卫 + 入账统计,Agent 定位代码只读需要的区间,节约量逐轮入账。Cursor / ZCode / Qoder 通用。
+- **动态模型路由**:按 prompt 难度把对话调度到不同价位的模型,贵模型只在必要时使用。仅 ZCode / Qoder,且要求自定义模型以 Anthropic Messages 协议接入。
 
-This directory is only the npm publish skeleton (`package.json`, this README, and `.gitignore`). Runtime scripts, `cli.mjs`, and `部署使用说明.txt` are generated from `code-index/` by `sync-npm.mjs` at the repo root. Do not edit runtime logic here. To copy-deploy, copy `code-index/` from the repo, not this directory.
+An on-machine agent productivity tool with two features: **Token Ledger** (semantic index + read guard + accounting, works on Cursor/ZCode/Qoder) and **dynamic model routing** (dispatch by difficulty, ZCode/Qoder only, Anthropic Messages custom models).
 
-```bash
-cd npm
-npm publish --access public
-```
+## 部署前提 / Prerequisites
 
-`prepack` 会先跑 `node ../sync-npm.mjs`。只想预览包内容：`npm pack --dry-run`。
+- Node.js ≥ 18 与 git / Node.js >= 18 and git
+- 嵌入模型默认 local(首次使用自动下载);可选 ollama(需自行 pull)/ embedding defaults to local (auto-download on first use); ollama optional (pull yourself)
+- 动态模型路由仅 ZCode / Qoder / dynamic model routing: ZCode and Qoder only
 
-目标项目：
+## 安装 / Install
 
 ```bash
 npm i -D @dionfang/tokensaver
-npx tokensaver init
-npx tokensaver search 关键词 --rerank --k 5
+npx tokensaver init --roots "项目目录1,项目目录2"
 npx tokensaver status
 ```
 
-直接复制部署用仓库里的 `code-index/`，不要复制本目录。
+init 参数 / init options:
+
+- `--roots "目录1,目录2"`:要索引的项目目录 / directories to index
+- `--model-in ollama|local`:嵌入模型来源 / embedding source
+- `--hooks all|cursor|zcode|qoder`:钩子安装范围(省耗记账三端都装;动态路由只装 ZCode/Qoder)
+
+常用命令 / commands:`tokensaver search 关键词 --k 5` · `tokensaver status` · `tokensaver auto`
+
+## 配置 / Configuration
+
+| 文件 | 用途 |
+|---|---|
+| `code-index/config.mjs` | 模型部署:嵌入/精排模型名、ollama 地址等 |
+| `项目/data/code-index.config.json` | 项目级配置:`roots`、`readMaxLines`、`skipDirs` 等 |
+| 同上 `modelRouting` 段 | 动态模型路由:`enabled`、`brandPriority`、`switchGuard`、`tierOptimize` 等 |
+
+动态模型路由启用:init 自动播种 `auto` 虚拟模型 → 会话选择 `auto` → 建议 `modelRouting.enabled=true`(可选)。自定义模型须以 Anthropic Messages 协议接入。
+
+完整说明见包内 [`部署使用说明.txt`](./部署使用说明.txt) / Full guide: [`部署使用说明.txt`](./部署使用说明.txt).

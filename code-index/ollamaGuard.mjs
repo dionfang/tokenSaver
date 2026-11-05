@@ -59,7 +59,7 @@ export async function ensureOllama({ base, timeoutMs = 30000, onInfo } = {}) {
 }
 
 // ---------- GPU/CPU 推理模式判定 ----------
-// 双模型常驻实测约 3.2GB(嵌入 968MB@ctx2048 + 精排 2.2GB@ctx8192)。
+// 双模型常驻实测约 3.2GB(嵌入 968MB + 精排 2.2GB;ctx 取 config.mjs 的 OLLAMA_NUM_CTX=4096)。
 // NVIDIA:nvidia-smi 读"空闲"显存判定(能感知其他程序占用);
 // AMD/Intel:注册表 qwMemorySize 读"总"显存判定(WMI AdapterRAM 有 4GB 截断,不可用);
 // 探测失败默认 GPU,Ollama 自身的自动分层/转 CPU 作为最终安全网。

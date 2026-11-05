@@ -9,7 +9,7 @@
  * 终端/Bash 里各链式组末段的 cat 整读同规则拦;带 | 限量管道、> 重定向、cat 无文件参数则放行。
  * Cursor 终端走 beforeShellExecution(工具名常是 Shell,不进 preToolUse Bash);ZCode/Qoder 仍认 Bash。
  * 带 offset/limit 的区间读放行。刚拦过或改写过同一目标,5 分钟内再发全量则放行。
- *   5 分钟放行不倒扣已入账的 deny 或改写:放行只删记录,不发票据。
+ *   Read 的 deny/改写在全量真进上下文时追加 void 事件退款;Bash 输出被宿主截断存盘,放行只删记录不退款。
  * 拦截/改写同时追加事件到 data/read-guard/events.jsonl(deny:{bytes};Rewrite:{bytes,rangeBytes,s,e}),
  *   供 modelStatus 按 rollout 回放做"会话累计"口径修正;入口账 deny 记 (bytes/4,0)、Rewrite 记 (bytes/4,区间/4)。
  * Cursor 拒绝输出 {permission:deny};放行/改写输出 {permission:allow,updated_input,agent_message}。
@@ -126,6 +126,73 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
   );
 }
 
+/** 实验数据保护(2026-10-31 用户要求):data/ab 是 A/B 实验唯一的原始证据,不入版本控制,
+ *  删了只能从本地会话库重建(见 test/scripts/ab/recover-db.mjs)。禁止顺手清理。
+ *  命中两类:①git clean 带 -x/-X(会连带删掉被 gitignore 的 data/ab);②递归删除命中 data/ab 或其父目录 data。 */
+const PROTECTED_DATA = /(^|[\\/])data([\\/])ab([\\/]|$)/i;
+const RM_CMDS = /^(?:rm|rmdir|del|erase|remove-item)$/i;
+
+function expandTarget(t, cwd) {
+  let s = String(t || '').trim().replace(/^["']|["']$/g, '');
+  s = s.replace(/^(\$\{?PWD\}?|\$\(pwd\)|%CD%)[\\/]/i, '');
+  if (!s) return null;
+  try { return path.resolve(cwd, s); } catch { return null; }
+}
+
+/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 data/ab 传入。 */
+export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected = false } = {}) {
+  const cmd = String(command ?? '');
+  if (!cmd.trim()) return { permission: 'allow' };
+  for (const raw of cmd.split(/&&|\|\||;|\n/)) {
+    const seg = raw.trim();
+    if (!seg) continue;
+    const tokens = seg.split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    const head = tokens[0].replace(/^["']|["']$/g, '');
+    // ①git clean -x / -X:连被 gitignore 的文件一起删(data/ab 就是被 ignore 的)
+    if (/^git(\.exe)?$/i.test(head)) {
+      const sub = tokens.slice(1).map(t => t.replace(/^["']|["']$/g, ''));
+      if (sub.includes('clean') && sub.some(t => /^-[A-Za-z]*[xX][A-Za-z]*$/.test(t) || /^--ignored/i.test(t))) {
+        if (hasProtected) return { permission: 'deny', kind: 'Clean', reason: 'git clean 带 -x/-X' };
+      }
+      continue;
+    }
+    // ②递归删除命中 data/ab 或父目录 data
+    const isRm = RM_CMDS.test(head);
+    if (!isRm) continue;
+    const rest = tokens.slice(1);
+    // 递归标志:POSIX 组合式(-rf/-fr/-R)、长写(--recurse/--recursive)、cmd 风格斜杠(/s /r)
+    const recursive = rest.some((t) => {
+      if (/^--/.test(t)) return /^--(recurse|recursive)$/i.test(t);
+      if (/^[-/]/.test(t)) return /[rRs]/.test(t.slice(1));
+      return false;
+    });
+    if (!recursive) continue;
+    for (const t of rest) {
+      if (t.startsWith('-')) continue;
+      const abs = expandTarget(t, cwd);
+      if (!abs) continue;
+      if (PROTECTED_DATA.test(abs)) return { permission: 'deny', kind: 'Clean', reason: `递归删除命中 ${abs}` };
+      const norm = abs.replace(/[\\/]+$/, '');
+      if (/(^|[\\/])data$/i.test(norm)) return { permission: 'deny', kind: 'Clean', reason: `递归删除命中 ${abs}` };
+      if (norm === path.resolve(cwd) || /(^|[\\/])\*$/.test(norm)) {
+        return { permission: 'deny', kind: 'Clean', reason: `递归删除命中工作区根 ${norm}` };
+      }
+    }
+  }
+  return { permission: 'allow' };
+}
+
+export function cleanGuardMessage() {
+  return (
+    'code-index: 已阻止清理 A/B 实验数据(data/ab)。那里是这批实验唯一的原始证据,' +
+    '不在版本控制内,删掉只能从本地会话库重建。要重跑实验请直接覆盖写' +
+    '(prepare 只清 data/ab/work 下的任务目录),不要先删整个目录;确需清理请先征得用户同意,' +
+    '或改成只删具体文件(路径里不要出现 data/ab 或 data)。' +
+    '若已经误删,可用 `node test/scripts/ab/recover-db.mjs` 从 ~/.zcode/cli/db/db.sqlite 重建。'
+  );
+}
+
 /** Bash 命令按 &&/||/; 分组,取每组管道末段:只有它直接写进工具结果,前面的输出已被后续命令消化。 */
 export function catDumpPieces(command) {
   return String(command ?? '')
@@ -233,7 +300,7 @@ export function rewriteGuidance({ file, lines, size, range, searchCmd }) {
 export function bytesOfLines(file, totalLines, s, e) {
   try {
     const st = fs.statSync(file);
-    if (st.size > 8 * 1024 * 1024 || totalLines <= 0) return Math.ceil(st.size * Math.min(1, (e - s + 1) / totalLines));
+    if (st.size > HUGE_BYTES || totalLines <= 0) return Math.ceil(st.size * Math.min(1, (e - s + 1) / totalLines));
     const content = fs.readFileSync(file, 'utf8');
     const all = content.split('\n');
     return Buffer.byteLength(all.slice(s - 1, e).join('\n'), 'utf8');
@@ -249,6 +316,11 @@ function searchCmd() {
 function statePath(convId) {
   const id = String(convId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
   return path.join(DATA_DIR, 'read-guard', `${id}.json`);
+}
+
+/** 放行窗口键:Windows 路径大小写不敏感,统一小写,否则同一文件的两种写法各记一条,逃生舱失效、重复记账。 */
+export function denialKey(file) {
+  return process.platform === 'win32' ? String(file).toLowerCase() : String(file);
 }
 
 function loadDenials(convId) {
@@ -314,6 +386,14 @@ async function bashGuard(input, dialect) {
   const convId = input.conversation_id || input.session_id || 'unknown';
   const now = Date.now();
   const cwd = input.cwd || process.cwd();
+  // 实验数据保护:先于整读拦截,命中就拒(不做 5 分钟放行,不可撤销)。
+  const hasProtectedData = fs.existsSync(path.join(cwd, 'data', 'ab'));
+  const clean = evaluateCleanGuard({ command: cmd, cwd, hasProtected: hasProtectedData });
+  if (clean.permission === 'deny') {
+    const body = formatDecision(dialect, 'deny', cleanGuardMessage());
+    respond(body);
+    return body;
+  }
   const denials = loadDenials(convId);
   const key = catDumpPieces(cmd).join(' && ');
   const stats = [];
@@ -387,6 +467,7 @@ export async function runReadGuard({ stdinText } = {}) {
   const file = path.isAbsolute(rawPath)
     ? rawPath
     : path.resolve(input.cwd || process.cwd(), rawPath);
+  const dkey = denialKey(file);
 
   let st;
   try {
@@ -410,14 +491,20 @@ export async function runReadGuard({ stdinText } = {}) {
     toolName: input.tool_name || 'Read',
     toolInput: ti,
     now,
-    denialAt: denials[file]?.at,
+    denialAt: denials[dkey]?.at,
     readMaxLines: resolveReadMaxLines(),
     lines,
   });
 
   if (decision.override) {
-    // 5 分钟内重发同一文件 → 放行。不倒扣已入账的 deny 或改写(不发票据)。
-    delete denials[file];
+    // 5 分钟内重发同一文件 → 放行。全文此刻真的进了上下文,那笔 deny/改写的节约不成立:
+    // 追加 void 事件(与原事件同 session|file|at)配对,modelStatus 退款(入口一次+已入账,只退一次)。
+    // Bash 不退款:宿主对超限输出做 persisted-output 存盘截断,全文并未进上下文。
+    const d = denials[dkey];
+    if (d && Number(d.bytes) > 0) {
+      await trackEvent({ at: d.at, session: convId, kind: d.kind === 'Rewrite' ? 'Rewrite' : 'Read', file, bytes: d.bytes, void: true });
+    }
+    delete denials[dkey];
     try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
     return emit(dialect, 'allow');
   }
@@ -448,7 +535,7 @@ export async function runReadGuard({ stdinText } = {}) {
           markHookRewrite(convId, file, now);
           // 改写也登记一次拦截:5 分钟内重发同一文件即放行全文(与 deny 同口径的逃生舱)
           try {
-            denials[file] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Rewrite', file };
+            denials[dkey] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Rewrite', file };
             saveDenials(convId, denials);
           } catch { /* 登记不上不影响改写 */ }
           respond(body);
@@ -465,7 +552,7 @@ export async function runReadGuard({ stdinText } = {}) {
     });
     const body = formatDecision(dialect, 'deny', msg);
     try {
-      denials[file] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Read' };
+      denials[dkey] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Read' };
       saveDenials(convId, denials);
     } catch {
       return emit(dialect, 'allow');

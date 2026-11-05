@@ -17,8 +17,6 @@ import { fileURLToPath } from 'node:url';
 import { DATA_DIR, MODULE_DIR, PACKED_INSTALL } from './config.mjs';
 import { addReadInputTokens, appendReadEvent, findSearchEventRef, readReadEvents } from './modelStatus.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-
 const HUGE_BYTES = 8 * 1024 * 1024;
 const READ_WINDOW_MS = 10 * 60 * 1000;
 const FAILURE_WINDOW_MS = 5 * 60 * 1000;
@@ -52,7 +50,7 @@ function searchCmd() {
 export function evaluateNudge({ hookEventName, toolName, toolInput, toolResponse, history, now, config, statFile }) {
   const h = history && typeof history === 'object' ? history : {};
   if (!config.enabled) return { history: h };
-  if (toolName !== 'Read' && toolName !== 'Bash') return { history: h };
+  if (toolName !== 'Read' && toolName !== 'Bash' && toolName !== 'Shell') return { history: h };
   const ti = toolInput || {};
   const resp = toolResponse || {};
 
@@ -131,7 +129,7 @@ function respond(obj) {
  * 兼容两种载荷:ZCode(toolResponse.stdoutBytes/stdout)与 Cursor(tool_output 为字符串或 {output})。
  * opts: stateDir 覆盖状态目录(测试密闭);account=false 跳过记账(测试)。
  */
-export async function runReadNudge({ stdinText, stateDir = path.join(DATA_DIR, 'read-guard'), account = true } = {}) {
+export async function runReadNudge({ stdinText, stateDir = path.join(DATA_DIR, 'read-guard'), account = true, statusRefresh = true } = {}) {
   let payload = {};
   try {
     payload = JSON.parse(String(stdinText != null ? stdinText : await new Promise((resolve) => {
@@ -184,12 +182,24 @@ export async function runReadNudge({ stdinText, stateDir = path.join(DATA_DIR, '
     try {
       const toolName = payload.toolName || payload.tool_name;
       const cmd = (payload.toolInput || payload.tool_input)?.command;
-      if (toolName === 'Bash' && typeof cmd === 'string' && cmd.includes('search.mjs')) {
+      if ((toolName === 'Bash' || toolName === 'Shell') && typeof cmd === 'string' && cmd.includes('search.mjs')) {
         const ref = findSearchEventRef(readReadEvents(), cmd, Date.now());
         if (ref != null) appendReadEvent({ at: Date.now(), session: sessionId, kind: 'SearchClaim', refAt: ref });
       }
     } catch { /* 认领失败不影响注入 */ }
-    const result = r.context ? { additionalContext: r.context } : {};
+    // 轮内状态句刷新(2026-11-04 用户拍板):新轮第一发请求完成后,真实模型已可查——
+    // 注入最新一条状态句,模型回复末尾照抄的就是本轮模型(修"模型名滞后一轮");渲染过程顺带结算放大节约。
+    // Cursor 成功事件不带 hook_event_name,按成功处理;失败事件不刷新。
+    let context = r.context || '';
+    const hookEv = payload.hookEventName || payload.hook_event_name;
+    if (statusRefresh && (!hookEv || hookEv === 'PostToolUse') && sessionId && sessionId !== 'unknown') {
+      try {
+        const { freshStatusLine } = await import('./turnStatus.mjs');
+        const fresh = await freshStatusLine({ stateDir, sid: sessionId });
+        if (fresh) context = context ? `${context}\n${fresh}` : fresh;
+      } catch { /* 刷新失败不影响导航注入 */ }
+    }
+    const result = context ? { additionalContext: context } : {};
     respond(result);
     return result;
   } catch { respond({}); return {}; }

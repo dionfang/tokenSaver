@@ -7,6 +7,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { modelRoutingScaffold } from './code-index/init.mjs'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
 const srcDir = path.join(root, 'code-index')
@@ -37,7 +38,7 @@ fs.writeFileSync(npmPkgPath, JSON.stringify(npmPkg, null, 2) + '\n')
 
 for (const n of fs.readdirSync(srcDir)) {
   if (SKIP_SRC.has(n) || n.endsWith('.test.mjs') || n === 'regress.mjs') continue
-  if (n.endsWith('.mjs') || n === 'ponytail.md' || n === 'output-diet.md') copy(n)
+  if (n.endsWith('.mjs') || n === 'output-diet.md') copy(n)
 }
 
 const deployDoc = fs.readFileSync(path.join(srcDir, '部署使用说明.txt'), 'utf8')
@@ -53,6 +54,10 @@ write(
 
 ${deployDoc}`
 )
+
+// 路由默认配置(#11/#12):全 false 空链骨架,与 init.mjs modelRoutingScaffold 同源生成;
+// 个人 provider_config/密钥/health/个人样本一律不入包。
+write('model-routing.default.json', JSON.stringify({ modelRouting: modelRoutingScaffold() }, null, 2) + '\n')
 
 write(
   'cli.mjs',

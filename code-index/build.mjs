@@ -126,9 +126,18 @@ function walk(dir, root, out) {
 const chunks = [];
 let ci = 0;
 let totalLines = 0;
+const unreadable = new Set(); // 采集后消失/不可读的文件,清单回填同步跳过
 
 for (const f of files) {
-  const content = fs.readFileSync(f.abs, 'utf8');
+  let content;
+  try {
+    content = fs.readFileSync(f.abs, 'utf8');
+  } catch (e) {
+    // 采集与切块之间文件可能被删/改名/无权限:单文件失败只跳过,不拖崩整次构建
+    console.warn(`[skip>unreadable] ${f.display} (${e.code || e.message})`);
+    unreadable.add(f.abs);
+    continue;
+  }
   const lines = content.split(/\r?\n/);
   // 压缩/生成文件启发式:行少但平均行长超大
   const avgLen = content.length / Math.max(lines.length, 1);
@@ -193,11 +202,11 @@ const manifest = {
   totalFiles: files.length,
   totalLines,
   totalChunks: chunks.length,
-  files: files.map(f => ({ p: f.display, lines: 0 })), // 行数在下方回填
 };
-// 回填真实行数(与切块口径一致:跳过 minified 的文件不再列出)
+// 回填真实行数(与切块口径一致:跳过 minified 与不可读的文件)
 manifest.files = [];
 for (const f of files) {
+  if (unreadable.has(f.abs)) continue;
   const content = fs.readFileSync(f.abs, 'utf8');
   const lines = content.split(/\r?\n/).length;
   const avgLen = content.length / Math.max(lines, 1);

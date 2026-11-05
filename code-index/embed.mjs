@@ -46,7 +46,8 @@ const { backend } = wantEmbedModel();
 const store = vectorPaths(backend);
 const PAIRED_PATH = store.paired;
 const EMB_PATH = store.emb;
-const BATCH = Number(getOpt('--batch', backend === 'ollama' ? 32 : 16));
+const BATCH_OPT = Number(getOpt('--batch', backend === 'ollama' ? 32 : 16));
+const BATCH = Number.isFinite(BATCH_OPT) ? Math.max(1, Math.floor(BATCH_OPT)) : (backend === 'ollama' ? 32 : 16);
 const FORCE = args.includes('--force');
 
 if (!fs.existsSync(CHUNKS_PATH)) {
@@ -256,7 +257,9 @@ if (misses.length) {
 }
 
 fs.mkdirSync(store.dir, { recursive: true });
-fs.writeFileSync(EMB_PATH, Buffer.from(vec.buffer));
+// tmp + 同盘 rename:嵌入动辄几分钟,中途被 Ctrl+C 不能留下半截向量文件(下次读就是脏数据)
+fs.writeFileSync(EMB_PATH + '.tmp', Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+fs.renameSync(EMB_PATH + '.tmp', EMB_PATH);
 fs.copyFileSync(CHUNKS_PATH, PAIRED_PATH); // 更新配对快照(与刚写入的向量逐位置对应)
 writeVectorMeta(backend, { model: emb.model, dim: emb.dim, backend, chunks: chunks.length, signature: curSig, builtAt: new Date().toISOString() });
 console.log(`[ok] 完成:复用 ${hit} + 新嵌入 ${misses.length} = ${chunks.length} × ${emb.dim} 维,耗时 ${((Date.now() - t0) / 1000).toFixed(0)}s(模型仅处理 ${misses.length} 块)`);

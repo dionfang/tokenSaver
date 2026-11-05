@@ -171,7 +171,10 @@ export async function pickRangeForFile(absFile, sessionId, { maxLines = 625, cos
   const embPath = vectorPaths(backend).emb;
   if (!vmeta?.dim || !fs.existsSync(embPath)) return null;
   if (Number(vmeta.chunks) !== chunks.length) return null; // 块清单与向量不配对,宁可不算
-  const buf = new Float32Array(fs.readFileSync(embPath).buffer, 0, fs.statSync(embPath).size / 4);
+  const raw = fs.readFileSync(embPath);
+  // 必须带 byteOffset:小文件读出的 Buffer 常落在共享内存池里,漏掉偏移会读到其他对象的数据
+  if (raw.byteLength % 4 !== 0) return null;
+  const buf = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
   const dim = vmeta.dim;
   const scored = mine.map(({ c, i }) => {
     let dot = 0;

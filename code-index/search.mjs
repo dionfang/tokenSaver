@@ -45,10 +45,14 @@ const getOpt = (name, def) => {
   const i = args.indexOf(name);
   return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : def;
 };
-const K = Number(getOpt('--k', 8));
+const numOpt = (name, def, min) => {
+  const n = Number(getOpt(name, def));
+  return Number.isFinite(n) ? Math.max(min, Math.floor(n)) : def;
+};
+const K = numOpt('--k', 8, 1);
 const MODE = getOpt('--mode', 'hybrid'); // hybrid | vec | bm25
 const RERANK = flags.includes('--rerank');
-const RRK = Number(getOpt('--rr-k', 14));
+const RRK = numOpt('--rr-k', 14, 1);
 const AS_JSON = flags.includes('--json');
 
 if (!query) { console.error('用法: node search.mjs <查询词> [--k 8] [--mode hybrid|vec|bm25] [--json]'); process.exit(1); }
@@ -111,8 +115,6 @@ bm25 = bm25.map(s => s / bm25Max);
 // 只读当前 modelIn 的 data/vectors/<路径>/。另一条路径的向量不参与,也不被本次检索改写。
 // ollama:必须已有 Ollama 服务。local:优先常驻进程,不在时本进程加载,不探测 Ollama。
 // 当前路径拉起失败 → bm25,不改换另一条路径。精排跟随 modelIn。
-try { JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'index.json'), 'utf8')); }
-catch { console.error('[warn] index.json 缺失或损坏,向量通道不可用(运行 node build.mjs && node embed.mjs 重建)'); }
 const indexBackend = activeBackend();
 const vmeta = readVectorMeta(indexBackend);
 const embPath = vectorPaths(indexBackend).emb;
