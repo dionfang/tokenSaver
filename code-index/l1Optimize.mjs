@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
-import { classifyRules, L1_LEXICON, META_MARKERS, stripCitations, hitsOf } from './classify.mjs';
+import { classifyRules, L1_LEXICON, META_MARKERS, stripCitations, hitsOf, normalizeType } from './classify.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FILES = {
@@ -37,12 +37,12 @@ const DEFAULTS = {
   folds: 5, minN: 4, rounds: 3, minGain: 0.02, maxDrop: 0.05, minRows: 40,
   wMin: 0.2, wMax: 1.5, priorCorrect: 2, priorTotal: 4, truth: 'autoLabel',
 };
-/** 词表数组 → 该数组证据支持的类型(T4 由 scope/refactor 双条件构成,两数组都映射 T4)。 */
+/** 词表数组 → 该数组证据支持的类型(2026-11-06 三档定稿:scope/refactor/plan→multi,edit/error/review/test→routine,chore/question→light)。 */
 export const ARRAY_TYPE = {
-  scope: 'T4', refactor: 'T4', edit: 'T3', error: 'T2',
-  review: 'T6', plan: 'T5', test: 'T7', chore: 'T8', question: 'T1',
+  scope: 'multi', refactor: 'multi', edit: 'routine', error: 'routine',
+  review: 'routine', plan: 'multi', test: 'routine', chore: 'light', question: 'light',
 };
-const TYPES = ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'];
+const TYPES = ['multi', 'routine', 'light'];
 const r2 = (v) => Math.round(Number(v) * 100) / 100;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
@@ -75,8 +75,8 @@ export function loadEvalRows({ dataDir = DATA_DIR, goldenFile = null, truth = DE
   for (const r of rows) {
     const ov = override.get(String(r.id));
     if (ov === 'skip') continue; // 人工评审明确跳过:不参训也不参评(不落回行为标签)
-    const label = ov ? ov : (r[truth] || r.autoLabel);
-    if (!label || !TYPES.includes(label)) continue; // 意图语料里 'meta'/'null' 等不参训(元提问不评 L1)
+    const label = normalizeType(ov ? ov : (r[truth] || r.autoLabel));
+    if (!label || !TYPES.includes(label)) continue; // 'meta'/'null'/折叠后不在三类的标签不参训(元提问不评 L1)
     const prompt = String(r.prompt || '').trim();
     if (prompt.length < 6) continue;
     out.push({ pkey: r.id || r.pkey || `k${out.length}`, prompt, truth: label, source: ov ? 'intent-human' : (r.humanLabel ? 'human+auto' : 'auto') });

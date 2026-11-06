@@ -1,5 +1,9 @@
 /**
  * 档位成本画像(单位:**R1 价 token 等效 / 每请求**)。2026-11-04 用户提供画像包,本模块把它固化成可计算的代价函数。
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+/**
  *
  * 画像基线:1M = 965k 缓存读 + 34k 新输入 + 1k 输出(一次请求的 token 构成)。
  *   - 隐式缓存(自动、不可关,命中部分按输入标准价 20% 计费):热轮 0.23M / 冷轮 1.00M / 切换税 0.77M
@@ -261,7 +265,84 @@ export function fitFromLedger({ rows = [], tierOf = null, minContextM = 0.05 } =
   };
 }
 
-// CLI:node costProfile.mjs --fit [--usage 文件] | --explain
+// ---------- 综合费率(2026-11-05 v2,口径 A:实际费 ÷ R1 基准费;按四档价格表计价,不按真实模型) ----------
+
+const _pricesCache = new Map();
+
+/** 读费率表(data/routing/model-prices.json 的 tiers 段;mtime 缓存;缺文件/坏 JSON 返回 null=不算费率)。 */
+export function loadModelPrices({ dataDir = null, file = null } = {}) {
+  const p = file || (dataDir ? path.join(dataDir, 'routing', 'model-prices.json') : null);
+  if (!p) return null;
+  try {
+    const st = fs.statSync(p);
+    const hit = _pricesCache.get(p);
+    if (hit && hit.mtimeMs === st.mtimeMs) return hit.data;
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    _pricesCache.set(p, { mtimeMs: st.mtimeMs, data });
+    return data;
+  } catch { return null; }
+}
+
+/**
+ * 一行账本 → 该请求实际费与 R1 基准费(元)。四段计价:输入 + 缓存写(cacheWrite 键,缺省按 input 计)
+ * + 缓存读 + 输出,价格按**难度档位**取
+ * (费率表 tiers 段;档位=账本 tier 字段,sticky 轮缺 tier 时按模型名 tierOf 推档)。
+ * token 全缺/为 0 的行(失败请求)返回 null(不入分子分母);无表/无档 → null。
+ */
+export function rowCost({ row = {}, priceTable = null, tierOf = null } = {}) {
+  const tiers = priceTable?.tiers;
+  if (!tiers) return null;
+  const inTok = Number(row.inTok), cr = Number(row.cacheRead), cw = Number(row.cacheWrite), out = Number(row.outTok);
+  const hasTokens = [inTok, cr, out].some((v) => Number.isFinite(v) && v > 0);
+  if (!hasTokens) return null;
+  const n = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
+  const tier = TIERS.includes(row.tier) ? row.tier : (tierOf ? tierOf(row.served || row.requested || '') : null);
+  const price = tiers[tier] || null;
+  if (!price) return null;
+  const r1 = tiers.R1;
+  if (!r1) return null;
+  const m = 1e6;
+  const cwP = price.cacheWrite ?? price.input;
+  const cwB = r1.cacheWrite ?? r1.input;
+  const actual = (n(inTok) * price.input + n(cw) * cwP + n(cr) * price.cacheRead + n(out) * price.output) / m;
+  const base = (n(inTok) * r1.input + n(cw) * cwB + n(cr) * r1.cacheRead + n(out) * r1.output) / m;
+  return { actual, base, tier };
+}
+
+/**
+ * 综合费率(口径 A):Σ实际费 ÷ ΣR1 基准费。纯函数;rows=proxy-usage 子集(某会话/某日)。
+ * 输出 {rate, actualCost, baseCost, reqs, failed, byTier:{R1:{reqs,tokens},...}}。
+ * rate=1.0 ⇒ 这段流量等效全走 R1;rate=2.3 ⇒ 账单是全 R1 的 2.3 倍。
+ * 无费率表 ⇒ reqs=0/rate=null(调用方不注入),不做倍率合成兜底——价格口径唯一。
+ */
+export function blendedRate({ rows = [], priceTable = null, tierOf = null } = {}) {
+  if (!priceTable?.tiers) return { rate: null, actualCost: 0, baseCost: 0, reqs: 0, failed: 0, byTier: {} };
+  let actual = 0;
+  let base = 0;
+  let reqs = 0;
+  let failed = 0;
+  const byTier = {};
+  for (const row of rows) {
+    const c = rowCost({ row, priceTable, tierOf });
+    if (!c) { if (row.served && Number(row.inTok) === 0) failed += 1; continue; }
+    reqs += 1;
+    actual += c.actual;
+    base += c.base;
+    const t = byTier[c.tier] = byTier[c.tier] || { reqs: 0, tokens: 0 };
+    t.reqs += 1;
+    t.tokens += (Number(row.inTok) || 0) + (Number(row.cacheRead) || 0) + (Number(row.outTok) || 0);
+  }
+  return {
+    rate: base > 0 ? Number((actual / base).toFixed(3)) : null,
+    actualCost: actual,
+    baseCost: base,
+    reqs,
+    failed,
+    byTier,
+  };
+}
+
+// CLI:node costProfile.mjs --fit [--usage 文件] | --explain | --rate [--conv conv键] [--days N]
 const directRun = process.argv[1] && process.argv[1].endsWith('costProfile.mjs');
 if (directRun) {
   const fs = await import('node:fs');
@@ -275,6 +356,18 @@ if (directRun) {
     try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { console.error(`账本不可读:${file}`); process.exit(1); }
     const { tierOfModel } = await import('./modelRoute.mjs');
     console.log(JSON.stringify(fitFromLedger({ rows, tierOf: (m) => tierOfModel(m) }), null, 1));
+  } else if (argv.includes('--rate')) {
+    const file = opt('--usage', path.join(DATA_DIR, 'usage', 'proxy-usage.jsonl'));
+    let rows = [];
+    try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { console.error(`账本不可读:${file}`); process.exit(1); }
+    const { tierOfModel } = await import('./modelRoute.mjs');
+    const prices = loadModelPrices({ dataDir: DATA_DIR });
+    const conv = opt('--conv', null);
+    const days = Number(opt('--days', 0));
+    const cut = days > 0 ? Date.now() - days * 864e5 : 0;
+    const picked = rows.filter((r) => (!conv || r.conv === conv) && r.ts >= cut);
+    const tierOf = (m) => tierOfModel(m);
+    console.log(JSON.stringify(blendedRate({ rows: picked, priceTable: prices, tierOf }), null, 1));
   } else {
     const p = resolveCostProfile(null);
     for (const t of TIERS) {

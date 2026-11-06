@@ -321,6 +321,10 @@ async function main() {
   // 上下文压缩后连击从 1 重新计数,自然获得下一次注入资格
   const gateLine = gateNoticeLine();
   if (gateLine) parts.push(gateLine);
+  // auto 综合费率行(2026-11-05):仅路由宿主注入,受 modelRouting.blendNotice.enabled 开关(默认开)门控;
+  // 口径 A(实际费 ÷ R1 基准费)按**最近会话**(文件按 conv 覆盖,钩子载荷无会话键可核,不冒充"本会话")
+  const blendLine = routingHostEnabled(host, cfg) ? blendNoticeLine(cfg) : null;
+  if (blendLine) parts.push(blendLine);
   // 每轮实时状态句(最新值,模型原样搬运;会话开始那句仅作首轮兜底);无 prompt 时不注入
   const statusLine = extractPrompt(payload) ? await liveStatusLine(payload) : null;
   if (statusLine) parts.push(`[code-index] 状态(本轮实时值,回复末尾原样附上):${statusLine}`);
@@ -344,6 +348,32 @@ function gateNoticeLine() {
     fs.writeFileSync(f, JSON.stringify(j));
     const estWan = Math.round(((Number(j.estLast) || Number(j.estFirst) || 0) / 10000) * 10) / 10;
     return `[model-routing] 升档已被切换税门控拦截 ${j.count} 次(上下文约 ${estWan} 万 tokens):建议压缩上下文(/compact)或新开会话后继续——压缩后即可正常升档;同会话连续拦截满 3 次将疲劳放行`;
+  } catch { return null; }
+}
+
+/**
+ * auto 综合费率行(2026-11-05,口径 A):读代理落盘的 data/usage/auto-blend.json(最近写入的 auto 会话累计),
+ * 注入"[model-routing] 综合费率 ×N.NNN"——实际费 ÷ 同样 tokens 全走 R1 的费;×1=纯 R1,越大=高档用得越多。
+ * 档位分布与失败数一并带出(费率 null 时只带失败数)。
+ * 开关 modelRouting.blendNotice.enabled(默认 true 注入);文件缺失/超 30 分钟旧(会话已断)不注入。fail-open。
+ */
+function blendNoticeLine(cfg) {
+  try {
+    if (cfg?.modelRouting?.blendNotice?.enabled === false) return null;
+    const j = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage', 'auto-blend.json'), 'utf8'));
+    const hasRate = typeof j.rate === 'number' && Number.isFinite(j.rate);
+    const hasFailed = Number(j.failed) > 0;
+    if (!j || (!hasRate && !hasFailed)) return null;
+    if (Date.now() - Number(j.at || 0) > 30 * 60 * 1000) return null;
+    const parts = [];
+    if (hasRate) {
+      const dist = Object.entries(j.byTier || {})
+        .sort((a, b) => b[1].reqs - a[1].reqs)
+        .map(([t, v]) => `${t}${v.reqs}轮`).join('/');
+      parts.push(`[model-routing] auto 综合费率 ×${j.rate.toFixed(3)}(最近会话 ${j.reqs} 轮${dist ? ':' + dist : ''})`);
+    }
+    if (hasFailed) parts.push(parts.length ? `失败 ${j.failed} 轮` : `[model-routing] auto 最近会话失败 ${j.failed} 轮(费率未定)`);
+    return parts.join(';');
   } catch { return null; }
 }
 

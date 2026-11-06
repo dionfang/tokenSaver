@@ -90,6 +90,9 @@ TokenSaver 部署使用说明
     enabled                    总开关(默认 false;只影响定档建议行,不影响路由)
     brandPriority              同档品牌的调用优先序
     providerPriority           同名模型挂多供应商时的取序
+    providerOrder              宿主 UI 供应商拖动序(快照自动采集):同名供应商未进
+                               providerPriority 时按它取序,冷却/配额尽按 UI 序逐个滑动
+                               (Qoder 端无拖动序,按设置文件键序采集)
     retryOnRateLimit/maxRetries  上游失败时同轮换模型重试(默认 true/2)
     maxPhaseTurns              升档阶段最多持续的人类轮数(默认 4)
     switchGuard                上下文过厚时不升档(默认开,阈值 20 万 tokens;
@@ -97,6 +100,15 @@ TokenSaver 部署使用说明
     l2Shadow / l2              语义近邻投票开关与阈值
     decisionModel              自动打标签用的判定模型(enabled/model/providers/chunkSize)
     tierOptimize               自进化:自动学习定档参数(enabled 默认 false)
+    blendNotice                auto 综合费率行注入开关(enabled 默认 true;关=只停
+                               注入行,记账照常;仅路由宿主生效)
+
+  综合费率(自动;modelRouting.blendNotice.enabled 默认 true):会话选 auto 后,每轮注入
+  一行"auto 综合费率 ×N.NNN"——最近会话的实际花费 ÷ 同样 tokens 全走 R1 的花费
+  (×1.0=纯 R1;每用一个高档轮倍率抬升;关开关只停注入,记账照常)。
+  价格按四个难度档位计价(不按真实模型),来自 data/routing/model-prices.json 的
+  tiers 段(每档 input/cacheRead/output 单价,元/M tokens;cacheWrite 可选,缺省按
+  input 计;轮的档位由代理定档决定)。改价格直接编辑该 JSON,即时生效。
 
 English
 
@@ -201,6 +213,11 @@ existing config is never overwritten):
     enabled                    master switch (default false; only affects the tier line)
     brandPriority              brand call order within a tier
     providerPriority           ordering when one model spans several providers
+    providerOrder              host UI provider drag order (auto-captured into the
+                               snapshot): same-name providers not listed in
+                               providerPriority follow it, and cooling/quota
+                               exhaustion slides through them in UI order
+                               (Qoder: settings-file key order)
     retryOnRateLimit/maxRetries  same-turn model retry on upstream failures (true/2)
     maxPhaseTurns              max human turns an upgrade phase lasts (default 4)
     switchGuard                no upgrades on very thick context (on by default,
@@ -210,3 +227,15 @@ existing config is never overwritten):
     decisionModel              judge model for auto-labeling (enabled/model/providers/chunkSize)
     tierOptimize               self-evolution: learns tiering parameters automatically
                                (enabled default false)
+    blendNotice                switch for the auto blended-rate line (enabled default
+                               true; off = no line, accounting continues; routing
+                               hosts only)
+
+  Blended rate (automatic; modelRouting.blendNotice.enabled defaults to true): once a
+  session selects auto, every turn carries a line "auto 综合费率 ×N.NNN" — the latest
+  session's actual spend ÷ what the same tokens would cost entirely on R1 (×1.0 = pure
+  R1; each high-tier turn bumps it up; the switch only stops the line, accounting
+  continues). Prices are per difficulty tier (not per real model), from the tiers
+  section of data/routing/model-prices.json (input/cacheRead/output per tier, CNY per
+  M tokens; cacheWrite optional, defaults to input; a turn's tier comes from the
+  proxy's tiering decision). Edit the JSON to change prices — effective immediately.

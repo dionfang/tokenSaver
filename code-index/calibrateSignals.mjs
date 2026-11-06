@@ -52,14 +52,14 @@ export const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'Search', 'read', 'gr
 
 /** 每条规则"声称会发生什么"→ 用哪个形态指标校验,以及期望基线(低于基线就降权)。 */
 const RULE_CLAIM = {
-  'R-T4范围+重构': { metric: 'heavyRate', baseline: 0.7 },   // 声称:大改动
-  'R-T7测试信号': { metric: 'actionRate', baseline: 0.6 },   // 声称:会动手写/跑
-  'R-T3编辑动词': { metric: 'actionRate', baseline: 0.6 },
-  'R-T2报错信号': { metric: 'actionRate', baseline: 0.5 },   // 初诊可能只读不改
-  'R-T8杂务信号': { metric: 'actionRate', baseline: 0.5 },
-  'R-T6审查信号': { metric: 'answerRate', baseline: 0.5 },   // 声称:审查=读+说,不写
-  'R-T5方案信号': { metric: 'answerRate', baseline: 0.5 },
-  'R-T1提问信号': { metric: 'answerRate', baseline: 0.6 },
+  'R-multi范围+重构': { metric: 'heavyRate', baseline: 0.7 },   // 声称:大改动
+  'R-routine测试信号': { metric: 'actionRate', baseline: 0.6 }, // 声称:会动手写/跑
+  'R-routine编辑动词': { metric: 'actionRate', baseline: 0.6 },
+  'R-routine报错信号': { metric: 'actionRate', baseline: 0.5 }, // 初诊可能只读不改
+  'R-light杂务信号': { metric: 'actionRate', baseline: 0.5 },
+  'R-routine审查信号': { metric: 'answerRate', baseline: 0.5 }, // 声称:审查=读+说,不写
+  'R-multi方案信号': { metric: 'answerRate', baseline: 0.5 },
+  'R-light提问信号': { metric: 'answerRate', baseline: 0.6 },
 };
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }

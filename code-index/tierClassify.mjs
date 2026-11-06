@@ -196,16 +196,17 @@ export function classifyDifficulty(text, { calibration = null } = {}) {
 }
 
 /**
- * T1-T8 任务型 → R1-R2 难度档的**设计映射**(黄金集 R 真值来源,scoreGoldenTier 用)。
- * v2 资费语义(2026-11-04):T4 疑难调试/范围重构与 T5 方案/设计 = 慎重工作起步 R2;
- * T2 报错初诊/T3 单点编辑/T6 审查/T7 测试 = 例行工作 → R1(解决不了由 P2 逐级上梯)。
+ * 任务型 → R1-R2 难度档的**设计映射**(黄金集 R 真值来源,scoreGoldenTier 用)。
+ * 2026-11-06 三档定稿:multi(多点改组,旧 T4/T5)= 慎重工作起步 R2;routine(例行,旧 T2/T3/T6/T7)
+ * 与 light(询问杂务,旧 T1/T8)= R1(解决不了由 P2 逐级上梯)。
  * R3 仅 P2 行为证据可达、R4 仅显式点名可达——prompt 词法无法预知,故真值不含 R3/R4
  * (scoreGoldenTier 的 R3/R4 覆盖恒 0,R3 路由质量由 P2 探针与实弹账本观察)。
  * 该槽位由四票代签写入(L1 词法/L2 向量/行为形态各 1 票 + 决策模型加权,见 autoLabel.mjs);
- * 四票里没有 classifyDifficulty(被评者),行为票是结果侧证据 ⇒ 非预测回灌;但 L1 词法票
- * 与难度分类器共享词法信号,独立程度低于字面宣称。
+ * 四票里没有 classifyDifficulty(被评者),行为票是结果侧证据 ⇒ 非预测回灌。
+ * 兼容键:旧 T1-T8 值保留(历史黄金集/日志的 R 真值派生),映射与三档定稿同口径。
  */
 export const TIER_FROM_TYPE = {
+  multi: 'R2', routine: 'R1', light: 'R1',
   T1: 'R1', T8: 'R1',
   T2: 'R1', T3: 'R1', T6: 'R1', T7: 'R1',
   T4: 'R2', T5: 'R2',

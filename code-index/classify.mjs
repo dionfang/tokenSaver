@@ -3,8 +3,11 @@
  * 主消费方=本地代理改写决策(modelRouteProxy.mjs decideTarget,主会话每 turn);
  * 次消费方=[model-routing] 注入建议行 + 路由日志(data/usage/routing-log.jsonl)+ MCP routing_decision。
  * 客户端侧不做主循环切换(#6 否决)——切换全部发生在代理内(角色子代理形态已废弃 2026-11-01)。
- * 规则顺序即 #5 决策树(第 0 步显式指令 /review→T6、/plan→T5,其后 T4→T2→T3→T6→T5→T7→T8→T1),命中即返回;
- * 全落空=uncertain(sticky 不切换)。
+ * 语义三类(2026-11-06 三档定稿,旧 T1-T8 按路由后果折叠):multi=多点改组(旧 T4/T5,建议档 R2)、
+ * routine=例行工作(旧 T2/T3/T6/T7)、light=询问杂务(旧 T1/T8)——旧八类里六个共享同一路由后果,
+ * 细分只制造歧义(黄金集最大类一致率仅 0.6)。规则顺序即决策树(第 0 步显式指令 /review→routine、
+ * /plan→multi,其后 multi→报错→编辑→审查→方案→测试→杂务→提问),命中即返回;
+ * 全落空=uncertain(sticky 不切换)。旧类型值经 normalizeType 兼容读(日志/黄金集/向量库历史数据)。
  *
  * 信号提取四层(2026-11-03 词表强化):
  *   ① 引用剥离 stripCitations:代码围栏/行内码/成对引号内文字不参与匹配;
@@ -61,8 +64,39 @@ export const L1_LEXICON = {
   question: QUESTION_SIGNS,
 };
 
+/** 语义三类值域(2026-11-06 三档定稿):multi=多点改组、routine=例行工作、light=询问杂务。 */
+export const L1_TYPES = ['multi', 'routine', 'light'];
+/** 旧 T1-T8 → 新三类(历史日志/黄金集旧标签/向量库旧 label 的兼容读;只读归一,不回写历史)。 */
+export const LEGACY_TYPE_MAP = { T1: 'light', T2: 'routine', T3: 'routine', T4: 'multi', T5: 'multi', T6: 'routine', T7: 'routine', T8: 'light' };
+/** 类型归一:旧八类值折叠为新三类;新值/未知值原样返回。 */
+export function normalizeType(t) { return LEGACY_TYPE_MAP[t] || t; }
+
+/** 疑问/征询形态(2026-11-06 multi 标签翻案判据):有疑问结构(疑问词)+ 无祈使前缀
+ *  + 无实改组锚(范围×重构 / 清剿式修复/结构性移除合成证据 / 强方案名词)⇒ 这条话是"问"不是"做"。
+ *  消费方=autoExemplars.reviewGolden 的 multi 一票否决(行为票会把会话级工作强度漏进单轮标签)。
+ *  纯函数;与决策树共享词表与合成证据,口径一致。 */
+export function isInquiryShape(text) {
+  const low = stripCitations(text).toLowerCase();
+  const verify = hitsOf(low, VERIFY_WORDS);
+  if (!verify.length) return false;
+  if (hitsOf(low, IMPERATIVE_WORDS).length) return false;
+  if (T4_FIXALL_RE.test(low) || T4_REMOVE_RE.test(low)) return false;
+  const scope = hitsOf(low, SCOPE_WORDS);
+  const refactor = hitsOf(low, REFACTOR_VERBS);
+  if (scope.length && refactor.length) return false;
+  const strongPlan = hitsOf(low, PLAN_SIGNS).filter((w) => !PLAN_TASKLESS.has(w));
+  if (strongPlan.length) return false;
+  return true;
+}
+
 /** 报错"形态"信号:堆栈帧/异常类名/errno/panic——粘贴报错文本时常不含中文信号词。 */
 const ERROR_SHAPE_RE = /\b(TypeError|ReferenceError|SyntaxError|RangeError|NullPointerException|ParseException)\b|\bTraceback \(most recent call last\)|\bat .+:\d+:\d+|\b(ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EACCES|EPERM|EPIPE)\b|\bError:\s|\bpanic:\s|\bException in thread/;
+
+/** T4 合成证据(2026-11-06 T4 专项):词表子串覆盖不了的两类多点改组形态——
+ *  ①清剿式修复:对成批问题的一次性清剿(修复所有X/逐条修复);②结构性移除:取消/删除某个模式/层/模块级机制。
+ *  两者本意即"多点结构改动",命中以合成词并入 refactor 通道(权重同单词);疑问形态由 T4 分支守卫拦。 */
+const T4_FIXALL_RE = /(?:修复|整改|解决)[^。{}]{0,6}(?:所有|全部)|(?:所有|全部|这些|以下)[^。{}]{0,10}(?:问题|错误|隐患|缺陷|报错)[^。{}]{0,10}(?:修复|整改|解决)|(?:逐条|逐个)[^。]{0,4}(?:修复|整改|解决)/;
+const T4_REMOVE_RE = /(?:取消|移除|删除|下线|废除|砍掉|剥除|摘除)[^。]{0,12}(?:模式|层|模块|机制|架构|分支|链路)|(?:模式|层|模块|机制|架构|分支|链路)[^。]{0,6}(?:彻底)?(?:取消|移除|废除|下线|砍掉)/;
 
 /** 元提问标记(2026-11-01):讨论"路由/分类/词表/判定"本身的 prompt,词法上含"测试/重构"但并非实现任务。
  *  只认强标记(不把"代理"这类工作常见词算进来,避免把正常任务误杀);配合疑问结构才判元提问。 */
@@ -169,6 +203,11 @@ export function classifyRules(prompt, opts = {}) {
   const low = scan.toLowerCase();
   const scope = hitsOf(low, SCOPE_WORDS);
   const refactor = hitsOf(low, REFACTOR_VERBS);
+  // T4 合成证据(2026-11-06 专项):清剿式修复/结构性移除形态 → 等价一条重构证据
+  const refSynthetic = [];
+  if (T4_FIXALL_RE.test(low)) refSynthetic.push('清剿式修复');
+  if (T4_REMOVE_RE.test(low)) refSynthetic.push('结构性移除');
+  const refAny = refactor.concat(refSynthetic);
   const edit = hitsOf(low, EDIT_VERBS);
   const error = hitsOf(low, ERROR_SIGNS);
   const errShape = ERROR_SHAPE_RE.test(scan); // 形态信号算一个报错证据(与词表命中合并计数)
@@ -185,21 +224,26 @@ export function classifyRules(prompt, opts = {}) {
   if (meta.length && verify.length) return null;
 
   // 第 0 步:显式指令(#5 决策树)——/review→T6、/plan→T5,指令形态高精度,置信给满
-  if (/^\s*\/\s*review\b/i.test(scan)) return { type: 'T6', confidence: 0.9, rule: 'R-T6审查信号', signals: ['/review'] };
-  if (/^\s*\/\s*plan\b/i.test(scan)) return { type: 'T5', confidence: 0.9, rule: 'R-T5方案信号', signals: ['/plan'] };
+  if (/^\s*\/\s*review\b/i.test(scan)) return { type: 'routine', confidence: 0.9, rule: 'R-routine审查信号', signals: ['/review'] };
+  if (/^\s*\/\s*plan\b/i.test(scan)) return { type: 'multi', confidence: 0.9, rule: 'R-multi方案信号', signals: ['/plan'] };
 
-  // T4:范围词+重构/迁移动词(双条件,最强信号);但"…是否可行/怎么做"这类征询不是执行任务
-  if (act(scope, 'scope', weights) && act(refactor, 'refactor', weights)) {
+  // T4:范围词+重构/迁移动词(双条件,最强信号);2026-11-06 T4 专项扩两条入口——
+  //   ①合成证据单独命中(清剿式修复/结构性移除);②重构动词+祈使前缀("帮我重构X",无范围词也是多点改组)。
+  // "…是否可行/怎么做"这类征询不是执行任务(疑问词且无祈使 → null;元提问门控在其上,不受影响)。
+  const t4Scope = act(scope, 'scope', weights) && act(refAny, 'refactor', weights);
+  const t4Hit = refSynthetic.length > 0 || t4Scope || (refAny.length > 0 && imperative.length > 0);
+  if (t4Hit) {
     if (verify.length && !imperative.length) return null;
     return {
-      type: 'T4', confidence: confOf(0.8, Math.max(scope.length, refactor.length)), rule: 'R-T4范围+重构',
-      signals: [...scope.slice(0, 2), ...refactor.slice(0, 2)],
+      type: 'multi', confidence: confOf(0.8, Math.max(scope.length, refAny.length)),
+      rule: t4Scope ? 'R-multi范围+重构' : 'R-multi重构+祈使',
+      signals: [...scope.slice(0, 2), ...refAny.slice(0, 2)],
     };
   }
   // T2:报错/异常信号(词表或堆栈形态);"没报错/不报错"已被否定过滤排除
   if (act(error, 'error', weights) || errShape) {
     return {
-      type: 'T2', confidence: confOf(0.8, error.length + (errShape ? 1 : 0)), rule: 'R-T2报错信号',
+      type: 'routine', confidence: confOf(0.8, error.length + (errShape ? 1 : 0)), rule: 'R-routine报错信号',
       signals: error.slice(0, 3),
     };
   }
@@ -207,21 +251,26 @@ export function classifyRules(prompt, opts = {}) {
   const testWriting = hitsOf(low, TEST_WRITING_PHRASES);
   if (act(edit, 'edit', weights) && !act(question, 'question', weights) && !testWriting.length) {
     return {
-      type: 'T3', confidence: confOf(0.7, edit.length, { step: 0.04, cap: 0.78 }), rule: 'R-T3编辑动词',
+      type: 'routine', confidence: confOf(0.7, edit.length, { step: 0.04, cap: 0.78 }), rule: 'R-routine编辑动词',
       signals: edit.slice(0, 3),
     };
   }
   // T6:审查信号,且无改动动词(否则是"改完帮我查"→实现为主)
   if (act(review, 'review', weights) && !act(edit, 'edit', weights)) {
     return {
-      type: 'T6', confidence: confOf(0.7, review.length), rule: 'R-T6审查信号',
+      type: 'routine', confidence: confOf(0.7, review.length), rule: 'R-routine审查信号',
       signals: review.slice(0, 3),
     };
   }
   // T5:方案/规划
+  // multi(旧 T5):方案/规划=深权衡的重活。疑问守卫只拦"纯征询"('这个怎么做'这类空想词,无实方案名词);
+  // 有实方案名词('出一版详细设计,怎么做才稳妥')即任务,不拦。
+  const PLAN_TASKLESS = new Set(['怎么做', '如何做', '想想', '思考一下', '盘一下']);
   if (act(plan, 'plan', weights)) {
+    const strongPlan = plan.filter((w) => !PLAN_TASKLESS.has(w));
+    if (verify.length && !imperative.length && !strongPlan.length) return null;
     return {
-      type: 'T5', confidence: confOf(0.7, plan.length), rule: 'R-T5方案信号',
+      type: 'multi', confidence: confOf(0.7, plan.length), rule: 'R-multi方案信号',
       signals: plan.slice(0, 3),
     };
   }
@@ -230,20 +279,20 @@ export function classifyRules(prompt, opts = {}) {
     if (testWriting.length || !verify.length) {
       const action = hitsOf(low, ACTION_VERBS);
       const signals = [...new Set([...test.slice(0, 2), ...(testWriting.length ? testWriting.slice(0, 1) : action.slice(0, 1))])];
-      return { type: 'T7', confidence: testWriting.length ? 0.75 : 0.7, rule: 'R-T7测试信号', signals };
+      return { type: 'routine', confidence: testWriting.length ? 0.75 : 0.7, rule: 'R-routine测试信号', signals };
     }
   }
   // T8:文档/chore
   if (act(chore, 'chore', weights)) {
     return {
-      type: 'T8', confidence: confOf(0.7, chore.length), rule: 'R-T8杂务信号',
+      type: 'light', confidence: confOf(0.7, chore.length), rule: 'R-light杂务信号',
       signals: chore.slice(0, 3),
     };
   }
   // T1:纯提问
   if (act(question, 'question', weights)) {
     return {
-      type: 'T1', confidence: confOf(0.7, question.length), rule: 'R-T1提问信号',
+      type: 'light', confidence: confOf(0.7, question.length), rule: 'R-light提问信号',
       signals: question.slice(0, 3),
     };
   }
@@ -295,8 +344,8 @@ export function routingEnabled(cfg) {
  *  默认 false=影子口径(仅测试用)。省略 diff 则与旧行完全一致(向后兼容)。 */
 export function routingContextLine(c, diff, { tierLive = false } = {}) {
   if (!c || !c.type) return null;
-  // T4 是"按难度升档",不是钉死 R3:实际落 R2 还是 R3 由 tierClassify 的难度档决定,切换税门控还可能抑制
-  const suggest = c.type === 'T4'
+  // multi(多点改组)是"按难度升档",不是钉死 R3:实际落 R2 还是 R3 由 tierClassify 的难度档决定,切换税门控还可能抑制
+  const suggest = c.type === 'multi'
     ? '建议:代理本轮按难度升档(难度档为准)并阶段粘住'
     : '模型由本地代理按 turn 路由(sticky)';
   const tierPart = diff && diff.tier

@@ -7,7 +7,7 @@
  *   ② 按 promptKey 唯一化(重复提问只留一条);
  *   ③ 按 ts±10s 窗口对齐 db.sqlite 的 part 表,取回**完整 prompt + session_id**(实测命中率 12/12);
  *   ④ 用该轮 tool_usage 的行为形态打弱标签(与 calibrateSignals 同一口径):
- *        零工具 → T1;写≥3 或 调用≥15 → T4;写 1-2 → T3;其余 → null(uncertain,不硬猜)。
+ *        零工具 → light;写≥3 或 调用≥15 → multi;写 1-2 → routine;其余 → null(uncertain,不硬猜)。
  * 标签只来自行为形态,绝不回灌 L1 预测。输出 data/routing/routinglog-labels.jsonl,
  * 供 buildExemplars/黄金集流程消费(格式:{promptKey,prompt,label,source,sessionId,shape,l1})。
  *
@@ -35,14 +35,14 @@ export function isProbeRow(row) {
   return PROBE_RE.test(String(row && row.promptHead) || '');
 }
 
-/** 行为形态 → 弱标签。只标行为上确定的:写≥3 或调用≥15=T4;写1-2=T3;零工具=T1;其余不猜。 */
+/** 行为形态 → 弱标签(2026-11-06 三档定稿)。只标行为上确定的:写≥3 或调用≥15=multi;写1-2=routine;零工具=light;其余不猜。 */
 export function labelFromShape({ calls = 0, writes = 0, dispatches = 0 } = {}) {
   const c = Number(calls) || 0;
   const w = Number(writes) || 0;
   const d = Number(dispatches) || 0;
-  if (w === 0 && d === 0 && c === 0) return 'T1';
-  if (w >= 3 || c >= 15) return 'T4';
-  if (w >= 1) return 'T3';
+  if (w === 0 && d === 0 && c === 0) return 'light';
+  if (w >= 3 || c >= 15) return 'multi';
+  if (w >= 1) return 'routine';
   return null;
 }
 

@@ -271,6 +271,9 @@ export function modelRoutingScaffold() {
     // 填了一半(baseUrl/key 缺一)=配置错误会显式报错。换判定模型/换网关只改 data/code-index.config.json 这里。
     // chunkSize(2026-11-03 实测定档):判定分片 1..16,默认 1——16 题批量稀释置信(97% 弃权),1 题/请求最佳。
     decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }], chunkSize: 1 },
+    // auto 综合费率行开关(2026-11-06):prompt-guard 每轮注入"最近会话实际费 ÷ R1 基准费"倍率行的总开关
+    // (仅路由宿主);enabled=false 只停注入,记账照常。价格表=data/routing/model-prices.json。
+    blendNotice: { enabled: true },
     // 生效宿主范围(2026-11-03 用户终裁):hosts 配置项已废——运行时恒按用户级目录自动检测
     // (prompt-guard.mjs routingHostsOf),检测不到的端不在路由面,重新部署 init 即恢复,不兜底。
     // 四档链恒由运行时从实时快照自主派生(2026-11-03 起 role 人工链/roles 映射/routeMode 已废,
@@ -305,7 +308,7 @@ export function modelRoutingScaffold() {
 /**
  * 确保 cfg 有 modelRouting 段(三级播种,人工配置零覆盖):
  *   ① modelRouting 段缺失 → 播种整骨架;
- *   ② 段在但缺 decisionModel / tierOptimize(或非对象)→ 只补缺的键,骨架各参数全关(enabled:false);
+ *   ② 段在但缺 decisionModel / tierOptimize / blendNotice(或非对象)→ 只补缺的键,骨架各参数全关(enabled:false);
  *   ③ 已存在 → 原样保留(含人工配置的 model/providers/key),init 绝不覆盖。
  * 返回 {cfg,seeded,patched}:seeded=整段新建,patched=只补了缺失子键。
  */
@@ -317,6 +320,8 @@ export function ensureModelRoutingSection(cfg) {
     if (!mr.decisionModel || typeof mr.decisionModel !== 'object' || Array.isArray(mr.decisionModel)) add.decisionModel = scaffold.decisionModel;
     // tierOptimize 缺失补默认关的骨架(2026-11-04):补上键不等于通电,enabled 仍 false
     if (!mr.tierOptimize || typeof mr.tierOptimize !== 'object' || Array.isArray(mr.tierOptimize)) add.tierOptimize = scaffold.tierOptimize;
+    // blendNotice 缺失补默认开骨架(2026-11-06):人工改过则原样保留
+    if (!mr.blendNotice || typeof mr.blendNotice !== 'object' || Array.isArray(mr.blendNotice)) add.blendNotice = scaffold.blendNotice;
     if (Object.keys(add).length) {
       return { cfg: { ...cfg, modelRouting: { ...mr, ...add } }, seeded: false, patched: true };
     }

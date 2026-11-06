@@ -1,8 +1,9 @@
 /**
  * 弱监督标签导出(#9 Step②,2026-11-03 由 exportWeakLabels.py 1:1 移植为 Node,随部署单元发布):
  * 从 ZCode 本地 db.sqlite 导出(主会话 turn 的用户 prompt + 工具形态)→ data/routing/raw-labels.jsonl。
- * 标签规则(优先级):显式 review → 测试写入 → 重实现(we>=3,total>=8)=T4 → 轻实现=T3
- * → 方案(plan 信号,零写入)=T5 → 报错文本=T2 → 零/只读=T1 → None(uncertain,不入样本库)。
+ * 标签规则(优先级,2026-11-06 三档定稿):显式 review → 测试写入 → 重实现(we>=3,total>=8)=multi
+ * → 轻实现=routine → 方案(plan 信号,零写入)=multi → 报错文本=routine → 零/只读=light
+ * → None(uncertain,不入样本库)。
  * 产出由 buildExemplars.mjs 消费(schema 与 py 版逐字段一致,label=null 行被消费方排除)。
  * db 用 node:sqlite 只读打开(Node>=22.5;不可用时显式报错,与 importRoutingLog 同口径)。
  * 用法:node exportWeakLabels.mjs [--db 路径] [--out 路径] [--limit N]
@@ -34,17 +35,17 @@ export function stripInjectionMarkers(txt) {
   return txt;
 }
 
-/** 弱标签规则链(与 py 版逐条一致);返回 [label, confidence, rule]。 */
+/** 弱标签规则链(2026-11-06 三档定稿);返回 [label, confidence, rule]。 */
 export function labelTurn(prompt, total, we, rd, agent) {
   const p = prompt || '';
-  if (REVIEW_RE.test(p)) return ['T6', 0.85, 'review-signal'];
-  if (TEST_RE.test(p) && we > 0) return ['T7', 0.8, 'test-prompt+writes'];
-  if (we >= 3 && total >= 8) return ['T4', 0.85, 'heavy-writes'];
-  if (we >= 1 && total >= 3) return ['T3', 0.8, 'light-writes'];
-  if (we === 0 && PLAN_RE.test(p)) return ['T5', 0.7, 'plan-signal'];
-  if (we === 0 && ERROR_RE.test(p)) return ['T2', 0.7, 'error-text'];
-  if (total === 0) return ['T1', 0.9, 'zero-tools'];
-  if (we === 0 && rd > 0) return ['T1', 0.6, 'read-only'];
+  if (REVIEW_RE.test(p)) return ['routine', 0.85, 'review-signal'];
+  if (TEST_RE.test(p) && we > 0) return ['routine', 0.8, 'test-prompt+writes'];
+  if (we >= 3 && total >= 8) return ['multi', 0.85, 'heavy-writes'];
+  if (we >= 1 && total >= 3) return ['routine', 0.8, 'light-writes'];
+  if (we === 0 && PLAN_RE.test(p)) return ['multi', 0.7, 'plan-signal'];
+  if (we === 0 && ERROR_RE.test(p)) return ['routine', 0.7, 'error-text'];
+  if (total === 0) return ['light', 0.9, 'zero-tools'];
+  if (we === 0 && rd > 0) return ['light', 0.6, 'read-only'];
   return [null, 0.0, 'uncertain'];
 }
 

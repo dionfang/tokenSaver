@@ -48,6 +48,7 @@ import { DATA_DIR } from './config.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY } from './modelRoute.mjs';
+import { blendedRate, loadModelPrices } from './costProfile.mjs';
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -176,11 +177,182 @@ export const anthropicAdapter = {
       const m = messages[i];
       if (!m || m.role !== 'user') continue;
       // 只看最后一条 user 消息(≈本轮新到的工具结果):历史报错不得把 streak 永远顶满
-      return Array.isArray(m.content) ? m.content.filter((b) => b && b.type === 'tool_result' && b.is_error).length : 0;
+      if (!Array.isArray(m.content)) return 0;
+      let errs = 0;
+      for (const b of m.content) {
+        if (!b || b.type !== 'tool_result') continue;
+        // ① 结构化标记(宿主标准做法:工具失败 → is_error:true)
+        if (b.is_error === true) { errs += 1; continue; }
+        // ② 内容形态兜底(2026-11-05 B 项,2026-11-06 收紧):宿主未标 is_error 但内容明显是失败——
+        //    强锚(exit code/Traceback/panic/command failed/异常名+冒号)单中即认;弱锚 b 类(errno 常量/
+        //    完整失败短语/异常类名)×1 与 a 类(正文常用词 error/not found 等)×0.5,须 b≥2 或 b=1∧a≥2。
+        //    防"读含错误词文档"误判。
+        if (b.is_error === undefined && toolTextLooksError(b.content)) errs += 1;
+      }
+      return errs;
     }
     return 0;
   },
+  // 同参重复调用检测(2026-11-05 A 项,治"空烧"死循环):模型反复执行*成功但没用*的操作,
+  // 不产生 is_error ⇒ P2 永远等不到。改为直接数"同一工具+同一参数"的连续重复次数。
+  countRepeatCalls(messages) { return countRepeatCalls(messages, anthropicToolCalls, anthropicToolResults); },
 };
+
+// ---------- 死循环检测与工具失败形态识别(2026-11-05 A/B 项) ----------
+
+/** 同参重复调用阈值:连续同工具+同参数 ≥N 次判死循环(2-3 次重试属正常,≥4 次是空烧)。 */
+export const REPEAT_LOOP_THRESHOLD = 4;
+/** 同结果实锤(2026-11-06):尾连 ≥N 且其中 ≥2 次拿到**相同**非平凡结果 = 确认无进展,
+ *  提前于 ≥4 阈值介入;合法重试的结果通常不同,不误伤。 */
+export const REPEAT_LOOP_CONFIRM_MIN = 3;
+
+/** 工具结果文本里的失败形态(宿主未标 is_error 时的兜底;宁漏勿误,2026-11-06 收紧):
+ *  强锚=命令/进程级失败信号,单独命中即认;弱锚分两级——b 类(errno 常量/完整失败短语/异常类名,
+ *  权重 1)与 a 类(正文常用词 error/exception/not found 等,权重 0.5),须 b≥2 或 (b=1 ∧ a≥2) 才认。
+ *  防"读含错误词文档"误判(误升档是 8x/15x 真金白银);真实失败通常带强锚或 b 类双锚,不漏。 */
+const TOOL_ERROR_STRONG_RE = [
+  /\bTraceback \(most recent call last\)/i,
+  /\bException in thread\b/i,
+  /\bpanic:\s/i,
+  /\bexit code [1-9]\d*/i,
+  /\bexit status [1-9]\d*/i,
+  /\bcommand failed\b/i,
+  /timeout of \d+ms exceeded/i,
+  // 运行期打印的异常行("TypeError: …" / "Error: …" / "NullPointerException: …")=程序输出语法,强;
+  // 正文自然提及的裸词(TypeError/Error)不在此列,走弱锚
+  /\b\w*(?:Error|Exception):/i,
+];
+const TOOL_ERROR_WEAK_B = [
+  /\b(TypeError|ReferenceError|SyntaxError|RangeError|FileNotFound\w*|NullPointerException|ParseException)\b/i,
+  /permission denied/i,
+  /no such file or directory/i,
+  /\bcommand not found\b/i,
+  /\b(ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOENT|EACCES|EPERM|EADDRINUSE|ENOTFOUND|EPIPE)\b/i,
+];
+const TOOL_ERROR_WEAK_A = [
+  /\bError\b/i,
+  /\bException\b/i,
+  /\bfatal\b/i,
+  /\bfailed with\b/i,
+  /\bnot found\b/i,
+  /\bat \S+:\d+:\d+/i,
+];
+
+/** 块数组/字符串 → 纯文本(错误形态判定与结果比对共用)。 */
+function contentText(content) {
+  return typeof content === 'string' ? content
+    : Array.isArray(content) ? content.map((b) => (typeof b === 'string' ? b : (b && b.text) || '')).join('\n')
+    : '';
+}
+
+/** tool_result 的文本内容 → 是否形似失败(内容可能是字符串或块数组)。 */
+function toolTextLooksError(content) {
+  const text = contentText(content);
+  if (!text.trim()) return false;
+  if (TOOL_ERROR_STRONG_RE.some((re) => re.test(text))) return true;
+  let b = 0;
+  let a = 0;
+  for (const re of TOOL_ERROR_WEAK_B) if (re.test(text)) b += 1;
+  for (const re of TOOL_ERROR_WEAK_A) if (re.test(text)) a += 1;
+  return b >= 2 || (b === 1 && a >= 2);
+}
+
+/** anthropic 形态:按顺序抽出所有工具调用 {name, input, id}(assistant 消息里的 tool_use 块)。 */
+function anthropicToolCalls(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b && b.type === 'tool_use') out.push({ name: String(b.name || '?'), input: b.input, id: b.id });
+    }
+  }
+  return out;
+}
+
+/** anthropic 形态:tool_use_id → 归一结果文本(user 消息里的 tool_result 块;同结果实锤用)。 */
+function anthropicToolResults(messages) {
+  const out = new Map();
+  for (const m of messages || []) {
+    if (!m || m.role !== 'user' || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (!b || b.type !== 'tool_result' || !b.tool_use_id) continue;
+      out.set(b.tool_use_id, contentText(b.content).trim().slice(0, 4000));
+    }
+  }
+  return out;
+}
+
+/** openai 形态:assistant.tool_calls 的 {name, arguments, id}。 */
+function openaiToolCalls(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+    for (const c of m.tool_calls) {
+      const fn = (c && c.function) || {};
+      let args = fn.arguments;
+      if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /* 保留原串 */ } }
+      out.push({ name: String(fn.name || '?'), input: args, id: c && c.id });
+    }
+  }
+  return out;
+}
+
+/** openai 形态:tool_call_id → 归一结果文本(role:"tool" 消息;同结果实锤用)。 */
+function openaiToolResults(messages) {
+  const out = new Map();
+  for (const m of messages || []) {
+    if (!m || m.role !== 'tool' || !m.tool_call_id) continue;
+    out.set(m.tool_call_id, contentText(m.content).trim().slice(0, 4000));
+  }
+  return out;
+}
+
+/** 参数归一(键序无关、空白无关),让"同一条命令只差空格"也算同参。 */
+function normalizeToolInput(input) {
+  let s;
+  try { s = JSON.stringify(input); } catch { s = String(input); }
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 末尾连续同参调用检测(2026-11-05 A 项,治"空烧"死循环)。
+ * 返回 {count, name, key, sameOut}:count=末尾连续"同工具+同参数"的调用次数(≥1);
+ * sameOut=这些调用里拿到**相同非平凡结果**的最大次数(2026-11-06,同参且同结果=确认无进展,
+ * 配合 loopFiredOf 在尾连 3 时即可提前介入)。
+ * 判定基于**请求体里的工具调用序列**,不看结果是否报错——空烧死循环的工具调用全是"成功"的,
+ * 只有调用形态本身能暴露它(P2 依赖 is_error,对此无能为力)。
+ */
+export function countRepeatCalls(messages, extractor, resultsExtractor = null) {
+  const calls = extractor(messages || []);
+  if (!calls.length) return { count: 0, name: null, key: null, sameOut: 0 };
+  const keyOf = (c) => `${c.name}::${normalizeToolInput(c.input)}`;
+  const lastKey = keyOf(calls[calls.length - 1]);
+  let count = 0;
+  const tailIds = [];
+  for (let i = calls.length - 1; i >= 0; i -= 1) {
+    if (keyOf(calls[i]) !== lastKey) break;
+    count += 1;
+    tailIds.push(calls[i].id);
+  }
+  let sameOut = 0;
+  if (resultsExtractor && tailIds.length) {
+    const results = resultsExtractor(messages || []);
+    const seen = new Map();
+    for (const id of tailIds) {
+      const t = results.get(id);
+      if (typeof t !== 'string' || !t) continue; // 空结果=平凡,不作实锤
+      seen.set(t, (seen.get(t) || 0) + 1);
+    }
+    for (const v of seen.values()) if (v > sameOut) sameOut = v;
+  }
+  return { count, name: calls[calls.length - 1].name, key: lastKey, sameOut };
+}
+
+/** 是否判死循环(2026-11-06):尾连 ≥4;或尾连 ≥3 且同结果实锤 ≥2。纯函数可测。 */
+export function loopFiredOf(loop) {
+  return !!loop && (loop.count >= REPEAT_LOOP_THRESHOLD
+    || (loop.count >= REPEAT_LOOP_CONFIRM_MIN && Number(loop.sameOut || 0) >= 2));
+}
 
 function anthropicGrab(u, acc) {
   acc.usageRaw = u;
@@ -274,9 +446,12 @@ export const openaiAdapter = {
     }
     return errs;
   },
+  // 同参重复调用检测(2026-11-05 A 项):openai 形态的 tool_calls(函数名+arguments)+ 同结果实锤
+  countRepeatCalls(messages) { return countRepeatCalls(messages, openaiToolCalls, openaiToolResults); },
 };
 
-/** OpenAI role:"tool" 消息是否形似报错(无 is_error 标记下的保守形态判定)。 */
+/** OpenAI role:"tool" 消息是否形似报错(无 is_error 标记下的保守形态判定;文本侧与 anthropic
+ *  tool_result 同款两级形态锚,2026-11-06 收紧)。 */
 function openaiToolLooksError(m) {
   const c = m && m.content;
   const text = typeof c === 'string' ? c : Array.isArray(c)
@@ -292,12 +467,8 @@ function openaiToolLooksError(m) {
       return false;
     }
   } catch { /* 非 JSON 走形态判定 */ }
-  return OPENAI_TOOL_ERROR_RE.test(text);
+  return toolTextLooksError(text);
 }
-
-/** 与 classify.mjs 的 ERROR_SHAPE_RE 同款形态(本模块自持一份,避免钩子冷启动拖进分类器模块):
- *  堆栈帧/异常类名/errno 常量/panic/超时/连接拒绝。 */
-const OPENAI_TOOL_ERROR_RE = /\b(TypeError|ReferenceError|SyntaxError|RangeError|NullPointerException|ParseException)\b|\bTraceback \(most recent call last\)|\bat .+:\d+:\d+|\b(ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EACCES|EPERM|EPIPE)\b|\bError:\s|\bpanic:\s|\bException in thread|\btimeout of \d+ms exceeded|\bexit code [1-9]/i;
 
 function openaiGrab(u, acc) {
   acc.usageRaw = u;
@@ -370,6 +541,14 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE } = {}
   const providers = {};
   const ingress = [];
   const zcodeRules = pc?.config?.providerConfigRules?.providerRules || [];
+  // 宿主 UI 供应商拖动序(2026-11-05):ZCode 把拖动结果存 config.providerOrder(数组即 UI 顺序);
+  // Qoder 无拖动序,取 settings.json providers 的文件键序兜底。代理按宿主取用:同名模型取序 =
+  // providerPriority(配置)优先,未进表者按此序——UI 把谁排前,冷却滑动就先耗谁的额度。
+  const qoderRules = readQoderProviders(home);
+  const providerOrder = {
+    zcode: (Array.isArray(pc?.config?.providerOrder) ? pc.config.providerOrder : []).map(String).filter(Boolean),
+    qoder: qoderRules.map((r) => r.providerId),
+  };
   // 单模型开关(2026-11-05):ZCode 关掉厂商下某个模型 = modelConfigRules.providerModelRules 里该条 enabled:false;
   // personalModelIds 不随单模型开关变化 ⇒ 快照必须自己读这份表过滤,否则关掉的模型仍被 auto 路由调用。
   // 键=providerId/modelId;Qoder 端无此表,维持"存在即启用"。
@@ -383,7 +562,7 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE } = {}
   // (/apps/qoder=Qoder,其余=ZCode)只在该宿主自己的清单里路由,互不混池。
   const all = [
     ...zcodeRules.map((r) => ({ rule: r, host: 'zcode' })),
-    ...readQoderProviders(home).map((r) => ({ rule: r, host: 'qoder' })),
+    ...qoderRules.map((r) => ({ rule: r, host: 'qoder' })),
   ];
   for (const { rule: r, host } of all) {
     const raw = (r.config?.api?.baseUrl || r.baseUrl || '').replace(/\/+$/, '');
@@ -414,8 +593,8 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE } = {}
     if (isIngress) ingress.push(pid);
   }
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  fs.writeFileSync(outFile, JSON.stringify({ version: 4, snapshottedAt: Date.now(), providers, ingress }, null, 1) + '\n');
-  return { providers: Object.keys(providers).length, ingress, outFile };
+  fs.writeFileSync(outFile, JSON.stringify({ version: 5, snapshottedAt: Date.now(), providers, ingress, providerOrder }, null, 1) + '\n');
+  return { providers: Object.keys(providers).length, ingress, providerOrder, outFile };
 }
 
 /**
@@ -479,6 +658,41 @@ export function pickUpstream({ providerId, model, upstreams } = {}) {
 }
 
 /**
+ * auto 综合费率落地(2026-11-05,口径 A:实际费 ÷ R1 基准费):
+ * 每请求按 conv 累计进 data/usage/auto-blend.json(单文件最新会话覆盖,与 gate-notice 同先例),
+ * prompt-guard 读它注入综合费率行。费率表(data/routing/model-prices.json)缺省时静默跳过。
+ * fail-open:任何异常不写、不影响转发。
+ */
+export function updateAutoBlend({ dataDir = DATA_DIR, conv = null, row = null, priceTable = null } = {}) {
+  try {
+    if (!conv || !row || !priceTable) return null;
+    const blended = blendedRate({ rows: [row], priceTable, tierOf: (m) => tierOfModel(m) });
+    if (!blended || (!blended.reqs && !blended.failed)) return null;
+    const file = path.join(dataDir, 'usage', 'auto-blend.json');
+    let cur = null;
+    try { cur = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { cur = null; }
+    if (!cur || cur.conv !== conv) {
+      cur = { conv, at: Date.now(), reqs: 0, actualCost: 0, baseCost: 0, byTier: {}, failed: 0 };
+    }
+    cur.at = Date.now();
+    cur.reqs += blended.reqs;
+    cur.failed += blended.failed;
+    // 累计保留全精度:4 位舍入会把小额会话成本吞成 0 → baseCost=0 → rate 变 null(2026-11-06 修);展示时才舍
+    cur.actualCost += blended.actualCost;
+    cur.baseCost += blended.baseCost;
+    cur.rate = cur.baseCost > 0 ? Number((cur.actualCost / cur.baseCost).toFixed(3)) : null;
+    for (const [t, v] of Object.entries(blended.byTier)) {
+      const e = cur.byTier[t] = cur.byTier[t] || { reqs: 0, tokens: 0 };
+      e.reqs += v.reqs;
+      e.tokens += v.tokens;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(cur));
+    return cur;
+  } catch { return null; }
+}
+
+/**
  * 门控通知文件 data/usage/gate-notice.json(2026-11-05):prompt-guard 据此在拦截连击中注入一次压缩建议。
  * 代理只在两类事件写:拦截(count/est 锚点;count===1 视为新连击,重置 suggested 注入标记)与疲劳放行(released)。
  * 钩子注入后回写 suggested=true ⇒ 同一连击不重复注入;上下文压缩后连击从 1 重新计数 ⇒ suggested 自然复位。
@@ -521,12 +735,17 @@ const baseProvKey = (p) => (p ? { baseProvider: p } : {});
 export const AUTO_MODEL = 'auto';
 
 /** auto 档位的 sticky 基准解析:R1 档链头(便宜体现在档位归属;链头=品牌优先序排序,冷却自动滑链)。纯函数可测。 */
-export function resolveAutoBase({ tierChains = {}, providerPriority = [], aliases = {}, inventory = [], health = {} } = {}) {
-  const r = resolveTier('R1', { cfg: { modelRouting: { chains: tierChains, providerPriority, aliases } }, inventory, health });
-  return { modelId: r.modelId || null, providerId: r.providerId || null, warn: r.warn };
+export function resolveAutoBase({ tierChains = {}, providerPriority = [], providerOrder = [], aliases = {}, inventory = [], health = {} } = {}) {
+  // v3 价带(2026-11-06):R1=flash/无后缀普通,池内理论恒有货;仍保留级联兜底(R1 空→R2→R3→R4),
+  // 取"最低有货档"链头——auto 的 sticky 基准永远是当前池里最便宜的可路由模型。
+  for (const t of ['R1', 'R2', 'R3', 'R4']) {
+    const r = resolveTier(t, { cfg: { modelRouting: { chains: tierChains, providerPriority, providerOrder, aliases } }, inventory, health });
+    if (r && r.modelId) return { modelId: r.modelId, providerId: r.providerId || null, warn: r.warn, tier: r.tier };
+  }
+  return { modelId: null, providerId: null, warn: '四档链全部为空', tier: null };
 }
 
-export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false } = {}) {
+export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, loopStreak = 0 } = {}) {
   const g = { ...DEFAULT_GUARD, ...(guard && typeof guard === 'object' ? guard : {}) };
   const inPhase = !!(phase && phase.model);
   // auto 档(2026-11-02):请求模型是虚拟名,没有"客户端所选真实模型"——
@@ -537,7 +756,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   // auto 基准供应商也要驻留并随决策带回(2026-11-05 修复):此前只回 model 不回 providerId,
   // pickUpstream 落到"按模型名找快照第一个持有者"——不查健康冷却、providerPriority 失效,
   // 同名多供应商时配额墙账号每轮被反复选中。
-  const autoBase = isAuto ? resolveAutoBase({ tierChains: tc, providerPriority, aliases, inventory, health }) : null;
+  const autoBase = isAuto ? resolveAutoBase({ tierChains: tc, providerPriority, providerOrder, aliases, inventory, health }) : null;
   const baseModel = isAuto ? (phase?.baseModel || autoBase.modelId || requestedModel) : requestedModel;
   const baseProvider = isAuto ? (phase?.baseProvider || autoBase.providerId || null) : null;
 
@@ -561,12 +780,16 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   const escTarget = ESC_NEXT[servingTier] || null;
   const tryEscalate = () => {
     if (!escTarget) return { mark: false, decision: null };
-    const target = resolveTier(escTarget, { cfg: { modelRouting: { chains: tc, providerPriority, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
+    // 同一段死循环只升一次(2026-11-05 A 项):已经因循环升过档就不要再升——否则同一循环会连吃多次冷读税。
+    if (loopStreak > 0 && phase?.loopEscalated === true) return { mark: false, decision: null };
+    const target = resolveTier(escTarget, { cfg: { modelRouting: { chains: tc, providerPriority, providerOrder, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
     const model = target?.modelId || null;
     // 解析结果必须真落在目标档:目标档链空时 resolveTier 会级联降到低档模型,拿它冒充"升级"是纯浪费(白付一次冷读)
     if (!model || target.tier !== escTarget || !isProxyReachable({ providerId: target.providerId, model, upstreams })) return { mark: false, decision: null };
     const est = estimateContextTokens(contextBytes);
-    if (g.enabled && est > g.maxContextTokens) return { mark: false, decision: null };
+    // 切换税门控对死循环证据豁免(2026-11-06):门控假设"升档可能不必要",而死循环按定义不会自愈,
+    // 拦住升档=R1 空烧到人来救;errStreak 类证据(可能自愈)仍受门控。
+    if (g.enabled && loopStreak === 0 && est > g.maxContextTokens) return { mark: false, decision: null };
     const nextPhase = {
       model, providerId: target.providerId,
       baseRequested: phase?.baseRequested ?? requestedModel,
@@ -574,8 +797,12 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
       ...baseProvKey(phase?.baseProvider || baseProvider),
       humanTurns: phase?.humanTurns || 0,
       escalated: true, tier: escTarget,
+      ...(loopStreak > 0 ? { loopEscalated: true } : {}),
     };
-    return { mark: true, decision: { model, providerId: target.providerId, switched: model !== baseModel, escalated: true, reason: `证据升级(连续 ${Math.max(errStreak, 2)} 轮修复失败,${servingTier}→${escTarget} 逐级上梯)`, nextPhase } };
+    const why = loopStreak > 0
+      ? `死循环(同参数工具调用连续 ${loopStreak} 次,工具都"成功"但没进展)`
+      : `连续 ${Math.max(errStreak, 2)} 轮修复失败`;
+    return { mark: true, decision: { model, providerId: target.providerId, switched: model !== baseModel, escalated: true, reason: `证据升级(${why},${servingTier}→${escTarget} 逐级上梯)`, nextPhase } };
   };
 
   if (lastKind !== 'human') {
@@ -628,7 +855,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   }
   const r1Down = r1Asks && (baseTier === 'R2' || baseTier === 'R3' || baseTier === 'R4');
   if (r1Down) {
-    const tr = resolveTier('R1', { cfg: { modelRouting: { chains: tc, providerPriority, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
+    const tr = resolveTier('R1', { cfg: { modelRouting: { chains: tc, providerPriority, providerOrder, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
     if (tr && tr.modelId && isProxyReachable({ providerId: tr.providerId, model: tr.modelId, upstreams })) {
       return { model: tr.modelId, providerId: tr.providerId, switched: true, reason: `难度 R1 降档(基准 ${baseTier} 档→R1,不建阶段${inPhase ? ',现有阶段收尾' : ''}${ambiguousR1 ? ';歧义轮(置信≤0.5)跳过宽限,有歧义即便宜档' : ''})`, nextPhase: gateTomb(), tier: 'R1' };
     }
@@ -650,7 +877,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
     return { model: phase.model, providerId: phase.providerId, switched: phase.model !== baseModel, reason: `阶段粘住延续(${phase.tier || phaseTier || '升档'}档,第 ${(phase.humanTurns || 0) + 1} 人类轮)`, nextPhase: { ...nextTurnOf(phase), r1Streak: 0 } };
   }
   if (wantTier) {
-    const tr = resolveTier(wantTier, { cfg: { modelRouting: { chains: tc, providerPriority, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
+    const tr = resolveTier(wantTier, { cfg: { modelRouting: { chains: tc, providerPriority, providerOrder, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
     if (tr && tr.modelId && isProxyReachable({ providerId: tr.providerId, model: tr.modelId, upstreams })) {
       const nextTurn = { model: tr.modelId, providerId: tr.providerId, baseRequested: requestedModel, baseModel, ...baseProvKey(baseProvider), humanTurns: (phase?.humanTurns || 0) + 1, tier: tr.tier };
       if (tr.modelId === baseModel) return { model: baseModel, providerId: tr.providerId, switched: baseModel !== requestedModel, reason: `${wantTier} 命中但已是该档${tr.downgraded ? `(目标档空,级联降档至 ${tr.tier})` : ''}`, nextPhase: nextTurn, tier: tr.tier };
@@ -894,6 +1121,14 @@ function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG) {
     fs.mkdirSync(path.dirname(usageFile), { recursive: true });
     fs.appendFileSync(usageFile, JSON.stringify(rec) + '\n');
   } catch { /* 记不上就算了 */ }
+  // auto 综合费率累计(2026-11-05):只记 auto 流量(显式选模与本口径无关),按 conv 累进
+  // auto-blend.json——成功计入费率,served 且无 token 计失败;费率表缺失静默跳过
+  if (rec.conv && rec.served && rec.requested === AUTO_MODEL) {
+    try {
+      const prices = loadModelPrices({ dataDir: DATA_DIR });
+      if (prices) updateAutoBlend({ dataDir: DATA_DIR, conv: rec.conv, row: rec, priceTable: prices });
+    } catch { /* 费率累计失败不影响记账 */ }
+  }
 }
 
 // ---------- HTTP 服务 ----------
@@ -925,8 +1160,14 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       const routeMode = 'tier'; // 2026-11-03 用户终裁:role 两档制已废,tier 四档难度制唯一
       let diffDecision = null;
       let retryCtx = null; // 同轮重选所需的重解析上下文:{ro, tierChains}
+      let loopStreak = 0; // 死循环证据(2026-11-05 A 项):块内检测,账本写入(块外)要读,故在外层声明
+      let loopName = null;
+      let loopRaw = 0; // 原始尾连数(阈值下也记,账本诊断用)
       if (adapter && Array.isArray(bodyObj.messages)) {
         const ro = mrRoutingOptions(configPath);
+        // 同名取序(2026-11-05):快照采集的宿主 UI 拖动序(providerOrder[reqHost]),resolveRole 在
+        // providerPriority 之后按它排同名供应商——UI 把谁排前,冷却滑动就先耗谁的额度。
+        const providerOrder = Array.isArray(upstreams.providerOrder?.[reqHost]) ? upstreams.providerOrder[reqHost] : [];
         const lastKind = adapter.lastMessageKind(bodyObj.messages);
         const l1 = lastKind === 'human' ? classifyPrompt(adapter.lastHumanText(bodyObj.messages)) : null;
         // 难度定档:人类轮算一次,tier 实弹决策与四档影子共用同一结果
@@ -939,24 +1180,31 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         const phase0 = state.get(convKey) || null;
         let errStreak = 0;
         let escalate = false;
+        // 死循环检测(2026-11-05 A 项):同工具同参数连续调用 ≥4 次 = 模型在"空烧"(工具全成功但没用)。
+        // 这类失败不产生 is_error ⇒ P2 等不到;直接当上梯证据(换强模型是最正当的破局理由)。
+        const loop = typeof adapter.countRepeatCalls === 'function' ? adapter.countRepeatCalls(bodyObj.messages) : { count: 0, name: null, key: null, sameOut: 0 };
+        // 判死循环(2026-11-06):尾连 ≥4;或尾连 ≥3 且同结果实锤 ≥2(提前一拍介入)
+        loopStreak = loopFiredOf(loop) ? loop.count : 0;
+        loopName = loop.count > 0 ? loop.name : null;
+        loopRaw = loop.count || 0;
         if (lastKind === 'tool') {
           const errs = adapter.countToolErrors(bodyObj.messages);
           errStreak = errs > 0 ? ((phase0?.errStreak || 0) + 1) : 0;
-          escalate = errStreak >= 2;
+          escalate = errStreak >= 2 || loopStreak > 0;
         }
         // 四档链(同一份快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序;chainsOverride=测试注入的档位链)
         const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority });
-        retryCtx = { ro, tierChains }; // 留给运行时 429 同轮重选:重跑 resolveTier 档内滑/降档
+        retryCtx = { ro, tierChains, providerOrder }; // 留给运行时 429 同轮重选:重跑 resolveTier 档内滑/降档
         // 健康/库存快照每轮读一次:实弹决策与难度裸解析审计共用(此前审计块各自重读一遍,同参数重复计算)
         const health0 = readHealth(healthDataDir);
         const inventory0 = inventoryFromUpstreams(upstreams);
         const d = decideTarget({
           requestedModel: bodyObj.model, lastKind, diff: diffDecision,
-          tierChains, providerPriority: ro.providerPriority, aliases: ro.aliases,
+          tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases,
           inventory: inventory0,
           health: health0, upstreams,
           phase: phase0, guard: switchGuard(configPath), contextBytes: size,
-          errStreak, escalate,
+          errStreak, escalate, loopStreak,
         });
         decision = d;
         // 门控通知(2026-11-05):拦截连击/疲劳放行落 data/usage/gate-notice.json,prompt-guard 据此注入压缩建议
@@ -971,14 +1219,14 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           try {
             const diff = diffDecision || classifyDifficulty(adapter.lastHumanText(bodyObj.messages), { calibration: loadTierCalibration() });
             const tr = resolveTier(diff.tier, {
-              cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, aliases: ro.aliases } },
+              cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
               inventory: inventory0, health: health0,
               reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
             });
             // 歧义轮(置信≤0.5 的 R1)影子 A/B:只记"改判 R2"会解析到哪,不改实弹——攒数据再定策略
             const ambiguousR1 = diff.tier === 'R1' && Number(diff.confidence) <= 0.5;
             const amb = ambiguousR1 ? resolveTier('R2', {
-              cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, aliases: ro.aliases } },
+              cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
               inventory: inventory0, health: health0,
               reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
             }) : null;
@@ -1078,7 +1326,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         let nextProvider = null;
         try {
           const r = resolveTier(curSlideTier, {
-            cfg: { modelRouting: { chains: retryCtx.tierChains, providerPriority: retryCtx.ro.providerPriority, aliases: retryCtx.ro.aliases } },
+            cfg: { modelRouting: { chains: retryCtx.tierChains, providerPriority: retryCtx.ro.providerPriority, providerOrder: retryCtx.providerOrder, aliases: retryCtx.ro.aliases } },
             inventory: inventoryFromUpstreams(upstreams), health: readHealth(healthDataDir),
             reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
           });
@@ -1124,7 +1372,9 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         // 决策证据(2026-11-03 tier 唯一):l1Type=L1 分类,diffTier=难度定档,tier=实际生效档
         l1Type, tier: decision.tier || null,
         suppressed: decision.suppressed, estTokens: estimateContextTokens(size),
-        escalated: decision.escalated === true, routeMode,
+        escalated: decision.escalated === true || state.get(convKey)?.escalated === true, routeMode,
+        // 死循环证据(2026-11-05 A 项;2026-11-06 起 loopRepeat 记原始尾连数,阈值下也记,供日后调阈值)
+        loopRepeat: loopRaw, loopFired: loopStreak > 0, loopTool: loopName,
         retryAttempts: attempts, retryTrail: retryTrail.length ? retryTrail : null, // 同轮重选轨迹(失败模型→重解析出的下一个)
         bodyBytes: size, cjkChars: countCjk(raw),
         cooled: cool || null, phaseTurns: state.get(convKey)?.humanTurns || 0,

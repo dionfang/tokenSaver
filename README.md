@@ -138,14 +138,16 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 | `enabled` | 总开关;只控制每轮 `[model-routing]` 定档行的注入,auto 流量无论开关都照常路由 |
 | `brandPriority` | 四档链档内品牌调用优先序(默认 glm,minimax,deepseek,qwen,kimi,grok,claude,gpt,gemini),不影响档位归属 |
 | `providerPriority` | 同名模型挂多供应商时的同名取序,配额尽自动滑下一供应商 |
+| `providerOrder` | 宿主 UI 供应商拖动序(快照自动采集,无需手配):同名供应商未进 `providerPriority` 时按它取序,冷却/配额尽按 UI 序逐个滑动;配置同键可覆盖快照序(Qoder 端无拖动序,按设置文件键序采集) |
 | `retryOnRateLimit` / `maxRetries` | 运行时 429/5xx/网络失败同轮换模型重选(默认 true / 2) |
 | `maxPhaseTurns` | 升档阶段最多持续的人类轮数(默认 4),到顶回 R1 基准 |
 | `switchGuard` | 切换税门控 `{enabled 默认 true, maxContextTokens 默认 200000}`;只拦升档;同会话被拦满 3 次疲劳放行,拦截时注入一次压缩建议 |
 | `l2Shadow` / `l2` | L2 向量投票通电开关与阈值 `{minSim, minConf}` |
 | `decisionModel` | 四票代签的判定模型 `{enabled, model, providers:[{baseUrl,apiKey,path}], chunkSize}` |
 | `tierOptimize` | 自进化闭环 `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`:enabled=true 后每 6h 学习信号权重与门槛,折外过门控自动晋升 live,观察窗成本恶化自动回滚 |
+| `blendNotice` | auto 综合费率行注入开关 `{enabled 默认 true}`:仅路由宿主注入"最近会话实际费 ÷ R1 基准费"倍率行;关=只停注入,记账照常 |
 
-生效范围与边界:仅 ZCode/Qoder 两端参与;auto 只调度自定义模型中以 Anthropic Messages 协议接入的模型;模型分档按名字自动判定(flash/haiku/lite→R1,普通/preview→R2,max/pro→R3,旗舰品牌无便宜后缀→R4),无需配置。接入步骤与配置字段见 [`部署使用说明.txt`](code-index/部署使用说明.txt) 的配置说明。
+生效范围与边界:仅 ZCode/Qoder 两端参与;auto 只调度自定义模型中以 Anthropic Messages 协议接入的模型;模型分档按名字自动判定(2026-11-06 v3.1 价带:flash→R1,无后缀普通与 pro/max 及一切便宜变体(preview/coding/turbo/haiku 等)→R2,旗舰品牌普通款→R3,旗舰品牌顶配(pro/max)→R4),无需配置。接入步骤与配置字段见 [`部署使用说明.txt`](code-index/部署使用说明.txt) 的配置说明。
 
 ### 仓库模块
 
@@ -297,14 +299,16 @@ The `modelRouting` section of `data/code-index.config.json` is scaffolded by ini
 | `enabled` | Master switch; only gates the per-turn `[model-routing]` tier line. Auto traffic is routed the same way regardless |
 | `brandPriority` | Within-tier brand call order of the four-tier chains (default glm,minimax,deepseek,qwen,kimi,grok,claude,gpt,gemini); does not affect tier assignment |
 | `providerPriority` | Same-name ordering when one model is hosted by several providers; an exhausted quota slides to the next one |
+| `providerOrder` | Host UI provider drag order (auto-captured into the snapshot, no manual setup): same-name providers not listed in `providerPriority` follow it, and cooling/quota exhaustion slides through them in UI order; a config key of the same name overrides the snapshot order (Qoder has no drag order; its settings-file key order is captured instead) |
 | `retryOnRateLimit` / `maxRetries` | Same-turn model re-selection on runtime 429/5xx/network failure (default true / 2) |
 | `maxPhaseTurns` | How many human turns an upgrade phase may last (default 4), then back to the R1 base |
 | `switchGuard` | Switch-tax gate `{enabled default true, maxContextTokens default 200000}`; upgrades only; releases by fatigue after 3 consecutive blocks and injects a one-shot compression suggestion while blocking |
 | `l2Shadow` / `l2` | Power switch and thresholds `{minSim, minConf}` for L2 vector voting |
 | `decisionModel` | The judge model for four-vote auto-signing `{enabled, model, providers:[{baseUrl,apiKey,path}], chunkSize}` |
 | `tierOptimize` | Self-evolution loop `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`: with enabled=true, every 6h it learns signal weights and thresholds from the golden set, auto-promotes a candidate that passes the out-of-fold gate, and auto-rolls back if cost worsens inside the observation window |
+| `blendNotice` | Injection switch for the auto blended-rate line `{enabled default true}`; routing hosts only — injects the "latest session's actual spend ÷ R1-equivalent spend" multiplier; off = stops the line, accounting continues |
 
-Scope and boundaries: only ZCode/Qoder take part; auto dispatches only custom models wired via the Anthropic Messages protocol; model tiering is derived from the name (flash/haiku/lite→R1, normal/preview→R2, max/pro→R3, flagship brands without a cheap suffix→R4) and needs no configuration. Wiring steps and config keys live in [`部署使用说明.txt`](code-index/部署使用说明.txt), configuration section.
+Scope and boundaries: only ZCode/Qoder take part; auto dispatches only custom models wired via the Anthropic Messages protocol; model tiering is derived from the name (v3.1 price bands, 2026-11-06: flash→R1, unsuffixed normal plus pro/max and every cheap variant (preview/coding/turbo/haiku etc.)→R2, a flagship brand's base model→R3, a flagship brand's pro/max→R4) and needs no configuration. Wiring steps and config keys live in [`部署使用说明.txt`](code-index/部署使用说明.txt), configuration section.
 
 ### Repository layout
 

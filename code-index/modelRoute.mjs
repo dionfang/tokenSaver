@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
-import { classifyPrompt } from './classify.mjs';
+import { normalizeType, L1_TYPES, classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration, TIER_FROM_TYPE } from './tierClassify.mjs';
 import { promptKey } from './buildExemplars.mjs';
 
@@ -29,12 +29,11 @@ const HEALTH_PATH = path.join(DATA_DIR, 'model-health.json');
 const SHADOW_LOG = path.join(DATA_DIR, 'usage', 'routing-shadow.jsonl');
 const L2_MIN_SIM = 0.55;
 const L2_MIN_CONF = 0.6; // 2026-11-02:与 init 骨架/本机配置对齐(黄金集扫描定档:0.6 覆盖 15/50 准确 93%;0.75 只覆盖 6/50)
-const TYPES = ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'];
+const TYPES = ['multi', 'routine', 'light'];
 
 const TYPE_DEFS = {
-  T1: '问答解释(只问不改)', T2: '缺陷诊断(报错/异常)', T3: '局部实现(改动动词+单点)',
-  T4: '重构/迁移/批量(范围词)', T5: '方案/规划(设计/选型)', T6: '审查/评审(找问题)',
-  T7: '测试(写测试/单测)', T8: '文档/chore(提交/依赖)',
+  multi: '多点改组(重构/迁移/批量/方案,建议档 R2)', routine: '例行工作(报错/单点编辑/审查/测试)',
+  light: '询问杂务(问答/文档/chore)',
 };
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -87,7 +86,7 @@ export function knnClassify(vector, vectorsDoc, { k = 5, minSim = L2_MIN_SIM, ta
     .map(([id, e]) => {
       const sim = cosine(vector, e.v);
       const tainted = !!(e.rule && /l2/i.test(String(e.rule)));
-      return { id, label: e.label, sim, tainted, eff: sim * (tainted ? taintFactor : 1) };
+      return { id, label: normalizeType(e.label), sim, tainted, eff: sim * (tainted ? taintFactor : 1) };
     })
     .filter((x) => x.sim >= minSim)
     .sort((a, b) => b.eff - a.eff)
@@ -131,35 +130,38 @@ export function tierOf(modelId) {
   return 'normal';
 }
 
-// ---------- 四档模型分级(2026-11-02 用户定档:R1高中生/R2大学生/R3研究生/R4教授) ----------
-// R4 教授 = 旗舰品牌(kimi/grok/gemini/gpt/claude)的 pro/max 或无便宜后缀的旗舰;
-//   便宜变体例外——按后缀回落(用户裁定"品牌优先但便宜变体例外")。
-// R1-R3 按价格后缀:flash/base→R1,普通/plus/coding→R2,pro/max→R3。
-// preview 一律 R2(2026-11-04 用户定档):优先级介于超便宜 R1 与品牌旗舰 R4 之间——便宜变体被 R1 截住,
-//   预览模型不随品牌升 R4、不随 pro/max 升 R3(K2.8 Preview/gemini-x-pro-preview→R2)。
-// 超便宜后缀(用户 2026-11-02 追加:Luna/Haiku/Flash-Lite)一律高中生档 R1,品牌也不例外。
+// ---------- 四档模型分级(2026-11-02 用户定档;2026-11-06 v3 重排价带,v3.1 无后缀普通入 R2) ----------
+// v3.1 定档(2026-11-06 用户定档):flash **R1**;无后缀普通(glm-5.3/MiniMax-M3)入 **R2**(与 pro/max 同档);
+// 旗舰品牌分两层——普通旗舰款(Kimi-K3/K2.7-Code)**R3**,顶配 pro/max(k3.1-pro)**R4**。价带:
+//   R1 = flash——最便宜日常主力价带;
+//   R2 = 无后缀普通(非旗舰)/ pro/max(非旗舰)/ 一切便宜变体(preview/coding/turbo/mini/haiku/lite/base…);
+//   R3 = 旗舰品牌普通款(无便宜后缀、非 pro/max;K2.7-Code 的 code 不算便宜变体);
+//   R4 = 旗舰品牌顶配(pro/max)。
 const PREMIUM_BRAND_RE = /(kimi|moonshot|gpt|openai|claude|anthropic|gemini|grok|\bxai\b)/i;
 const KIMI_K_RE = /^k\d/i; // k3.1-pro = Kimi K3.1(裸 k+数字前缀)
-const R1_TOKENS = new Set(['flash', 'base', 'haiku', 'luna', 'lite']); // 超便宜 → 直接 R1
-const CHEAP_TOKENS = new Set(['flash', 'base', 'coding', 'mini', 'lite', 'air', 'haiku', 'nano', 'event', 'luna']); // 阻止品牌升 R4
+const CHEAP_VARIANT_TOKENS = new Set(['preview', 'coding', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base']); // v3:便宜变体+超便宜一律 R2
 export const TIER_RANK = { R1: 1, R2: 2, R3: 3, R4: 4 };
 export const TIER_ORDER_DESC = ['R4', 'R3', 'R2', 'R1']; // 降档方向
 
-/** 模型 id → 四档(R1/R2/R3/R4)。品牌优先,便宜变体按后缀回落。纯函数可测。 */
+/** 模型 id → 四档(R1/R2/R3/R4)。v3.1 价带:flash→R1,无后缀普通/pro/max→R2,旗舰普通款→R3,旗舰顶配→R4。纯函数可测。 */
 export function tierOfModel(modelId) {
   const id = String(modelId || '');
   const tokens = id.split(/[^A-Za-z0-9]+/).filter(Boolean).map((t) => t.toLowerCase());
   const suffix = tierOf(id); // flash/normal/plus/pro/max(既有价格档,内部基元)
   const premium = PREMIUM_BRAND_RE.test(id) || KIMI_K_RE.test(id);
-  // 1. 超便宜后缀(flash/base/haiku/luna/lite)一律高中生档,品牌旗舰也不例外(claude-haiku/gemini-flash-lite→R1)
-  if (suffix === 'flash' || tokens.some((t) => R1_TOKENS.has(t))) return 'R1';
-  // 1.5 preview 一律大学生档 R2(2026-11-04 用户定档):不随品牌升 R4、不随 pro/max 升 R3;便宜变体已被 1 截住
-  if (tokens.includes('preview')) return 'R2';
-  // 2. 品牌旗舰(pro/max 或无便宜后缀)⇒ 教授档;便宜变体(coding/mini/nano…)不升(k3.1-pro→R4,gpt-4→R4)
-  if (premium && !tokens.some((t) => CHEAP_TOKENS.has(t))) return 'R4';
-  // 3. pro/max ⇒ 研究生档
-  if (suffix === 'pro' || suffix === 'max') return 'R3';
-  // 4. 其余(普通/plus/coding)⇒ 大学生档
+  // pro/max 判定要 token 感知:tierOf 只认词尾,pro-x/gpt-max-x 这类"后缀再接词"会被解析成 normal
+  const proMax = suffix === 'pro' || suffix === 'max' || tokens.includes('pro') || tokens.includes('max');
+  // 1. flash → R1(v3.1:flash=最便宜日常主力价带;品牌 flash 也截在此档不升 R3/R4)
+  if (suffix === 'flash' || tokens.includes('flash')) return 'R1';
+  // 2. 便宜变体/超便宜(preview/coding/turbo/haiku/lite/base…)一律 R2(2026-11-06 用户定档:与 pro/max 同档)
+  if (tokens.some((t) => CHEAP_VARIANT_TOKENS.has(t))) return 'R2';
+  // 3. 旗舰品牌:pro/max=顶配 R4;其余无便宜后缀普通款(Kimi-K3/K2.7-Code)⇒ 普通旗舰 R3(2026-11-06 用户定档)
+  if (premium) return proMax ? 'R4' : 'R3';
+  // 4. 非旗舰 pro/max ⇒ R2(增强档,v3 从 R3 降)
+  if (proMax) return 'R2';
+  // 5. 非旗舰无后缀普通(glm-5.3/MiniMax-M3)⇒ R2(v3.1:与 pro/max 同档,不再与 flash 同档)
+  if (suffix === 'normal') return 'R2';
+  // 6. plus 及其余 ⇒ R2
   return 'R2';
 }
 
@@ -354,6 +356,7 @@ export function resolveRole(role, { cfg = {}, inventory = [], health = {}, curre
   const chain = mr.chains?.[role];
   if (!Array.isArray(chain)) return { error: `未知链键或未配置链: ${role}` };
   const priority = mr.providerPriority || [];
+  const order = mr.providerOrder || []; // 宿主 UI 供应商拖动序(快照采集):同名模型在 providerPriority 之后的次级取序
   const aliases = mr.aliases || {};
   const seenKeys = new Set();
   let index = 0;
@@ -375,7 +378,8 @@ export function resolveRole(role, { cfg = {}, inventory = [], health = {}, curre
     if (at > 0) { name = entry.slice(0, at); pin = entry.slice(at + 1); }
     if (aliases[name]) name = aliases[name];
     const { exact, family } = candidatesByName(inventory, name, pin);
-    // #7 规格:providerPriority 是外层循环,匹配方式(精确>家族)是内层——同名字多供应商按优先级取
+    // #7 规格:providerPriority 是外层循环,匹配方式(精确>家族)是内层——同名字多供应商按优先级取;
+    // 未进 priority 的同名供应商按 providerOrder(宿主 UI 拖动序,2026-11-05)排——UI 把谁排前,冷却滑动就先耗谁
     const pools = new Map();
     for (const c of exact) {
       const a = pools.get(c.providerId) || { exact: [], family: [] };
@@ -388,7 +392,8 @@ export function resolveRole(role, { cfg = {}, inventory = [], health = {}, curre
       pools.set(c.providerId, a);
     }
     const rank = (pid) => { const i = priority.indexOf(pid); return i === -1 ? priority.length : i; };
-    const providers = [...pools.keys()].sort((a, b) => rank(a) - rank(b));
+    const rankO = (pid) => { const i = order.indexOf(pid); return i === -1 ? order.length : i; };
+    const providers = [...pools.keys()].sort((a, b) => rank(a) - rank(b) || rankO(a) - rankO(b));
     for (const pid of providers) {
       const { exact: ex, family: fam } = pools.get(pid);
       for (const cand of [...ex, ...fam]) {
@@ -493,8 +498,8 @@ export function collectInventory(home = HOME) {
 
 // ---------- 黄金集打分(#14 验证闭环) ----------
 
-/** #14 目标线:轻类型 ≥90%,重类型 ≥80%(证据升级协议兜底其余)。 */
-const GOLDEN_TARGETS = { T1: 0.9, T3: 0.9, T8: 0.9, T2: 0.8, T4: 0.8 };
+/** 目标线(2026-11-06 三档定稿):light/routine ≥0.85,multi 边界最糊 ≥0.7(P2 证据升级兜底其余)。 */
+const GOLDEN_TARGETS = { light: 0.85, routine: 0.85, multi: 0.7 };
 
 /**
  * 黄金集打分:以 humanLabel 槽位为真值算 L1 准确率/各类命中/错分清单。
@@ -510,23 +515,24 @@ export function scoreGolden({ dataDir = DATA_DIR, goldenFile = null, classifyFn 
   try {
     rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch { return { error: `黄金集不可读: ${file}` }; }
-  const calibrated = rows.filter((r) => /^T[1-8]$/.test(String(r.humanLabel || '')));
+  const calibrated = rows.filter((r) => L1_TYPES.includes(normalizeType(String(r.humanLabel || ''))));
   const perType = {};
   const misses = [];
   let correct = 0;
   for (const r of calibrated) {
-    const pred = classifyFn(r.prompt)?.type ?? 'uncertain';
-    const p = perType[r.humanLabel] || (perType[r.humanLabel] = { actual: 0, hit: 0 });
+    const label = normalizeType(String(r.humanLabel || ''));
+    const pred = normalizeType(classifyFn(r.prompt)?.type ?? 'uncertain');
+    const p = perType[label] || (perType[label] = { actual: 0, hit: 0 });
     p.actual += 1;
-    if (pred === r.humanLabel) { p.hit += 1; correct += 1; } else misses.push({ id: r.id, actual: r.humanLabel, pred, promptHead: String(r.prompt || '').slice(0, 60) });
+    if (pred === label) { p.hit += 1; correct += 1; } else misses.push({ id: r.id, actual: label, pred, promptHead: String(r.prompt || '').slice(0, 60) });
   }
   const perTypeOut = {};
   for (const [t, v] of Object.entries(perType)) {
     const acc = v.hit / v.actual;
     perTypeOut[t] = { actual: v.actual, hit: v.hit, acc: Number(acc.toFixed(3)), target: GOLDEN_TARGETS[t] ?? null, pass: GOLDEN_TARGETS[t] ? acc >= GOLDEN_TARGETS[t] : null };
   }
-  const uncalibrated = rows.filter((r) => !/^T[1-8]$/.test(String(r.humanLabel || '')));
-  const agree = uncalibrated.length ? uncalibrated.filter((r) => classifyFn(r.prompt)?.type === r.autoLabel).length : 0;
+  const uncalibrated = rows.filter((r) => !L1_TYPES.includes(normalizeType(String(r.humanLabel || ''))));
+  const agree = uncalibrated.length ? uncalibrated.filter((r) => normalizeType(classifyFn(r.prompt)?.type) === normalizeType(String(r.autoLabel || ''))).length : 0;
   // 来源切分(2026-11-02 自动代签后):自动签条目 humanLabel 来自四票多数,用它评 L1 会自证;
   // 故"外部真值"只取非自动签条目(人工/构造性真值),自动签部分单独报"与四票一致率"。
   // 2026-11-04:非自动签条目已全部删除 => humanRows=0、accuracyHuman=null、passAll=null,L1 自此无外部锚点。
@@ -534,16 +540,17 @@ export function scoreGolden({ dataDir = DATA_DIR, goldenFile = null, classifyFn 
   const autoRows = calibrated.filter((r) => r.autoSigned);
   const accOf = (arr) => {
     if (!arr.length) return null;
-    const hit = arr.filter((r) => (classifyFn(r.prompt)?.type ?? 'uncertain') === r.humanLabel).length;
+    const hit = arr.filter((r) => normalizeType(classifyFn(r.prompt)?.type ?? 'uncertain') === normalizeType(String(r.humanLabel || ''))).length;
     return Number((hit / arr.length).toFixed(3));
   };
   // 外部真值(非自动签)的逐类统计:passAll 只看这一部分
   const perTypeHuman = {};
   for (const r of humanRows) {
-    const pred = classifyFn(r.prompt)?.type ?? 'uncertain';
-    const p = perTypeHuman[r.humanLabel] || (perTypeHuman[r.humanLabel] = { actual: 0, hit: 0 });
+    const label = normalizeType(String(r.humanLabel || ''));
+    const pred = normalizeType(classifyFn(r.prompt)?.type ?? 'uncertain');
+    const p = perTypeHuman[label] || (perTypeHuman[label] = { actual: 0, hit: 0 });
     p.actual += 1;
-    if (pred === r.humanLabel) p.hit += 1;
+    if (pred === label) p.hit += 1;
   }
   const perTypeHumanOut = {};
   for (const [t, v] of Object.entries(perTypeHuman)) {
@@ -634,7 +641,7 @@ export function scoreGoldenTier({ dataDir = DATA_DIR, goldenFile = null, classif
 
 // ---------- doctor ----------
 
-export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentModel = null, upstreamsFile = null } = {}) {
+export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentModel = null, upstreamsFile = null, host = 'zcode' } = {}) {
   const c = cfg || readJson(path.join(dataDir, 'code-index.config.json')) || {};
   const mr = c.modelRouting || {};
   const health = readHealth(dataDir);
@@ -645,10 +652,13 @@ export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentMod
   // 四档链与代理端同口径:从快照按 tierOfModel 派生(brandPriority 用配置覆盖默认);role 人工链已废(2026-11-03)
   const brandPriority = Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY;
   const tierChains = deriveTierChains(upstreams, { brandPriority });
+  // 同名取序(2026-11-05):providerPriority(配置)优先,未进表的同名供应商按快照采集的 providerOrder
+  // (宿主 UI 拖动序;Qoder 端=设置文件键序)排;报告口径=--host(默认 zcode)。配置同键 providerOrder 可覆盖快照序。
+  const providerOrder = Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[host]) ? upstreams.providerOrder[host] : []);
   const snapInventory = inventoryFromUpstreams(upstreams);
   // 每档解析一次(快照口径,与代理转发同一份 inventory):报告各档链头与代理可达性
   const resolved = TIER_ORDER_DESC.map((t) => {
-    const result = resolveTier(t, { cfg: { ...c, modelRouting: { ...mr, chains: tierChains } }, inventory: snapInventory, health, currentModel });
+    const result = resolveTier(t, { cfg: { ...c, modelRouting: { ...mr, chains: tierChains, providerOrder } }, inventory: snapInventory, health, currentModel });
     const proxyReachable = !!(result.providerId && isProxyReachable({ providerId: result.providerId, model: result.modelId, upstreams }));
     return { tier: t, result, proxyReachable };
   });
@@ -669,10 +679,11 @@ export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentMod
     byModel.get(k).add(m.providerId);
   }
   const priority = Array.isArray(mr.providerPriority) ? mr.providerPriority : [];
+  const uiOrder = Array.isArray(upstreams?.providerOrder?.[host]) ? upstreams.providerOrder[host] : [];
   if (!priority.length) {
     for (const [model, pids] of [...byModel.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
       if (pids.size > 1) {
-        sameNameNotes.push(`模型 ${model} 挂多供应商(${[...pids].sort().join(',')})且未配 modelRouting.providerPriority——同名取序=快照键序;要把某供应商排前(如额度多的),把它写进 providerPriority,或在链里用 模型@供应商 钉死`);
+        sameNameNotes.push(`模型 ${model} 挂多供应商(${[...pids].sort().join(',')})且未配 modelRouting.providerPriority——同名取序=${uiOrder.length ? `${host === 'qoder' ? '设置文件键序' : '宿主 UI 拖动序'}(快照 providerOrder)` : '快照键序'};要显式改序,把想先调的供应商写进 providerPriority(或 providerOrder 覆盖 UI 序),或在链里用 模型@供应商 钉死`);
       }
     }
   }
@@ -745,7 +756,7 @@ async function cli(argv) {
     const mr = cfg.modelRouting || {};
     const upstreams = readUpstreamsSnapshot(path.join(dataDir, 'routing', 'proxy-upstreams.json'));
     const brandPriority = Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY;
-    const r = resolveTier(tier, { cfg: { ...cfg, modelRouting: { ...mr, chains: deriveTierChains(upstreams, { brandPriority }) } }, inventory: inventoryFromUpstreams(upstreams), health: readHealth(dataDir), currentModel });
+    const r = resolveTier(tier, { cfg: { ...cfg, modelRouting: { ...mr, chains: deriveTierChains(upstreams, { brandPriority }), providerOrder: Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[val('--host', 'zcode')]) ? upstreams.providerOrder[val('--host', 'zcode')] : []) } }, inventory: inventoryFromUpstreams(upstreams), health: readHealth(dataDir), currentModel });
     console.log(JSON.stringify(r));
     return;
   }
@@ -770,7 +781,7 @@ async function cli(argv) {
   if (has('--doctor')) {
     const cur = val('--current', '');
     const currentModel = cur.includes('/') ? { providerId: cur.split('/')[0], modelId: cur.split('/')[1] } : null;
-    console.log(JSON.stringify(doctor({ dataDir, currentModel }), null, 1));
+    console.log(JSON.stringify(doctor({ dataDir, currentModel, host: val('--host', 'zcode') }), null, 1));
     return;
   }
   if (has('--kpi')) {
@@ -807,7 +818,7 @@ async function cli(argv) {
     }, null, 1));
     return;
   }
-  console.error('用法: node modelRoute.mjs --build-vectors | --classify [--l2] "<prompt>" | --shadow-async --prompt <b64> | --resolve --tier R3 [--current p/m] | --score-golden [--golden 文件] | --score-golden-tier [--golden 文件] | --doctor [--current p/m] | --kpi [--usage 文件] | --health-mark <provider/model> | --health-clear <key> | --health-list');
+  console.error('用法: node modelRoute.mjs --build-vectors | --classify [--l2] "<prompt>" | --shadow-async --prompt <b64> | --resolve --tier R3 [--current p/m] | --score-golden [--golden 文件] | --score-golden-tier [--golden 文件] | --doctor [--current p/m] [--host zcode|qoder] | --kpi [--usage 文件] | --health-mark <provider/model> | --health-clear <key> | --health-list');
   process.exit(1);
 }
 
