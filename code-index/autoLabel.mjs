@@ -97,6 +97,7 @@ export function autoSign(candidates, votersOf, { minVotes = 2 } = {}) {
       agreement: v.agreement,
       votes: v.votes,
       sources: v.sources,
+      voters: votersOf(c),
       evidence: { toolCalls: c.shape ? c.shape.calls : '-', writeEdits: c.shape ? c.shape.writes : '-' },
     });
   }
@@ -104,10 +105,12 @@ export function autoSign(candidates, votersOf, { minVotes = 2 } = {}) {
 }
 
 /** 把自动代签结果并入黄金集(已签条目优先保留 + 补新自动签,按 promptKey 去重)。
- *  2026-11-04 起黄金集全为四票代签:人工/构造条目的判据(reviewed 或非 auto 的 T 标签)保留,只兼容旧数据。 */
+ *  2026-11-04 起黄金集全为四票代签:人工/构造条目的判据(reviewed 或 非 auto 的 T 标签)保留,只兼容旧数据;
+ *  2026-11-06 费解:同一 pkey 的新鲜代签条目会更新原条目的票型/voters/labelRule/agreement,
+ *  但不改 humanLabel/reviewed/evidence,让黄金集跟上可观测性改进。 */
 export function mergeAutoSigned(freshRows, existing = []) {
   const byKey = new Map();
-  const isSigned = (r) => r.reviewed === true || /^T[1-8]$/.test(r.humanLabel || '');
+  const isSigned = (r) => r.reviewed === true || /^(multi|routine|light|T[1-8])$/.test(r.humanLabel || '');
   const keyOf = (r) => r.pkey || promptKey(r.prompt || '');
   for (const r of existing.filter(isSigned)) {
     const k = keyOf(r);
@@ -118,7 +121,17 @@ export function mergeAutoSigned(freshRows, existing = []) {
   const out = [...kept];
   for (const r of freshRows) {
     const k = keyOf(r);
-    if (seen.has(k)) continue;
+    if (seen.has(k)) {
+      const old = byKey.get(k);
+      if (old && r.voters) {
+        old.voters = r.voters;
+        old.labelRule = r.labelRule;
+        old.agreement = r.agreement;
+        old.votes = r.votes;
+        old.sources = r.sources;
+      }
+      continue;
+    }
     seen.add(k);
     out.push({ ...r, pkey: k });
   }
@@ -126,21 +139,35 @@ export function mergeAutoSigned(freshRows, existing = []) {
 }
 
 /** 诊断报告(不需要人签字,只看统计)。 */
-export function writeReport({ signed, contested, skipped }, { dataDir = DATA_DIR } = {}) {
+export function writeReport({ signed, contested, skipped }, { dataDir = DATA_DIR, decisionNote = '' } = {}) {
   const out = path.join(dataDir, 'routing', 'auto-label-report.md');
   const dist = {};
-  for (const s of signed) dist[s.humanLabel] = (dist[s.humanLabel] || 0) + 1;
+  const sourceTally = { l1: 0, l2: 0, decision: 0, behavior: 0 };
+  for (const s of signed) {
+    dist[s.humanLabel] = (dist[s.humanLabel] || 0) + 1;
+    if (s.voters) {
+      for (const src of ['l1', 'l2', 'decision', 'behavior']) {
+        if (s.voters[src]) sourceTally[src] += 1;
+      }
+    }
+  }
   const head = [
     '# 自动代签报告(无需人工处理)',
     '',
     `> 代签时间:${new Date().toISOString()}　已签:${signed.length}　分歧:${contested.length}　排除(续写/过短):${skipped.length}`,
-    '> 规则:L1 词法 / L2 向量 / 行为形态 三票 + 决策模型加权,唯一领先且 ≥2 票才签;平票与单票只留样本池。',
+    `> 规则:L1 词法 / L2 向量 / 行为形态 三票 + 决策模型加权,唯一领先且 ≥2 票才签;平票与单票只留样本池。${decisionNote ? '　' + decisionNote : ''}`,
     '',
     '## 已签标签分布',
     '',
     '| 类型 | 条数 |',
     '|---|---|',
     ...Object.entries(dist).sort((a, b) => b[1] - a[1]).map(([k, v]) => `| ${k} | ${v} |`),
+    '',
+    '## 投票源参与(已签样本)',
+    '',
+    '| 投票源 | 条数 |',
+    '|---|---|',
+    ...Object.entries(sourceTally).sort((a, b) => b[1] - a[1]).map(([k, v]) => `| ${k} | ${v} |`),
     '',
     '## 分歧项(仅诊断,不进量尺)',
     '',

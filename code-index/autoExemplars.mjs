@@ -20,6 +20,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
+import { isInquiryShape, normalizeType, classifyPrompt } from './classify.mjs';
 import { buildExemplars, loadPool, promptKey } from './buildExemplars.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -227,6 +228,10 @@ async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, classif
             const src = cand[a.id - 1];
             if (src) decisionByRow.set(src.row, a);
           }
+          if (dr.failedChunks) {
+            const retryInfo = dr.retriedChunks ? `,退避重试 ${dr.retriedChunks} 次` : '';
+            decisionNote = `决策模型 ${dr.failedChunks}/${dr.chunks} 个分片失败已跳过(其余照常计票${retryInfo})`;
+          }
         }
       }
     } catch (e) {
@@ -287,7 +292,7 @@ export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVot
   const existing = readJsonl(goldenFile);
   const merged = renumberGolden(mergeAutoSigned(signedWithEvidence, existing));
   fs.writeFileSync(goldenFile, merged.map((r) => JSON.stringify(r)).join('\n') + '\n');
-  const report = writeReport({ signed, contested, skipped }, { dataDir });
+  const report = writeReport({ signed, contested, skipped }, { dataDir, decisionNote: decisionNote || '' });
   return { signed: signedWithEvidence, signedCount: signedWithEvidence.length, contested: contested.length, skipped: skipped.length, golden: merged.length, report: report.out, decisionNote: decisionNote || null };
 }
 
@@ -323,6 +328,41 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
   const demotedSet = new Map();
   const reviewRows = [];
   for (const r of cand) {
+    // multi 疑问形态一票否决(2026-11-06 用户拍板):标签=multi 但原文是疑问/征询形态(isInquiryShape:
+    // 疑问结构+无祈使+无实改组锚)**且** L1 元提问防线也弃权(classifyPrompt=null)——双确认才否决,
+    // 带疑问从句的真任务(把X注册进Y,L1 判 routine)不误伤。行为票把会话级工作强度漏进了单轮标签,
+    // "问"被签成"做";否决独立于投票多数(行为票认同正是这批错标的成因),只摘标退池、绝不按预测重贴(红线)。
+    if (normalizeType(r.humanLabel) === 'multi' && isInquiryShape(r.prompt) && classifyPrompt(r.prompt) == null) {
+      demotedSet.set(r, {
+        ...r, reviewed: false, autoSigned: false, humanLabel: null, autoLabel: null,
+        demotedAt: now, demotedFrom: r.humanLabel,
+        demoteRule: 'multi疑问形态一票否决(问被签成做,2026-11-06 定向翻案)',
+      });
+      reviewRows.push({
+        ts: now, pkey: r.pkey || null, promptHead: String(r.prompt || '').slice(0, 120),
+        from: r.humanLabel || null, verdict: 'demoted', votes: 0, sources: 1,
+        voters: { multi: ['inquiry-morphology'] },
+      });
+      continue;
+    }
+    // multi 行为证据强度对齐(2026-11-06 用户拍板第二刀):multi 是强度声明——evidence 重放
+    // labelFromShape 不到 heavy(写≥3/调用≥15)⇒ 签名管线内部不一致(别的票盖过了行为票),复核即摘。
+    // 单向只查 multi:light/routine 轮出现 heavy 重放不摘(提问触发重度调查,标签按 prompt 仍正确)。
+    // 当前池实测 0 命中(26/27 重放=multi,1 证据弃权)=历史签名行为一致;此规则守未来扩样池。
+    const behaviorVote = (voters.get(r) || {}).behavior;
+    if (normalizeType(r.humanLabel) === 'multi' && behaviorVote && behaviorVote.type && behaviorVote.type !== 'multi') {
+      demotedSet.set(r, {
+        ...r, reviewed: false, autoSigned: false, humanLabel: null, autoLabel: null,
+        demotedAt: now, demotedFrom: r.humanLabel,
+        demoteRule: `multi行为证据强度不符(重放=${behaviorVote.type},不到 heavy 门槛)`,
+      });
+      reviewRows.push({
+        ts: now, pkey: r.pkey || null, promptHead: String(r.prompt || '').slice(0, 120),
+        from: r.humanLabel || null, verdict: 'demoted', votes: 0, sources: 1,
+        voters: { [behaviorVote.type]: ['behavior-replay'] },
+      });
+      continue;
+    }
     const v = voteLabel(voters.get(r) || {});
     const flip = !!(v.type && v.type !== r.humanLabel);
     reviewRows.push({

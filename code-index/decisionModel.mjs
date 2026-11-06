@@ -36,16 +36,11 @@ export const SYSTEMONE_PATH = '/compatible-mode/v1/systemone';
 export const MAX_QUESTIONS = 16;
 const PROVIDER_CONFIG = path.join(HOME, '.zcode', 'v2', 'provider_config.json');
 
-/** 八个任务类型的判据(与 modelRoute.mjs 的 TYPE_DEFS 同口径,措辞面向判定模型)。 */
+/** 三个任务类型的判据(2026-11-06 三档定稿,与 classify.mjs 语义三类同口径,措辞面向判定模型)。 */
 export const TYPE_CRITERIA = {
-  T1: '纯提问/解释/咨询,不改任何文件',
-  T2: '缺陷诊断:排查报错、异常、失效、不生效',
-  T3: '局部实现:在单点/少量文件上做具体改动',
-  T4: '重构/迁移/批量改造:跨模块或全项目范围的改动',
-  T5: '方案与规划:设计、选型、排期、技术方案',
-  T6: '代码审查:找问题、找隐患、评审',
-  T7: '写测试:单测、测试用例、覆盖率',
-  T8: '文档与杂务:提交代码、写文档、升级依赖、格式化',
+  multi: '多点改组:重构/迁移/批量改造、方案与规划/设计选型、跨模块或全项目范围的改动',
+  routine: '例行工作:缺陷诊断(报错/异常/失效)、局部实现(单点/少量文件改动)、代码审查、写测试',
+  light: '询问杂务:纯提问/解释/咨询不改任何文件,文档与杂务(提交/写文档/升级依赖/格式化)',
 };
 
 /** 决策模型名:配置 modelRouting.decisionModel.model 非空才认,缺省回内置 DECISION_MODEL。 */
@@ -175,71 +170,89 @@ export function parseAnswers(json, items = []) {
 }
 
 /**
- * 批量判定:一次请求并行判 N 条。fetchFn 可注入(测试)。
- * 返回 {answers:[...], usage, latencyMs, endpoint, error?}。
- */
-/**
- * 批量判定:一次请求并行判 N 条(超过分片大小自动分片,顺序发送;分片=显式参数 > 配置 chunkSize,默认 1)。
+ * 批量判定:分片并发(默认 2 路),分片=显式参数 > 配置 chunkSize(默认 1)。
+ * 超时是**每请求**一个 AbortController(2026-11-06 修:旧版整批共用 30s,chunk=1 下
+ * 300+ 候选 × ~270ms/请求必然撞穿 → abort → 全分片秒败 → 跳闸,决策票整轮归零);
+ * 单分片失败只跳过该分片(failedChunks 计数),**全部**分片失败才算 error;
+ * 429/503/网络抖动触发指数退避(最多 2 次、最长 400ms),降低并发下的限流失败率。
  * model(模型名)与 config(整个 loadConfig 形态)可注入;两者缺省都读 data/code-index.config.json
  * 的 modelRouting.decisionModel 段——providers 配了只走配置,model 空回内置 DECISION_MODEL。
- * fetchFn 可注入(测试)。返回 {answers:[...], usage, latencyMs, endpoint, error?}。
+ * fetchFn 可注入(测试)。返回 {answers:[...](按全局 id 排序), usage, latencyMs, endpoint, chunks, failedChunks, retriedChunks, error?}。
  */
-export async function judgeBatch({ items, criteria = TYPE_CRITERIA, provider = null, fetchFn = fetch, timeoutMs = 30000, endpoints = null, providers = null, chunkSize = null, model = null, config = null } = {}) {
+export async function judgeBatch({ items, criteria = TYPE_CRITERIA, provider = null, fetchFn = fetch, timeoutMs = 30000, endpoints = null, providers = null, chunkSize = null, model = null, config = null, concurrency = null, retries = 2, baseDelay = 150 } = {}) {
   if (!items || !items.length) return { answers: [], usage: null };
   const list = providers || (provider ? [provider] : decisionProviders({ config }));
   if (!list.length) return { answers: [], usage: null, error: '没有可用供应商(modelRouting.decisionModel.providers 配 baseUrl+apiKey,或在客户端配置带 key 的 Token Plan 供应商)' };
   const modelName = String(model || '').trim() || resolveDecisionModel(config);
   // 分片:显式参数 > 配置 chunkSize(默认 1,2026-11-03 实测定档:批量稀释置信)→ API 上限 MAX_QUESTIONS
   const effChunk = Number(chunkSize) > 0 ? Math.min(Math.floor(Number(chunkSize)), MAX_QUESTIONS) : decisionChunkSize(config);
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  const chunks = [];
+  for (let off = 0; off < items.length; off += effChunk) chunks.push(items.slice(off, off + effChunk));
+  const effConc = Math.max(1, Math.min(Math.floor(Number(concurrency)) > 0 ? Math.floor(Number(concurrency)) : 2, chunks.length));
   const started = Date.now();
   const all = [];
   let usage = null;
   let endpoint = null;
+  let failedChunks = 0;
+  let retriedChunks = 0;
   let lastErr = '';
-  try {
-    for (let off = 0; off < items.length; off += effChunk) {
-      const chunk = items.slice(off, off + effChunk);
-      const body = buildBody({ items: chunk, criteria, model: modelName });
-      let done = false;
-      for (const p of list) {
-        const cands = endpoints || endpointCandidates(p.baseUrl, p.path);
-        for (const url of cands) {
-          let res;
-          try {
-            res = await fetchFn(url, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json', authorization: `Bearer ${p.apiKey}` },
-              body: JSON.stringify(body),
-              signal: ctl.signal,
-            });
-          } catch { continue; }
-          const text = await res.text();
-          if (!res.ok) { lastErr = `HTTP ${res.status}: ${text.slice(0, 160)}`; continue; }
-          let json;
-          try { json = JSON.parse(text); } catch { lastErr = '响应非 JSON'; continue; }
-          const parsed = parseAnswers(json, chunk);
-          // HTTP 200 但解析不出任何答案 = 该网关并不是 systemone 宿主(200 包着错误体/别的形态)
-          // ⇒ 不能当成功(2026-11-03 实弹:token-plan 429 后滑到的网关 200+空形态,70 条全静默弃权),
-          // 记入 lastErr 继续试下一供应商。
-          if (!parsed.length) { lastErr = `HTTP 200 但无可解析答案(${String(text).slice(0, 80)})`; continue; }
-          // 把分片内的相对 id 还原成全局 id
-          for (const a of parsed) a.id = chunk[a.id - 1] ? chunk[a.id - 1].id : a.id;
-          all.push(...parsed);
-          if (json.usage) usage = { ...(usage || {}), input_tokens: (usage?.input_tokens || 0) + (json.usage.input_tokens || 0) };
-          endpoint = endpoint || url;
-          done = true;
-          break;
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  const runChunk = async (chunk, attempt = 0) => {
+    const body = buildBody({ items: chunk, criteria, model: modelName });
+    for (const p of list) {
+      const cands = endpoints || endpointCandidates(p.baseUrl, p.path);
+      for (const url of cands) {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), timeoutMs);
+        let res;
+        try {
+          res = await fetchFn(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', authorization: `Bearer ${p.apiKey}` },
+            body: JSON.stringify(body),
+            signal: ctl.signal,
+          });
+        } catch { clearTimeout(timer); lastErr = '请求异常/超时'; continue; }
+        clearTimeout(timer);
+        const text = await res.text();
+        // 限流/过载 → 指数退避后重试
+        if ((res.status === 429 || res.status === 503 || res.status >= 500) && attempt < retries) {
+          lastErr = `HTTP ${res.status}: ${text.slice(0, 160)}`;
+          retriedChunks += 1;
+          await sleep(baseDelay * (2 ** attempt));
+          return runChunk(chunk, attempt + 1);
         }
-        if (done) break;
+        if (!res.ok) { lastErr = `HTTP ${res.status}: ${text.slice(0, 160)}`; continue; }
+        let json;
+        try { json = JSON.parse(text); } catch { lastErr = '响应非 JSON'; continue; }
+        const parsed = parseAnswers(json, chunk);
+        // HTTP 200 但解析不出任何答案 = 该网关并不是 systemone 宿主(200 包着错误体/别的形态)
+        // ⇒ 不能当成功(2026-11-03 实弹:token-plan 429 后滑到的网关 200+空形态,70 条全静默弃权),
+        // 记入 lastErr 继续试下一供应商。
+        if (!parsed.length) { lastErr = `HTTP 200 但无可解析答案(${String(text).slice(0, 80)})`; continue; }
+        // 把分片内的相对 id 还原成全局 id
+        for (const a of parsed) a.id = chunk[a.id - 1] ? chunk[a.id - 1].id : a.id;
+        return { parsed, url, usage: json.usage || null };
       }
-      if (!done) return { answers: all, usage, latencyMs: Date.now() - started, endpoint, error: `分片(${chunk.length} 题)失败:${lastErr}` };
     }
-    return { answers: all, usage, latencyMs: Date.now() - started, endpoint };
-  } catch (e) {
-    return { answers: all, usage, latencyMs: Date.now() - started, error: String(e && e.message ? e.message : e) };
-  } finally { clearTimeout(timer); }
+    return null; // 该分片所有供应商/端点候选都失败 → 只跳过它,不算整批 error
+  };
+  let nextIdx = 0;
+  const workers = Array.from({ length: effConc }, async () => {
+    while (nextIdx < chunks.length) {
+      const chunk = chunks[nextIdx++];
+      const got = await runChunk(chunk);
+      if (!got) { failedChunks += 1; continue; }
+      all.push(...got.parsed);
+      if (got.usage) usage = { ...(usage || {}), input_tokens: (usage?.input_tokens || 0) + (got.usage.input_tokens || 0) };
+      endpoint = endpoint || got.url;
+    }
+  });
+  await Promise.all(workers);
+  all.sort((a, b) => a.id - b.id);
+  const base = { answers: all, usage, latencyMs: Date.now() - started, endpoint, chunks: chunks.length, failedChunks, retriedChunks };
+  if (!all.length) return { ...base, error: `全部 ${chunks.length} 个分片失败:${lastErr}` };
+  return base;
 }
 
 /** 便捷入口:给一批 prompt 直接判类型。 */
@@ -311,7 +324,7 @@ export async function reviewGolden({ dataDir = DATA_DIR, goldenFile = null, limi
     return { skipped: true, reason: `断路器开(${breaker.reason || '未知原因'})——不再尝试网关;人工 --probe 探活成功后恢复` };
   }
   const file = goldenFile || path.join(dataDir, 'routing', 'golden-set.jsonl');
-  let rows = readJsonl(file).filter((r) => /^T[1-8]$/.test(String(r.humanLabel || '')) && r.prompt);
+  let rows = readJsonl(file).filter((r) => (/^(multi|routine|light|T[1-8])$/.test(String(r.humanLabel || ''))) && r.prompt);
   if (limit > 0) rows = rows.slice(0, limit);
   if (!rows.length) return { skipped: true, reason: `无可复核的已签条目(${file})` };
   const dr = await classifyBatch(rows.map((r) => String(r.prompt)), { fetchFn });
