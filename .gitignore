@@ -18,3 +18,9 @@ hf-cache/
 
 # 动态模型路由设计决策与实施文档,仅本地维护不推送
 /model-routing.md
+
+# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
+/C:/Users/Administrator/AppData/Local/Temp/tmp.FEHZdy3OVr/
+
+# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
+/C:/Users/Administrator/AppData/Local/Temp/tmp.hyjiOVkAEd/

@@ -49,7 +49,7 @@ import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { blendedRate, loadModelPrices } from './costProfile.mjs';
-import { isAutoModelName, normalizeAutoModel } from './virtualProvider.mjs';
+import { isAutoModelName, normalizeAutoModel, resolveZcodeV2Dir } from './virtualProvider.mjs';
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -536,8 +536,13 @@ function readQoderProviders(home = HOME) {
   return out;
 }
 
-export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE } = {}) {
-  const pc = readJson(path.join(home, '.zcode', 'v2', 'provider_config.json'));
+export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE, zcodeV2Dir = null } = {}) {
+  // v2 目录定位(2026-11-07 路径自适应,**仅 ZCode 分支**):zcodeV2Dir 显式优先;
+  // home 缺省(=主目录,生产)走 resolveZcodeV2Dir 探测;home 显式非默认(测试)用旧拼接。
+  // Qoder 分支(readQoderProviders(home))零接触——Qoder 不参与 v2 数据路径迁移。
+  const v2Dir = zcodeV2Dir
+    || (home && home !== HOME ? path.join(home, '.zcode', 'v2') : resolveZcodeV2Dir().dir);
+  const pc = readJson(path.join(v2Dir, 'provider_config.json'));
   const old = readJson(outFile) || { providers: {} };
   const providers = {};
   const ingress = [];
@@ -545,7 +550,7 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE } = {}
   // 宿主 UI 供应商拖动序(2026-11-05):ZCode 把拖动结果存 config.providerOrder(数组即 UI 顺序);
   // Qoder 无拖动序,取 settings.json providers 的文件键序兜底。代理按宿主取用:同名模型取序 =
   // providerPriority(配置)优先,未进表者按此序——UI 把谁排前,冷却滑动就先耗谁的额度。
-  const qoderRules = readQoderProviders(home);
+  const qoderRules = readQoderProviders(home); // Qoder 端不参与 v2 数据路径迁移,恒用真实主目录(原样零改动)
   const providerOrder = {
     zcode: (Array.isArray(pc?.config?.providerOrder) ? pc.config.providerOrder : []).map(String).filter(Boolean),
     qoder: qoderRules.map((r) => r.providerId),

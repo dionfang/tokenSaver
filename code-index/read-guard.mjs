@@ -131,6 +131,9 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
  *  命中两类:①git clean 带 -x/-X(会连带删掉被 gitignore 的 data/ab);②递归删除命中 data/ab 或其父目录 data。 */
 const PROTECTED_DATA = /(^|[\\/])test([\\/])ab([\\/]|$)/i;
 const RM_CMDS = /^(?:rm|rmdir|del|erase|remove-item)$/i;
+/** 宿主工具输出截断阈值(ZCode persisted-output >32KB 存盘只给 2KB 预览;Qoder/Cursor 近似同量级):
+ *  Bash 拦截记账的节约上限——放行时宿主也会截断,超过它的部分不算"省下的"。 */
+const HOST_OUTPUT_CAP_BYTES = 32 * 1024;
 
 function expandTarget(t, cwd) {
   let s = String(t || '').trim().replace(/^["']|["']$/g, '');
@@ -264,6 +267,20 @@ export function resolveReadMaxLines() {
   return DEFAULT_CONFIG.readMaxLines;
 }
 
+/**
+ * 护栏面与索引面统一(2026-11-07 用户定案):**只有 exts 白名单内的文本类型才做全量 Read 拦截与记账**;
+ * 白名单外(图片/二进制/未收录类型)一律直接放行——它们不在索引口径里,按文本 bytes/4 折算记账必然失真
+ * (实弹:3MB jpg 曾记 78.6 万×放大=2038 万虚账;图片走宿主视觉通道真实成本千级)。
+ * 运行时读 data JSON 覆盖(与 resolveReadMaxLines 同模式),缺省回落 DEFAULT_CONFIG.exts。
+ */
+export function resolveGuardExts() {
+  try {
+    const j = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    if (Array.isArray(j.exts) && j.exts.length) return new Set(j.exts.map((s) => String(s).toLowerCase().replace(/^\./, '')));
+  } catch { /* 缺文件或坏 JSON:用默认 */ }
+  return new Set(DEFAULT_CONFIG.exts);
+}
+
 /** Grep 补封顶上限:写死,不走配置(防大仓库匹配倾倒;PreToolUse 拿不到结果量,此路不记账)。 */
 export const GREP_HEAD_LIMIT = 100;
 
@@ -337,6 +354,19 @@ function saveDenials(convId, denials) {
   fs.writeFileSync(statePath(convId), JSON.stringify({ denials }));
 }
 
+/** 二进制嗅探:前 8KB 含 NUL 字节即判二进制(任何文本编码都绝无 NUL;UTF-16 文件不在索引白名单,可接受)。
+ *  仅对 exts 白名单内的文件兜底(名义 .json/.xml 实为二进制的边缘);白名单外已在入口统一放行。 */
+function isBinaryFile(file, size) {
+  if (!(Number(size) > 0)) return false;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(Math.min(Number(size), 8192));
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.slice(0, n).includes(0);
+  } catch { return false; } finally { if (fd != null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+}
+
 function countLines(file, size) {
   if (size > HUGE_BYTES) return Math.ceil(size / 40);
   const content = fs.readFileSync(file, 'utf8');
@@ -397,11 +427,16 @@ async function bashGuard(input, dialect) {
   const denials = loadDenials(convId);
   const key = catDumpPieces(cmd).join(' && ');
   const stats = [];
+  const guardedExts = resolveGuardExts();
   const statFile = (f) => {
     const abs = path.isAbsolute(f) ? f : path.resolve(cwd, f);
+    // 白名单统一(2026-11-07):cat 图片/二进制/未收录类型不进文本行数闸与记账——
+    // 二进制的"行数"本就是乱码,判定失真;记账口径也只对索引面内的文本成立。
+    if (!guardedExts.has(path.extname(abs).slice(1).toLowerCase())) return null;
     let st;
     try { st = fs.statSync(abs); } catch { return null; }
     if (!st.isFile()) return null;
+    if (isBinaryFile(abs, st.size)) return null;
     let lines;
     try { lines = countLines(abs, st.size); } catch { return null; }
     const s = { file: abs, size: st.size, lines };
@@ -422,7 +457,10 @@ async function bashGuard(input, dialect) {
     return emit(dialect, 'allow');
   }
   if (decision.permission !== 'deny' || !key) return emit(dialect, 'allow');
-  const size = stats.reduce((n, s) => n + s.size, 0);
+  // 记账口径(2026-11-07 修 Bash 侧虚高):宿主对 >32KB 的工具输出做 persisted-output 存盘只给
+  // 2KB 预览——即使放行,全文也不会进上下文,拦截的真实节约上限是宿主截断阈值,不是文件全量。
+  // 记账 = min(文件合计, 32KB);行数闸(totalLines)判定不受影响。
+  const size = Math.min(stats.reduce((n, s) => n + s.size, 0), HOST_OUTPUT_CAP_BYTES);
   const msg = bashOversizeGuidance({
     files: decision.files,
     lines: stats.reduce((n, s) => n + s.lines, 0),
@@ -476,6 +514,13 @@ export async function runReadGuard({ stdinText } = {}) {
     return emit(dialect, 'allow');
   }
   if (!st.isFile()) return emit(dialect, 'allow');
+
+  // 白名单统一(2026-11-07 用户定案):exts 外的文件类型不做全量 Read 拦截/记账——图片走宿主视觉通道
+  // (真实成本视觉 token 千级,按文本 bytes/4 折算曾放大两个数量级:3MB jpg=78.6 万×25 请求=2038 万虚账),
+  // 二进制/未收录类型同理不在索引口径。放行不计账不留痕——文本节约口径只对 exts 内的文本文件成立。
+  // 白名单内仍保留 NUL 嗅探兜底(名义 .json/.xml 实为二进制的文件)。
+  if (!resolveGuardExts().has(path.extname(file).slice(1).toLowerCase())) return emit(dialect, 'allow');
+  if (isBinaryFile(file, st.size)) return emit(dialect, 'allow');
 
   const convId = input.conversation_id || input.session_id || 'unknown';
   const now = Date.now();

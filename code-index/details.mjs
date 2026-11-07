@@ -9,14 +9,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, DATA_DIR } from './config.mjs';
+import { loadKnownAnnotations, DATA_DIR } from './config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const chunks = fs.readFileSync(path.join(DATA_DIR, 'chunks.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
 const idx = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'index.json'), 'utf8'));
 
-// 关键文件用途注解:来自 code-index.config.json 的 knownAnnotations(随项目配置迁移)
-const KNOWN = loadConfig().knownAnnotations;
+// 关键文件用途注解(2026-11-07 拆出 config):独立文件 data/known-annotations.json
+const KNOWN = loadKnownAnnotations();
 
 // 聚合:file → 排序去重符号
 const byFile = new Map();

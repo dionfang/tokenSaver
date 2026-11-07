@@ -51,7 +51,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot } from './config.mjs';
+import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot, KNOWN_ANNOTATIONS_PATH, loadKnownAnnotations } from './config.mjs';
 import { localOnnxCached } from './localRerank.mjs';
 import { spawnLogged } from './proc.mjs';
 
@@ -140,6 +140,31 @@ export function splitRoots(raw) {
 export function rollKnownAnnotations(prev, rootsChanged) {
   if (!prev || typeof prev !== 'object' || Array.isArray(prev)) return {};
   return rootsChanged ? {} : prev;
+}
+
+/**
+ * knownAnnotations 迁移(2026-11-07 用户拍板:注解库拆出 config,独立 data/known-annotations.json):
+ * 旧 config 键存在 ⇒ 条目并入新文件(新文件已有条目优先,旧条目补缺),然后从 config 删键。
+ * 幂等:config 无该键时零动作。纯 I/O 在调用方(init 主流程),本函数可测。
+ */
+export function migrateKnownAnnotations(cfgOld, annFile = KNOWN_ANNOTATIONS_PATH) {
+  const old = cfgOld && cfgOld.knownAnnotations;
+  if (old === undefined) return { migrated: 0, removedKey: false };
+  if (!old || typeof old !== 'object' || Array.isArray(old) || !Object.keys(old).length) {
+    delete cfgOld.knownAnnotations;
+    return { migrated: 0, removedKey: true };
+  }
+  let cur = {};
+  try {
+    const j = JSON.parse(fs.readFileSync(annFile, 'utf8'));
+    if (j && typeof j === 'object' && !Array.isArray(j)) cur = j;
+  } catch { cur = {}; }
+  let added = 0;
+  for (const [k, v] of Object.entries(old)) if (!(k in cur)) { cur[k] = v; added += 1; }
+  fs.mkdirSync(path.dirname(annFile), { recursive: true });
+  fs.writeFileSync(annFile, JSON.stringify(cur, null, 2) + '\n');
+  delete cfgOld.knownAnnotations;
+  return { migrated: added, removedKey: true, total: Object.keys(cur).length };
 }
 
 function posixAbs(p) {
@@ -375,6 +400,13 @@ const chosenBackend = modelInArg || 'local';
 if (configExisted) {
   const cfgOld = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   let dirty = false;
+  // knownAnnotations 迁移(2026-11-07):旧 config 键 → data/known-annotations.json(幂等,无键零动作)。
+  // 必须先于 roots 逻辑:roots 变化会重置注解库,先迁移才不会丢掉旧 config 里的沉淀。
+  const annMig = migrateKnownAnnotations(cfgOld);
+  if (annMig.removedKey) {
+    dirty = true;
+    ok(`knownAnnotations 已迁出 config → data/known-annotations.json(并入 ${annMig.migrated} 条,库内共 ${annMig.total ?? 0} 条)`);
+  }
   if (rootsArg) {
     const added = takeExistingRoots(rootsArg);
     if (!added.length && !(cfgOld.roots || []).length) {
@@ -384,16 +416,18 @@ if (configExisted) {
     roots = mergeRoots(cfgOld.roots || [], added);
     if (JSON.stringify(roots) !== JSON.stringify(cfgOld.roots || [])) {
       cfgOld.roots = roots;
-      const prevAnn = cfgOld.knownAnnotations;
-      cfgOld.knownAnnotations = rollKnownAnnotations(prevAnn, true);
-      if (prevAnn && typeof prevAnn === 'object' && !Array.isArray(prevAnn) && Object.keys(prevAnn).length) {
-        ok(`roots 已变化,knownAnnotations 整表重置(${Object.keys(prevAnn).length} 条旧注解只对原 roots 有效)`);
+      // roots 变化 ⇒ 注解库整表重置(2026-11-07 起作用于独立文件,不再在 config 里)
+      const prevAnn = loadKnownAnnotations();
+      const rolled = rollKnownAnnotations(prevAnn, true);
+      if (Object.keys(prevAnn).length) {
+        fs.writeFileSync(KNOWN_ANNOTATIONS_PATH, JSON.stringify(rolled, null, 2) + '\n');
+        ok(`roots 已变化,known-annotations.json 整表重置(${Object.keys(prevAnn).length} 条旧注解只对原 roots 有效)`);
       }
       dirty = true;
       ok(`已纳入 roots = ${JSON.stringify(roots)}`);
     } else {
       roots = cfgOld.roots || [];
-      ok(`roots 未变化,knownAnnotations 增量保留 ${JSON.stringify(roots)}`);
+      ok(`roots 未变化,known-annotations.json 增量保留 ${JSON.stringify(roots)}`);
     }
   } else {
     roots = healRoots(cfgOld.roots || [], {
@@ -442,18 +476,25 @@ if (configExisted) {
       process.exit(1);
     }
   } else {
-    roots = [hostRoot];
+    // 首装不带 --roots(2026-11-07 用户定案):roots 留空完成安装(钩子/配置/纪律段全就位),
+    // 索引面等用户配置项目目录后重跑 init 或 build 再建——成功框会给出配置指引。
+    roots = [];
+    ok('未传 --roots:roots 置空完成安装(钩子与配置已就位);请在 data/code-index.config.json 的 roots 填入项目目录后重跑 node init.mjs(见下方提示框)');
   }
-  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。knownAnnotations: 首装为空;init --roots 使 roots 变化时整表重置,--roots 未变或未传则原样保留,由深挖后手工追加。';
+  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。knownAnnotations 已拆出本文件(2026-11-07):独立存 data/known-annotations.json,首装为空;init --roots 使 roots 变化时整表重置,未变则原样保留,由深挖后手工追加。';
   const skipDirs = [...new Set([...DEFAULT_CONFIG.skipDirs, path.basename(here), 'code-index', '.cursor', '.zcode', '.qoder'])];
   fs.writeFileSync(configPath, JSON.stringify({
     $说明: desc,
     roots,
     skipDirs,
     modelIn: chosenBackend,
-    knownAnnotations: {},
     modelRouting: modelRoutingScaffold(),
   }, null, 2));
+  // 注解库独立文件(2026-11-07 拆出 config):首装建空表,已有则不动(增量沉淀)
+  if (!fs.existsSync(KNOWN_ANNOTATIONS_PATH)) {
+    fs.mkdirSync(path.dirname(KNOWN_ANNOTATIONS_PATH), { recursive: true });
+    fs.writeFileSync(KNOWN_ANNOTATIONS_PATH, '{}\n');
+  }
   ok(`已生成,roots = ${JSON.stringify(roots)},嵌入路径 = ${chosenBackend};skipDirs 含内置默认 + "code-index"(hub 模式下由 build 放行工具目录)`);
 }
 if (!configExisted || modelInArg) {
@@ -1015,7 +1056,7 @@ export function disciplineBlock({ rel, dataRel, packed = false }) {
     P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 与 Bash 里 cat 整读大文件都会被钩子拦下:三端的全量 Read 都默认改写为语义最相关区间(按提问选段),选不出区间才拒绝(拒绝信息自带检索/区间读/grep 替代方案);改走检索+区间读;同一目标 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
     P(4, pathHint),
     P(5, '**模型状态提示(整句照抄,禁止截短)**:每轮 UserPromptSubmit 会注入一句 `[code-index] 状态(本轮实时值,回复末尾原样附上):⚙ …`;轮内工具执行后可能再用同一句式注入更新的一条(此时句首已是本轮实际调用的模型,数字也已结算)。把其中 ⚙ 开头的**整句**原样附在每次回复末尾——从 ⚙ 一直到句末,包括句首的"【当前远程模型名】"段(该会话最近一轮实际服务的远程模型;查无记录时该段省略)与"今日累计节约 … tokens，总计节约 … tokens"两段,一个字都不能省;只抄前半句、截掉数字段、或沿用前几轮数字都算违规。**以最新注入的那一条为准**,会话开始时注入的那句仅作首轮兜底。该句只含:句首【当前远程模型名】、是否启动成功、嵌入模型名与精排模型名、失败时的最可能原因,或成功时今日累计/总计两个 tokens 数(总计为全历史日求和)。不要加长、不要改写、不要拼接不同轮次的片段;没有这句输出时不得虚构'),
-    P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/code-index.config.json` 的 knownAnnotations 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后校验 JSON 合法'),
+    P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/known-annotations.json` 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后校验 JSON 合法'),
     P(7, '**提交后保鲜**:执行 `git commit` 后,运行 `' + autoCmd + '`(HEAD 没变秒级跳过;有变更时 build 内联约 10s+嵌入转后台)——有 PostToolUse hook 的环境已自动做,重复触发零成本'),
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
     P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
@@ -1027,6 +1068,8 @@ export function disciplineBlock({ rel, dataRel, packed = false }) {
 }
 
 if (directRun) {
+let currentStep = 'parse-args';
+try {
 const hookArg = parseInitArgs(args).hooks;
 const hookTools = resolveHookTargets(hookArg);
 {
@@ -1046,6 +1089,7 @@ function wireRepo(root) {
 }
 
 // 宿主仓库 + config 实际生效的每个 root(去重);root 不是 git 仓库(纯目录)则只索引不接线
+currentStep = 'wire-repos(接线各仓库 hooks + AGENTS.md)';
 const effRoots = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8')).roots || []; }
   catch { return []; }
@@ -1064,8 +1108,10 @@ for (const r of wireRoots) {
 }
 
 // 钩子本体统一装在用户级:所有工作区共享一份,绝对路径直指本模块,不依赖各仓的 workspace 信任审批
+currentStep = 'user-hooks(用户级钩子接线)';
 log(`\n[user] 用户级钩子接线(${hookTools.join(', ')})`);
 if (hookTools.includes('zcode')) {
+  currentStep = 'zcode-virtual-entry(ZCode auto 档播种)';
   rewriteZcodeUserHooks();
   // autoName 不传(2026-11-07 定影语义):现有 auto 系名原样保持,改名权只在会话开启钩子
   const vp = ensureVirtualProviderEntry();
@@ -1073,6 +1119,7 @@ if (hookTools.includes('zcode')) {
   if (!vp.seeded && !vp.refreshed) console.log(`  [note] 虚拟供应商 tokenSaverModel:${vp.note}`);
 }
 if (hookTools.includes('qoder')) {
+  currentStep = 'qoder-virtual-entry(Qoder auto 档播种)';
   // Qoder 接入(2026-11-02 用户实测:自定义模型可写用户级 settings.json):播种 tokensaver-auto
   // 虚拟条目(单 auto 档,同 ZCode 策略);快照/清单同步由 snapshot-refresh 双端共用。
   // 双端隔离(2026-11-04 用户定档):Qoder 走宿主专属前缀 /apps/qoder——代理按前缀判宿主,
@@ -1083,12 +1130,69 @@ if (hookTools.includes('qoder')) {
 if (hookTools.includes('cursor')) rewriteCursorUserHooks();
 if (hookTools.includes('qoder')) rewriteQoderUserHooks();
 
-log(`\n============ 初始化完成 ============`);
-// CODE_MAP 模板(项目资产,位于 data/;已存在则不动)
+currentStep = 'code-map(CODE_MAP 模板)';
+log(`\n============ 初始化完成 ============`);// CODE_MAP 模板(项目资产,位于 data/;已存在则不动)
 const codeMapPath = path.join(DATA_DIR, 'CODE_MAP.md');
 if (!fs.existsSync(codeMapPath)) {
   fs.writeFileSync(codeMapPath, `# CODE_MAP —— 项目代码知识地图(由 agent 在深挖中持续维护)\n\n> 用法:先读本文获得全局背景 → node search.mjs 检索定位 → 按行区间精读。\n> 建议内容:项目架构图、核心链路、关键文件职责、已知问题速查。\n\n(模板生成于 ${new Date().toISOString().slice(0, 10)};请按项目实际逐步充实,knownAnnotations 同步沉淀)\n`);
   ok(`已生成 CODE_MAP 模板:${codeMapPath}(请逐步充实)`);
 }
-log(`提示:项目资产在 ${DATA_DIR}(config/CODE_MAP/索引)。Ollama/local 模型权重不随本目录复制。`);
+log(`提示:项目资产都在 ${DATA_DIR} 目录下——配置 code-index.config.json、知识地图 CODE_MAP.md、索引 chunks.jsonl/index.json/vectors/(向量)。Ollama/local 模型权重不随本目录复制。`);
+// 结果框(2026-11-07 用户要求):顶部大字安装结果 + v2Dir 重要提示。
+// ZCode 数据存储路径可在其设置里修改,迁移是复制不是移动——旧 ~/.zcode/v2 文件仍在但不再更新,
+// 快照/auto 播种会读到陈旧数据。醒目告知用户改 v2Dir。
+// roots 终态从盘上 config 读(本块与 roots 决策块是两个独立 directRun 作用域,变量不互通;
+// config 在上一块已写盘,读盘即最终态)
+const rootsEmptyNow = (() => {
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8'));
+    return !(Array.isArray(c.roots) && c.roots.length);
+  } catch { return false; }
+})();
+printResultBox(null, { rootsEmpty: rootsEmptyNow });
+} catch (e) {
+  console.error(`\n[err] 安装中断于环节「${currentStep}」: ${e && e.message ? e.message : e}`);
+  if (e && e.stack) console.error(e.stack.split('\n').slice(1, 4).join('\n'));
+  printResultBox(currentStep);
+  process.exit(1);
+}
+}
+
+/** 安装结果框(成功=█ 块大字"安装成功";失败=✖ 大字"安装失败"+环节)。72 列等宽;
+ *  中文按 2 列手工对齐(padEnd 按字符数算会在宽字符行溢出)。
+ *  opts.rootsEmpty(2026-11-07 首装免 roots):成功框追加"配置项目目录"指引段。 */
+function printResultBox(failedStep, opts = {}) {
+  const W = '*'.repeat(72);
+  const blank = '*' + ' '.repeat(70) + '*';
+  if (failedStep) {
+    console.error(W);
+    console.error(blank);
+    console.error('*   ✖✖✖  安 装 失 败  ✖✖✖' + ' '.repeat(47) + '*');
+    console.error(('*   失败环节: ' + String(failedStep).slice(0, 40)).padEnd(71, ' ') + '*');
+    console.error(blank);
+    console.error(W);
+    console.error('*   排查后重跑 node init.mjs(幂等);仍失败请把上方 [err] 反馈维护者' + ' '.repeat(8) + '*');
+    console.error(W);
+  } else {
+    log(W);
+    log(blank);
+    log('*   ███  安 装 成 功  ███   (dionfang/TokenSaver)' + ' '.repeat(22) + '*');
+    log(blank);
+    log(W);
+    if (opts.rootsEmpty) {
+      log('*  下一步(必做):roots 当前为空,索引尚未覆盖任何项目——请编辑' + ' '.repeat(9) + '*');
+      log(('*  ' + DATA_DIR + path.sep + 'code-index.config.json').padEnd(71, ' ') + '*');
+      log('*  的 "roots": [] 填入您的项目目录(可多个),例如:' + ' '.repeat(21) + '*');
+      log('*    "roots": ["D:/HbuilderX-Project/my-app", "D:/work/shop"]' + ' '.repeat(11) + '*');
+      log('*  然后重跑 node init.mjs(纳入索引+接线各仓钩子与 AGENTS.md)。' + ' '.repeat(10) + '*');
+      log(W);
+    }
+    log('*  重要:如果您在 ZCode 设置中修改过「数据存储路径」,请编辑' + ' '.repeat(15) + '*');
+    log(('*  ' + DATA_DIR + path.sep + 'code-index.config.json').padEnd(71, ' ') + '*');
+    log('*  中的根级字段  "v2Dir": ""  ,填入迁移后的实际数据路径' + ' '.repeat(17) + '*');
+    log('*  (示例:"v2Dir": "D:/hello/.zcode/v2"),然后重启 ZCode。' + ' '.repeat(13) + '*');
+    log('*  不填写则按默认 ~/.zcode/v2 读取——迁移后那里是陈旧副本,' + ' '.repeat(11) + '*');
+    log('*  会导致 auto 档快照为空、模型清单缺失。' + ' '.repeat(29) + '*');
+    log(W);
+  }
 }

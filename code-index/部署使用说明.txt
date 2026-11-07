@@ -70,7 +70,9 @@ TokenSaver 部署使用说明
   exts                收录的扩展名
   jsonWhitelist       允许收录的 json 文件名
   maxFileBytes        单文件上限(默认 819200)
-  readMaxLines        整文件 Read 行数上限(默认 500,设很大等于关闭拦截)
+  readMaxLines        整文件 Read 行数上限(默认 500,设很大等于关闭拦截);
+                    护栏面与索引面统一:只对 exts 白名单内类型拦截记账,
+                    白名单外(图片/二进制/未收录)直接放行不计入节约口径
   chunk               分块参数(targetLines/maxLines/overlapLines/minTail)
   staleNonGitMs       非 git 目录重建间隔(默认 86400000 毫秒)
   knownAnnotations    "项目名/相对路径" → 一句职责说明
@@ -201,7 +203,9 @@ Project-level fields (data/code-index.config.json):
   exts                file extensions to index
   jsonWhitelist       json filenames allowed into the index
   maxFileBytes        per-file size cap (default 819200)
-  readMaxLines        full-file Read line cap (default 500; a huge value disables it)
+  readMaxLines        full-file Read line cap (default 500; a huge value disables it);
+                    guard scope equals index scope: only exts-whitelisted types
+                    are intercepted/accounted, others pass through untallied
   chunk               chunking parameters (targetLines/maxLines/overlapLines/minTail)
   staleNonGitMs       non-git rebuild interval (default 86400000 ms)
   knownAnnotations    "project/relative-path" → one-line description

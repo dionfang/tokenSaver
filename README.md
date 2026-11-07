@@ -18,7 +18,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 #### 省耗记账(要点)
 
 - 混合检索:BM25 词法 + 向量余弦;需要更准再加 `--rerank`;嵌入拉起失败自动降为纯 BM25。嵌入默认 local(transformers.js),可选 `--model-in ollama`。
-- 读取守卫:整文件 Read 超过 `readMaxLines`(默认 500)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。Cursor 的 preToolUse 用字面 matcher。
+- 读取守卫:整文件 Read 超过 `readMaxLines`(默认 500)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。**护栏面与索引面统一(2026-11-07)**:只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制/未收录类型)直接放行不计入节约口径(图片走宿主视觉通道,真实成本是视觉 token)。Cursor 的 preToolUse 用字面 matcher。
 - 索引保鲜:git 仓库按 HEAD 判断过期;非 git 目录默认 24 小时重建。
 - 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次(下限口径,真实节约随后续轮数复利);状态句实时展示今日/累计。
 
@@ -183,7 +183,7 @@ Built for agent-based development on local repositories. One TokenSaver can inde
 #### Token Ledger (key points)
 
 - Hybrid search: BM25 lexical + vector cosine; add `--rerank` for tighter ranking; falls back to BM25-only if the embedding model fails to start. Embedding defaults to local (transformers.js), optionally `--model-in ollama`.
-- Read guard: a full-file Read past 1.25 × `readMaxLines` (default 500) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. Cursor's preToolUse uses literal matchers.
+- Read guard: a full-file Read past 1.25 × `readMaxLines` (default 500) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. **Guard scope equals index scope (2026-11-07)**: only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries/unlisted types) passes through without entering the savings ledger (images go through the host vision channel — real cost is vision tokens). Cursor's preToolUse uses literal matchers.
 - Index freshness: git repositories go stale by HEAD; non-git directories rebuild every 24 hours by default.
 - Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point (a lower bound; real savings compound over later turns); the status line shows today/cumulative live.
 

@@ -4,7 +4,9 @@
  *     改完随 git 可见,协作排查时打开本文件即可。单次命令仍可用 CLI(--rr-model)。嵌入模型名与 ollamaBase 不接受命令行覆盖。
  *   modelIn:init.mjs --model-in > code-index.config.json > 内置默认 local
  *   roots:init --roots 与已有合并(纳入);无参数重跑只读本文件并自愈。运行时 env(CODE_INDEX_ROOTS) 仍可临时盖掉。内置默认空。
- *   skipDirs/exts/chunk/knownAnnotations/staleNonGitMs/readMaxLines:code-index.config.json > 内置默认(无 env/CLI)
+ *   skipDirs/exts/chunk/staleNonGitMs/readMaxLines:code-index.config.json > 内置默认(无 env/CLI)
+ *   knownAnnotations(2026-11-07 拆出):**独立文件 data/known-annotations.json**(不再存 config),
+ *     loadKnownAnnotations() 读取;init 负责旧 config 键的一次性迁移与 roots 变化时的整表重置。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -78,6 +80,16 @@ export const HF_CACHE_DIR = layout.hfCacheDir;
 export const PACKED_INSTALL = layout.packed;
 /** 项目配置:位于项目资产目录(随 data 走,不随模块复制) */
 export const CONFIG_PATH = path.join(DATA_DIR, 'code-index.config.json');
+/** 关键文件注解库(2026-11-07 自 config 拆出):独立 JSON,顶层即 {路径: 注解} 映射。 */
+export const KNOWN_ANNOTATIONS_PATH = path.join(DATA_DIR, 'known-annotations.json');
+
+/** 读注解库:缺失/坏 JSON/非对象回落 {}(只读展示面,不值得硬失败)。 */
+export function loadKnownAnnotations(file = KNOWN_ANNOTATIONS_PATH) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : {};
+  } catch { return {}; }
+}
 /**
  * Ollama 加载参数。warm、search、embed 必须用同一组:
  * 换 num_ctx 会重载模型,更短的 keep_alive 会把预热的 2 小时驻留改掉。
@@ -97,7 +109,7 @@ export function gitHeadOf(dir) {
 export const DEFAULT_CONFIG = {
   roots: [],
   skipDirs: ['node_modules', '.git', 'unpackage', 'dist', 'dist-dev', 'dist-pro', 'public', 'coverage', '.husky', '.vscode', '.cache', 'mock', 'plop', 'uni_modules', 'static', 'uploadAvatar', '.uni', '.idea'],
-  exts: ['js', 'mjs', 'cjs', 'ts', 'tsx', 'vue', 'scss', 'css', 'less', 'html', 'sql', 'wxs'],
+  exts: ['js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte', 'scss', 'css', 'less', 'html', 'sql', 'wxs', 'json', 'md', 'txt', 'rst', 'yaml', 'yml', 'toml', 'ini', 'xml', 'properties', 'gradle', 'conf', 'py', 'java', 'kt', 'go', 'rs', 'php', 'rb', 'c', 'h', 'cpp', 'hpp', 'cs', 'swift', 'dart', 'scala', 'sh', 'bash', 'zsh', 'ps1', 'bat', 'cmd', 'graphql', 'gql', 'proto'],
   jsonWhitelist: ['package.json', 'pages.json', 'manifest.json', 'tsconfig.json'],
   maxFileBytes: 800 * 1024,
   // Cursor 全量 Read 行数上限。超过 ×1.25 由 preToolUse 拦截;带 offset/limit 的区间读不受限。
@@ -122,7 +134,6 @@ export const DEFAULT_CONFIG = {
   modelIn: 'local', // ollama | local。data JSON 可覆盖;缺省或非法值按 local。
   ollamaBase: 'http://localhost:11434',
   gpu: 'auto', // auto=按显存判定;cpu / gpu=强制。改这里,不要设环境变量。
-  knownAnnotations: {},
   // 多模型路由门控(model-routing.md #11):默认全关。enabled=true 后 prompt-guard 才跑 L1 分类+路由日志;
   // 二次人工配置:改 data/code-index.config.json 的 modelRouting 段(2026-11-03 起 role 两档制已废:routeMode/roles/chains
   // 均不再被读取,四档链恒由快照派生;providerPriority/brandPriority 仍生效)。
