@@ -11,7 +11,7 @@
  * 所以"escalated 的那一轮"就是**低档确实干不动**的直接证据 ⇒ 真值 = 上梯后的那一档。
  * R4 真值只认"用户显式点名旗舰/客户端选定的模型本身就在 R4 档"这类用户侧事实,词法永远给不出 R4 真值。
  */
-import { TIER_FROM_TYPE } from './tierClassify.mjs';
+import { TIER_FROM_TYPE, TIER_FROM_INTENSITY } from './tierClassify.mjs';
 
 const TIERS = ['R1', 'R2', 'R3', 'R4'];
 const ESC_NEXT = { R1: 'R2', R2: 'R3', R3: null, R4: null };
@@ -53,7 +53,7 @@ export function deriveTierTruth(ev = {}) {
   if (errors !== null && errors >= 2 && (writes === 0 || writes <= 2)) {
     return { tier: 'R2', confidence: 0.65, rule: `troubleshoot-shape(e${errors})` };
   }
-  if ((writes !== null && writes >= 3) || (calls !== null && calls >= 12)) {
+  if ((writes !== null && writes >= 3) || (calls !== null && calls >= 15)) {
     return { tier: 'R2', confidence: 0.6, rule: `heavy-shape(c${calls ?? '-'}w${writes ?? '-'})` };
   }
   if ((calls === null || calls <= 2) && writes === 0) return { tier: 'R1', confidence: 0.85, rule: 'answer-only' };
@@ -63,20 +63,38 @@ export function deriveTierTruth(ev = {}) {
   return { tier: null, confidence: 0, rule: 'inconclusive-shape' };
 }
 
-/** T→R 设计映射口径的 R 真值(现网 --score-golden-tier 用的就是它)。 */
+/** T→R 设计映射口径的 R 真值(旧口径;现网优先走强度轴,见 tierTruthFromAxes)。 */
 export function truthFromType(row = {}) {
   return TIER_FROM_TYPE[String(row.humanLabel || '')] || null;
 }
 
 /**
+ * 双轴 → R 真值(2026-11-06 现网口径):**语义轴优先**,强度轴仅作回落。
+ * 为什么语义轴优先:R 档问的是"这件事需要多强的能力",与**意图形态**(多点改组⇒慎重档)同源;
+ *   强度轴量的是"这轮实际干了多重的活"(结果侧)——活多不等于要强模型(读 15 个文件的轮照样 R1)。
+ *   实测(当前黄金集 172 行):语义轴派生 R 真值 acc 0.767,强度轴派生只有 0.671 ⇒ 强度轴派生会**变差**,不采用。
+ *   强度轴的正当用途是"实际行为成本度量"(跨档占比/漏升返工),不是"应该需要哪一档"。
+ * 兼容:两轴都缺 ⇒ null(该行不进量尺)。
+ */
+export function tierTruthFromAxes(row = {}) {
+  const sem = String(row.semanticType || row.humanLabel || '');
+  if (TIER_FROM_TYPE[sem]) return { tier: TIER_FROM_TYPE[sem], source: 'semantic' };
+  const inten = row.intensityType ? String(row.intensityType) : null;
+  if (inten && TIER_FROM_INTENSITY[inten]) return { tier: TIER_FROM_INTENSITY[inten], source: 'intensity' };
+  return { tier: null, source: null };
+}
+
+/**
  * 双通道并排:返回 {behavior, map, agree, tier}(tier 取"用哪条做优化目标"的那条,默认行为侧)。
  * 两条都缺 ⇒ tier=null,该行不进量尺。
+ * 2026-11-06 双轴:map 通道改走**强度轴优先**(tierTruthFromAxes)——语义轴被当强度用会把 R2 门禁压到 0.362。
  */
 export function reconcile(row = {}, { prefer = 'behavior' } = {}) {
   const behavior = deriveTierTruth(evidenceOf(row));
-  const map = truthFromType(row);
+  const axes = tierTruthFromAxes(row);
+  const map = axes.tier;
   const agree = !!(behavior.tier && map) ? behavior.tier === map : null;
   const tier = prefer === 'map' ? (map || behavior.tier || null) : (behavior.tier || map || null);
-  const source = tier && tier === behavior.tier ? (map ? (agree ? 'both' : 'behavior') : 'behavior') : (tier ? 'map' : null);
-  return { behavior: behavior.tier, behaviorRule: behavior.rule, behaviorConfidence: behavior.confidence, map, agree, tier, source };
+  const source = tier && tier === behavior.tier ? (map ? (agree ? 'both' : 'behavior') : 'behavior') : (tier ? `map:${axes.source}` : null);
+  return { behavior: behavior.tier, behaviorRule: behavior.rule, behaviorConfidence: behavior.confidence, map, mapSource: axes.source, agree, tier, source };
 }

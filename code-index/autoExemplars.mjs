@@ -143,8 +143,10 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     }
     const primary = loadPool(path.join(dataDir, 'routing', 'raw-labels.jsonl')).pool;
     const extra = toPoolRows(labels);
-    // 自动代签的标签回流样本库(2026-11-02 补分发链路):L2 向量空间原先只学"行为形态"标签,
-    // 而行为票是最粗的一票;代签标签是四票合议,更准 ⇒ 让 L2 也学它(与行为标签同 prompt 去重,代签优先)。
+    // 自动代签的标签回流样本库(2026-11-02 补分发链路;2026-11-06 修优先级倒置):L2 向量空间原先只学
+    // "行为形态"标签;代签标签是四票合议,更准 ⇒ 同 prompt 去重**代签排最前**(mergePools 先到先得)。
+    // 旧实现把 raw 弱标签放 primary 位,172 条代签只有 4-5 条进库(97% 被去重+120/类配额掐断),
+    // "进化回路"两端皆断——现 signed → raw → routing-log 三级优先,配额内代签先占位。
     const signedPool = signedRows.map((s) => ({
       id: `as-${String(s.pkey || s.prompt || '').slice(0, 12)}`,
       project: s.project || 'TokenSaver',
@@ -155,7 +157,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       writeEdits: s.evidence && s.evidence.writeEdits,
       source: 'auto-signed',
     }));
-    const merged = mergePools(primary, [...signedPool, ...extra]);
+    const merged = mergePools([...signedPool, ...primary], extra);
     const builtLib = buildExemplars(merged, { capPerLabel: 120 }); // 返回 {version,builtAt,source,stats,exemplars[]}
     const exemplars = builtLib.exemplars;
     const outFile = path.join(dataDir, 'routing', 'exemplars.json');
@@ -263,8 +265,13 @@ async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, classif
   return { voters, decisionNote };
 }
 
-function readL2MinConf(dataDir) {
-  try { return Number(JSON.parse(fs.readFileSync(path.join(dataDir, 'code-index.config.json'), 'utf8'))?.modelRouting?.l2?.minConf) || 0.6; } catch { return 0.6; }
+async function readL2MinConf(dataDir) {
+  // 统一走 resolveL2Config(2026-11-07 嵌套收口):l2.vote.minConf 新结构优先,旧 l2.minConf/旧顶层回落
+  try {
+    const { resolveL2Config } = await import('./modelRoute.mjs');
+    const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'code-index.config.json'), 'utf8')) || {};
+    return resolveL2Config(cfg.modelRouting || {}).voteMinConf;
+  } catch { return 0.6; }
 }
 
 export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVotes = 2, decisionMinConf = 0.6, l2MinConf = null, classifyBatchFn = null, shadowEvidence = null } = {}) {
@@ -327,6 +334,7 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
   });
   const demotedSet = new Map();
   const reviewRows = [];
+  const reviewedHeavySet = new Set(); // heavy 反向候选当轮点名去重(跨周期由 reviewRows 台账留痕)
   for (const r of cand) {
     // multi 疑问形态一票否决(2026-11-06 用户拍板):标签=multi 但原文是疑问/征询形态(isInquiryShape:
     // 疑问结构+无祈使+无实改组锚)**且** L1 元提问防线也弃权(classifyPrompt=null)——双确认才否决,
@@ -347,8 +355,9 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
     }
     // multi 行为证据强度对齐(2026-11-06 用户拍板第二刀):multi 是强度声明——evidence 重放
     // labelFromShape 不到 heavy(写≥3/调用≥15)⇒ 签名管线内部不一致(别的票盖过了行为票),复核即摘。
-    // 单向只查 multi:light/routine 轮出现 heavy 重放不摘(提问触发重度调查,标签按 prompt 仍正确)。
-    // 当前池实测 0 命中(26/27 重放=multi,1 证据弃权)=历史签名行为一致;此规则守未来扩样池。
+    // 反向候选(2026-11-06 补):light/routine 但 evidence 重放=heavy 的也进复核——此前单向只查 multi,
+    // 7 条"写 3-8 个文件"的重活被漏摘;不过反向只**点名不直接摘标**(行为票把会话级强度漏进单轮标签的
+    // 方向恰好相反,直接摘会重蹈疑问形态覆辙),靠下方四票复核对齐裁定。
     const behaviorVote = (voters.get(r) || {}).behavior;
     if (normalizeType(r.humanLabel) === 'multi' && behaviorVote && behaviorVote.type && behaviorVote.type !== 'multi') {
       demotedSet.set(r, {
@@ -362,6 +371,17 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
         voters: { [behaviorVote.type]: ['behavior-replay'] },
       });
       continue;
+    }
+    if ((normalizeType(r.humanLabel) === 'routine' || normalizeType(r.humanLabel) === 'light')
+      && behaviorVote && behaviorVote.type === 'multi' && !reviewedHeavySet.has(r)) {
+      // heavy 反向候选:记录复核行(from=原标签,voters 标 behavior-replay→multi)但不摘——
+      // reviewedHeavySet 防同一条每周期重复点名(等四票真翻案它才退出循环)。
+      reviewRows.push({
+        ts: now, pkey: r.pkey || null, promptHead: String(r.prompt || '').slice(0, 120),
+        from: r.humanLabel || null, verdict: 'kept', votes: 0, sources: 1,
+        voters: { multi: ['behavior-replay'] }, note: 'heavy证据但标'+r.humanLabel+'(反向候选,仅点名)',
+      });
+      reviewedHeavySet.add(r);
     }
     const v = voteLabel(voters.get(r) || {});
     const flip = !!(v.type && v.type !== r.humanLabel);

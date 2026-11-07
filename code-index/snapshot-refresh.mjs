@@ -76,7 +76,8 @@ function main() {
   } catch { /* 目录读不到不影响刷新 */ }
   log(`refreshed: providers=${r.providers} ingress=[${(r.ingress || []).join(',')}] snapshottedAt=${new Date(next.snapshottedAt).toLocaleString()}`);
   // 虚拟条目保鲜(2026-11-02 auto 档位制):宿主选器里只有 auto 一个档位,baseUrl/形态变更时在这里对账收敛,
-  // 真实模型清单继续由快照(providers)维护。
+  // 真实模型清单继续由快照(providers)维护。autoName 不传(2026-11-07 定影语义):现有 auto 系名
+  // (含 auto×倍率)原样保持,改名权只在会话开启钩子(auto.mjs SessionStart)。
   try {
     const vp = ensureVirtualProviderEntry();
     if (vp.refreshed) log(`virtual-provider synced: ${vp.note}`);

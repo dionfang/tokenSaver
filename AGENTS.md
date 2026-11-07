@@ -23,7 +23,7 @@
 
 10. **部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `cd code-index && node deploySync.mjs` 校验一致性;不一致就重新运行 `node init.mjs` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致
 
-11. **实验数据保护**:`data/ab` 等实验目录里是唯一的原始证据(不入版本控制,删了不可再生):禁止 `git clean -x/-X`、`rm -rf data` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意
+11. **实验数据保护**:`test/ab/result`(A/B 实验结果,2026-11-07 自 data/ab 迁入)等实验目录里是唯一的原始证据,删了不可再生(已入版本控制受 git 保护,但 `test/` 其余部分仍是本地沙盒):禁止 `git clean -x/-X`、`rm -rf test/ab` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意
 
 <!-- output-diet-v10 -->
 ## 输出纪律(省话不省工) / Output discipline: less talk, same work

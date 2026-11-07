@@ -137,17 +137,21 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 |---|---|
 | `enabled` | 总开关;只控制每轮 `[model-routing]` 定档行的注入,auto 流量无论开关都照常路由 |
 | `brandPriority` | 四档链档内品牌调用优先序(默认 glm,minimax,deepseek,qwen,kimi,grok,claude,gpt,gemini),不影响档位归属 |
+| `modelTiers` | 品牌三档默认表(2026-11-06 v4,v4.1 调档):`{normal:[deepseek,glm,qwen,minimax]→R2, mid:[kimi,grok,gemini]→R3, high:[claude,gpt]→R4}`,未识别品牌按 normal 兜底;pro/max 不特殊,档位语义与品牌等级一一对应 |
+| `lightSuffixes` | 轻量版本后缀表(默认 flash,preview,coding,code,coder,turbo,mini,air,nano,event,haiku,luna,lite,base,sol,sonnet):命中即在品牌默认档上降一档(R1 封底,flash 恒 R1) |
 | `providerPriority` | 同名模型挂多供应商时的同名取序,配额尽自动滑下一供应商 |
 | `providerOrder` | 宿主 UI 供应商拖动序(快照自动采集,无需手配):同名供应商未进 `providerPriority` 时按它取序,冷却/配额尽按 UI 序逐个滑动;配置同键可覆盖快照序(Qoder 端无拖动序,按设置文件键序采集) |
 | `retryOnRateLimit` / `maxRetries` | 运行时 429/5xx/网络失败同轮换模型重选(默认 true / 2) |
 | `maxPhaseTurns` | 升档阶段最多持续的人类轮数(默认 4),到顶回 R1 基准 |
 | `switchGuard` | 切换税门控 `{enabled 默认 true, maxContextTokens 默认 200000}`;只拦升档;同会话被拦满 3 次疲劳放行,拦截时注入一次压缩建议 |
-| `l2Shadow` / `l2` | L2 向量投票通电开关与阈值 `{minSim, minConf}` |
+| `l2` | L2 向量能力嵌套配置(2026-11-07 收口):`{shadow 嵌入器总闸(默认 false), vote:{minSim,minConf} 代签投票阈值(0.55/0.6), live:{enabled,minConf} 线上路由救回(默认关)}`——shadow 关则两条支路都拿不到嵌入器;旧顶层 l2Shadow/l2Live/旧 l2.minSim 兼容读一个版本期 |
+| `l2Live` | (已收进 `l2.live`,旧键兼容)代理实弹 L2 融合票:词法判 R1 但 kNN 高置信投 multi ⇒ 救回 R2(只救回不压制,不碰 R3+);需 `l2.shadow` 同开;失败 fail-open 维持词法定档 |
 | `decisionModel` | 四票代签的判定模型 `{enabled, model, providers:[{baseUrl,apiKey,path}], chunkSize}` |
+| 双轴标签 | 黄金集每条同时记两个正交轴:`semanticType`(语义形态 multi/routine/light,由 L1/L2/决策三票合议——"这话要求的是不是多点改组")与 `intensityType`(行为强度 heavy/normal/light,由行为票——"这轮实际干了多重的活")。此前两者塞进同一标签比较,multi 一致率被压到 0.2;拆开后各轴各评(`node code-index/modelRoute.mjs --score-golden-dual`)。两轴真值均为机器合议弱真值,无外部人工锚点 |
 | `tierOptimize` | 自进化闭环 `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`:enabled=true 后每 6h 学习信号权重与门槛,折外过门控自动晋升 live,观察窗成本恶化自动回滚 |
-| `blendNotice` | auto 综合费率行注入开关 `{enabled 默认 true}`:仅路由宿主注入"最近会话实际费 ÷ R1 基准费"倍率行;关=只停注入,记账照常 |
+| `blendNotice` | auto 综合费率行注入开关 `{enabled 默认 true}`:仅路由宿主注入"最近会话实际费 ÷ R3 基准费(R3=1x)"倍率行;关=只停注入,记账照常 |
 
-生效范围与边界:仅 ZCode/Qoder 两端参与;auto 只调度自定义模型中以 Anthropic Messages 协议接入的模型;模型分档按名字自动判定(2026-11-06 v3.1 价带:flash→R1,无后缀普通与 pro/max 及一切便宜变体(preview/coding/turbo/haiku 等)→R2,旗舰品牌普通款→R3,旗舰品牌顶配(pro/max)→R4),无需配置。接入步骤与配置字段见 [`部署使用说明.txt`](code-index/部署使用说明.txt) 的配置说明。
+生效范围与边界:仅 ZCode/Qoder 两端参与;auto 只调度自定义模型中以 Anthropic Messages 协议接入的模型;模型分档按名字自动判定(2026-11-06 v4 品牌三档+轻量降档,v4.1 调档:普通品牌 deepseek/glm/qwen/minimax→R2、中档 kimi/grok/gemini→R3、高档 claude/gpt→R4,轻量后缀(flash/preview/turbo/mini/haiku/sonnet/sol 等)在默认档上降一档、flash 恒 R1,未识别品牌按普通档兜底;两表都在 `modelRouting.modelTiers` / `lightSuffixes`,可改配置重排全链)。接入步骤与配置字段见 [`部署使用说明.txt`](code-index/部署使用说明.txt) 的配置说明。
 
 ### 仓库模块
 
@@ -298,17 +302,21 @@ The `modelRouting` section of `data/code-index.config.json` is scaffolded by ini
 |---|---|
 | `enabled` | Master switch; only gates the per-turn `[model-routing]` tier line. Auto traffic is routed the same way regardless |
 | `brandPriority` | Within-tier brand call order of the four-tier chains (default glm,minimax,deepseek,qwen,kimi,grok,claude,gpt,gemini); does not affect tier assignment |
+| `modelTiers` | Brand three-grade default table (2026-11-06 v4, adjusted in v4.1): `{normal:[deepseek,glm,qwen,minimax]→R2, mid:[kimi,grok,gemini]→R3, high:[claude,gpt]→R4}`; unrecognized brands fall back to normal. pro/max is not special — tier semantics map one-to-one onto brand grades |
+| `lightSuffixes` | Lightweight-version suffixes (default flash,preview,coding,code,coder,turbo,mini,air,nano,event,haiku,luna,lite,base,sol,sonnet): a hit demotes one tier from the brand default (floor R1; flash is always R1) |
 | `providerPriority` | Same-name ordering when one model is hosted by several providers; an exhausted quota slides to the next one |
 | `providerOrder` | Host UI provider drag order (auto-captured into the snapshot, no manual setup): same-name providers not listed in `providerPriority` follow it, and cooling/quota exhaustion slides through them in UI order; a config key of the same name overrides the snapshot order (Qoder has no drag order; its settings-file key order is captured instead) |
 | `retryOnRateLimit` / `maxRetries` | Same-turn model re-selection on runtime 429/5xx/network failure (default true / 2) |
 | `maxPhaseTurns` | How many human turns an upgrade phase may last (default 4), then back to the R1 base |
 | `switchGuard` | Switch-tax gate `{enabled default true, maxContextTokens default 200000}`; upgrades only; releases by fatigue after 3 consecutive blocks and injects a one-shot compression suggestion while blocking |
-| `l2Shadow` / `l2` | Power switch and thresholds `{minSim, minConf}` for L2 vector voting |
+| `l2` | Nested L2 config (collapsed 2026-11-07): `{shadow — embedder master gate (default false), vote:{minSim,minConf} golden-set voting thresholds (0.55/0.6), live:{enabled,minConf} live-proxy routing rescue (default off)}` — with shadow off, neither branch gets the embedder; legacy top-level l2Shadow/l2Live and old l2.minSim stay readable for one version window |
+| `l2Live` | (moved into `l2.live`, legacy key still read) Live-proxy L2 fusion vote: when lexicon says R1 but kNN votes multi with high confidence, rescue to R2 (rescue-only, never pushes to R3+); requires `l2.shadow` on; fail-open keeps the lexical tier on any error |
 | `decisionModel` | The judge model for four-vote auto-signing `{enabled, model, providers:[{baseUrl,apiKey,path}], chunkSize}` |
+| Dual-axis labels | Every golden-set row carries two orthogonal axes: `semanticType` (multi/routine/light — the L1/L2/decision consensus, "does this ask for a multi-point restructure?") and `intensityType` (heavy/normal/light — the behavior vote, "how heavy was the work actually done?"). Mixing both into one label had pushed multi accuracy to 0.2; split, each axis is scored on its own (`node code-index/modelRoute.mjs --score-golden-dual`). Both axes are machine-consensus weak truth — no external human anchor |
 | `tierOptimize` | Self-evolution loop `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`: with enabled=true, every 6h it learns signal weights and thresholds from the golden set, auto-promotes a candidate that passes the out-of-fold gate, and auto-rolls back if cost worsens inside the observation window |
-| `blendNotice` | Injection switch for the auto blended-rate line `{enabled default true}`; routing hosts only — injects the "latest session's actual spend ÷ R1-equivalent spend" multiplier; off = stops the line, accounting continues |
+| `blendNotice` | Injection switch for the auto blended-rate line `{enabled default true}`; routing hosts only — injects the "latest session's actual spend ÷ R3-equivalent spend (R3 = 1x base)" multiplier; off = stops the line, accounting continues |
 
-Scope and boundaries: only ZCode/Qoder take part; auto dispatches only custom models wired via the Anthropic Messages protocol; model tiering is derived from the name (v3.1 price bands, 2026-11-06: flash→R1, unsuffixed normal plus pro/max and every cheap variant (preview/coding/turbo/haiku etc.)→R2, a flagship brand's base model→R3, a flagship brand's pro/max→R4) and needs no configuration. Wiring steps and config keys live in [`部署使用说明.txt`](code-index/部署使用说明.txt), configuration section.
+Scope and boundaries: only ZCode/Qoder take part; auto dispatches only custom models wired via the Anthropic Messages protocol; model tiering is derived from the name (brand three grades + lightweight demotion, 2026-11-06 v4, adjusted in v4.1: normal brands deepseek/glm/qwen/minimax→R2, mid-grade kimi/grok/gemini→R3, high-grade claude/gpt→R4; lightweight suffixes (flash/preview/turbo/mini/haiku/sonnet/sol etc.) demote one tier from the brand default and flash is always R1; unrecognized brands fall back to the normal grade. Both tables live in `modelRouting.modelTiers` / `lightSuffixes` and re-derive the whole chain from config). Wiring steps and config keys live in [`部署使用说明.txt`](code-index/部署使用说明.txt), configuration section.
 
 ### Repository layout
 

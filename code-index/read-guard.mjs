@@ -126,10 +126,10 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
   );
 }
 
-/** 实验数据保护(2026-10-31 用户要求):data/ab 是 A/B 实验唯一的原始证据,不入版本控制,
+/** 实验数据保护(2026-10-31 用户要求):test/ab/result 是 A/B 实验唯一的原始证据(2026-11-07 自 data/ab 迁入并已入版本控制),
  *  删了只能从本地会话库重建(见 test/scripts/ab/recover-db.mjs)。禁止顺手清理。
  *  命中两类:①git clean 带 -x/-X(会连带删掉被 gitignore 的 data/ab);②递归删除命中 data/ab 或其父目录 data。 */
-const PROTECTED_DATA = /(^|[\\/])data([\\/])ab([\\/]|$)/i;
+const PROTECTED_DATA = /(^|[\\/])test([\\/])ab([\\/]|$)/i;
 const RM_CMDS = /^(?:rm|rmdir|del|erase|remove-item)$/i;
 
 function expandTarget(t, cwd) {
@@ -139,7 +139,7 @@ function expandTarget(t, cwd) {
   try { return path.resolve(cwd, s); } catch { return null; }
 }
 
-/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 data/ab 传入。 */
+/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 test/ab/result 传入。 */
 export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected = false } = {}) {
   const cmd = String(command ?? '');
   if (!cmd.trim()) return { permission: 'allow' };
@@ -149,7 +149,7 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
     const tokens = seg.split(/\s+/).filter(Boolean);
     if (!tokens.length) continue;
     const head = tokens[0].replace(/^["']|["']$/g, '');
-    // ①git clean -x / -X:连被 gitignore 的文件一起删(data/ab 就是被 ignore 的)
+    // ①git clean -x / -X:连被 gitignore 的文件一起删(旧 data/ab 曾因此被误删)
     if (/^git(\.exe)?$/i.test(head)) {
       const sub = tokens.slice(1).map(t => t.replace(/^["']|["']$/g, ''));
       if (sub.includes('clean') && sub.some(t => /^-[A-Za-z]*[xX][A-Za-z]*$/.test(t) || /^--ignored/i.test(t))) {
@@ -185,10 +185,10 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
 
 export function cleanGuardMessage() {
   return (
-    'code-index: 已阻止清理 A/B 实验数据(data/ab)。那里是这批实验唯一的原始证据,' +
+    'code-index: 已阻止清理 A/B 实验数据(test/ab/result)。那里是这批实验唯一的原始证据,' +
     '不在版本控制内,删掉只能从本地会话库重建。要重跑实验请直接覆盖写' +
     '(prepare 只清 data/ab/work 下的任务目录),不要先删整个目录;确需清理请先征得用户同意,' +
-    '或改成只删具体文件(路径里不要出现 data/ab 或 data)。' +
+    '或改成只删具体文件(路径里不要出现 test/ab/result)。' +
     '若已经误删,可用 `node test/scripts/ab/recover-db.mjs` 从 ~/.zcode/cli/db/db.sqlite 重建。'
   );
 }
@@ -387,7 +387,7 @@ async function bashGuard(input, dialect) {
   const now = Date.now();
   const cwd = input.cwd || process.cwd();
   // 实验数据保护:先于整读拦截,命中就拒(不做 5 分钟放行,不可撤销)。
-  const hasProtectedData = fs.existsSync(path.join(cwd, 'data', 'ab'));
+  const hasProtectedData = fs.existsSync(path.join(cwd, 'test', 'ab', 'result'));
   const clean = evaluateCleanGuard({ command: cmd, cwd, hasProtected: hasProtectedData });
   if (clean.permission === 'deny') {
     const body = formatDecision(dialect, 'deny', cleanGuardMessage());

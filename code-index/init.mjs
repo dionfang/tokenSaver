@@ -257,11 +257,9 @@ export function modelRoutingScaffold() {
     // 失败轮本就拿不到回复,同轮重试是纯改善;设 retryOnRateLimit:false 整体关闭回到"透传单次错误"旧行为。
     retryOnRateLimit: true,
     maxRetries: 2,
-    // L2 通电开关(2026-11-01 实测:此前影子/CLI 都不传 embedFn ⇒ L2 从未运行过)。默认关:
-    // 每轮影子起子进程加载嵌入模型会与主会话争资源;要观测 L2 就显式 --l2 跑一次,或人工把该键设 true。
-    l2Shadow: false,
-    // L2 阈值(2026-11-01 黄金集扫描,minSim 0.55):minConf 0.75 覆盖 6/50 准确 100%,0.6 覆盖 15/50 准确 93%。
-    l2: { minSim: 0.55, minConf: 0.6 },
+    // L2 配置(2026-11-07 嵌套收口):shadow=嵌入器资源总闸(原顶层 l2Shadow);vote=代签投票阈值(原 l2.minSim/minConf);
+    // live=线上路由救回(原顶层 l2Live)——总闸关则两条支路都拿不到嵌入器、静默零影响。旧键双读兼容一个版本期。
+    l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } },
     // 决策模型开关(2026-11-03 用户定档:三投票+一加权):默认 false——生效时按置信加权参与代签计票
     // (可影响代签结果),断网/失败自动跳闸零网关重试(恢复=人工 --probe 探活,或下次会话开始
     // 自动探活成功);复核 CLI 同受此开关约束。
@@ -271,7 +269,7 @@ export function modelRoutingScaffold() {
     // 填了一半(baseUrl/key 缺一)=配置错误会显式报错。换判定模型/换网关只改 data/code-index.config.json 这里。
     // chunkSize(2026-11-03 实测定档):判定分片 1..16,默认 1——16 题批量稀释置信(97% 弃权),1 题/请求最佳。
     decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }], chunkSize: 1 },
-    // auto 综合费率行开关(2026-11-06):prompt-guard 每轮注入"最近会话实际费 ÷ R1 基准费"倍率行的总开关
+    // auto 综合费率行开关(2026-11-06):prompt-guard 每轮注入"最近会话实际费 ÷ R3 基准费"倍率行的总开关
     // (仅路由宿主);enabled=false 只停注入,记账照常。价格表=data/routing/model-prices.json。
     blendNotice: { enabled: true },
     // 生效宿主范围(2026-11-03 用户终裁):hosts 配置项已废——运行时恒按用户级目录自动检测
@@ -286,6 +284,12 @@ export function modelRoutingScaffold() {
     // **不影响档位归属**(tierOfModel/classifyDifficulty/resolveTier 级联照旧)= 不影响动态路由的调用档位。
     // 未列出的品牌排到所有已列品牌之后;改这里即可覆盖默认序。tier 模式(或四档影子)消费。
     brandPriority: ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini'],
+    // 品牌三档默认表(2026-11-06 v4 用户定档;v4.1 grok/gemini 移入 mid):模型名 → 档位的品牌面。
+    // normal=deepseek/glm/qwen/minimax(默认 R2),mid=kimi/grok/gemini(默认 R3),high=claude/gpt(默认 R4);未识别品牌按 normal 兜底。
+    // 轻量后缀(lightSuffixes)把默认档降一档(flash 恒 R1)。pro/max 不特殊:档位语义与品牌等级一一对应。改这里即重排全链。
+    modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] },
+    // 轻量版本后缀(2026-11-06 v4;v4.1 补 sol/sonnet,再补 code/coder——编码款按轻量款降档):命中任一 token 视为轻量版,品牌默认档降一档(R1 封底);可增删。
+    lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'],
     // 阶段轮数上限(2026-11-04 自 switchGuard 迁出):升档阶段最多持续的人类轮数,到顶回主循环;
     //   恒生效、不受切换税门控开关控制——语义属阶段生命周期,不属门控;旧位置 switchGuard.maxPhaseTurns 仍兼容读取。
     maxPhaseTurns: 4,
@@ -322,6 +326,11 @@ export function ensureModelRoutingSection(cfg) {
     if (!mr.tierOptimize || typeof mr.tierOptimize !== 'object' || Array.isArray(mr.tierOptimize)) add.tierOptimize = scaffold.tierOptimize;
     // blendNotice 缺失补默认开骨架(2026-11-06):人工改过则原样保留
     if (!mr.blendNotice || typeof mr.blendNotice !== 'object' || Array.isArray(mr.blendNotice)) add.blendNotice = scaffold.blendNotice;
+    // 品牌三档表/轻量后缀缺失补默认骨架(2026-11-06 v4):人工配置过(哪怕空数组)原样保留
+    if (!mr.modelTiers || typeof mr.modelTiers !== 'object' || Array.isArray(mr.modelTiers)) add.modelTiers = scaffold.modelTiers;
+    if (!Array.isArray(mr.lightSuffixes)) add.lightSuffixes = scaffold.lightSuffixes;
+    // l2 嵌套骨架缺失补默认关(2026-11-07 收口):旧配置有 l2Shadow/l2Live/旧 l2 任一键时不补(由 resolveL2Config 双读兼容接管,人工配置原样保留)
+    if ((!mr.l2 || typeof mr.l2 !== 'object' || Array.isArray(mr.l2)) && mr.l2Shadow === undefined && mr.l2Live === undefined) add.l2 = scaffold.l2;
     if (Object.keys(add).length) {
       return { cfg: { ...cfg, modelRouting: { ...mr, ...add } }, seeded: false, patched: true };
     }
@@ -413,7 +422,7 @@ if (configExisted) {
       ok(`嵌入路径已是 ${modelInArg}`);
     }
   }
-  // modelRouting 骨架播种(#11):段缺失建整骨架,缺 decisionModel/tierOptimize 只补对应键(全关);人工配置原样保留
+  // modelRouting 骨架播种(#11):段缺失建整骨架,缺可选子键(decisionModel/tierOptimize/blendNotice/modelTiers/lightSuffixes/l2Live)只补对应键;人工配置原样保留
   const mr = ensureModelRoutingSection(cfgOld);
   if (mr.seeded) {
     cfgOld.modelRouting = mr.cfg.modelRouting;
@@ -422,7 +431,7 @@ if (configExisted) {
   } else if (mr.patched) {
     cfgOld.modelRouting = mr.cfg.modelRouting;
     dirty = true;
-    ok('[user] data 配置 modelRouting 缺 decisionModel/tierOptimize,已补全关骨架(其余键原样保留,不覆盖人工配置)');
+    ok('[user] data 配置 modelRouting 缺可选子键(decisionModel/tierOptimize/blendNotice/modelTiers/lightSuffixes/l2),已补默认骨架(其余键原样保留,不覆盖人工配置)');
   }
   if (dirty) fs.writeFileSync(configPath, JSON.stringify(cfgOld, null, 2));
 } else {
@@ -1011,7 +1020,7 @@ export function disciplineBlock({ rel, dataRel, packed = false }) {
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
     P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
     P(10, '**部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `' + (packed ? 'npx tokensaver sync' : 'cd ' + rel + ' && node deploySync.mjs') + '` 校验一致性;不一致就重新运行 `' + (packed ? 'npx tokensaver init' : 'node init.mjs') + '` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致'),
-    P(11, '**实验数据保护**:`data/ab` 等实验目录里是唯一的原始证据(不入版本控制,删了不可再生):禁止 `git clean -x/-X`、`rm -rf data` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
+    P(11, '**实验数据保护**:`test/ab/result`(A/B 实验结果,2026-11-07 自 data/ab 迁入)等实验目录里是唯一的原始证据,删了不可再生(已入版本控制受 git 保护,但 `test/` 其余部分仍是本地沙盒):禁止 `git clean -x/-X`、`rm -rf test/ab` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
   ];
   const snippet = `\n${MARK_V2}\n## 代码检索纪律(节约 token)\n\n本项目已部署本地语义索引(工具在 \`${toolLabel}\`,项目资产在 \`${dataRel}\`):\n\n${items.join('\n\n')}\n`;
   return snippet.trim() + '\n';
@@ -1058,6 +1067,7 @@ for (const r of wireRoots) {
 log(`\n[user] 用户级钩子接线(${hookTools.join(', ')})`);
 if (hookTools.includes('zcode')) {
   rewriteZcodeUserHooks();
+  // autoName 不传(2026-11-07 定影语义):现有 auto 系名原样保持,改名权只在会话开启钩子
   const vp = ensureVirtualProviderEntry();
   // 播种/同步时函数内已打过日志,这里只补"无事发生"的说明,避免重复两行
   if (!vp.seeded && !vp.refreshed) console.log(`  [note] 虚拟供应商 tokenSaverModel:${vp.note}`);

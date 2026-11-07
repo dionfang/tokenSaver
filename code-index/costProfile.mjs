@@ -1,16 +1,18 @@
 /**
- * 档位成本画像(单位:**R1 价 token 等效 / 每请求**)。2026-11-04 用户提供画像包,本模块把它固化成可计算的代价函数。
+ * 档位成本画像(单位:**R3 价 token 等效 / 每请求**)。2026-11-04 用户提供画像包,本模块把它固化成可计算的代价函数;
+ * 2026-11-06 v2 基准换挡:用户实测各档综合单价 R1/R2/R3/R4 = 0.16/1.6/3.2/11.6 元/MTok,**基准费率 = R3 = 1x**,
+ * 全部量纲常数随基准同步换算(相对比较与百分比门槛不受影响;档间相对比 1:10:20:72.5 取代旧口径 1:8:15:100)。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 /**
  *
  * 画像基线:1M = 965k 缓存读 + 34k 新输入 + 1k 输出(一次请求的 token 构成)。
- *   - 隐式缓存(自动、不可关,命中部分按输入标准价 20% 计费):热轮 0.23M / 冷轮 1.00M / 切换税 0.77M
- *   - 显式缓存(主动创建,创建 125%、命中 10%、5min TTL):创建轮 1.24M / 命中轮 0.13M / 换模型税 1.11M
- *   ⇒ 两条"税"都不是独立项,恒等于 (冷读价 − 热读价):隐式 1.00−0.23=0.77、显式 1.24−0.13=1.11。
+ *   - 隐式缓存(自动、不可关,命中部分按输入标准价 20% 计费):热轮 0.0115M / 冷轮 0.05M / 切换税 0.0385M
+ *   - 显式缓存(主动创建,创建 125%、命中 10%、5min TTL):创建轮 0.062M / 命中轮 0.0065M / 换模型税 0.0555M
+ *   ⇒ 两条"税"都不是独立项,恒等于 (冷读价 − 热读价):隐式 0.05−0.0115=0.0385、显式 0.062−0.0065=0.0555。
  *     **切换模型最大的冷读付费就是缓存费**,所以路由的代价函数必须以"是否换档"为第一变量。
- * 档位倍率:R1=1x(日常主力)/ R2=8x(增强,慎重改动)/ R3=15x(最强,R2 明确解决不了)/ R4=100x(奢侈,仅显式点名)。
+ * 档位倍率(2026-11-06 实测,基准 R3=1x):R1=0.05x(日常主力)/ R2=0.5x(增强)/ R3=1x(最强,基准)/ R4=3.625x(奢侈,仅显式点名)。
  *   倍率乘在**整轮价**上(缓存读写同样按该档模型自己的单价结算)⇒ 高档误升一轮的损失 = 倍率 ×(冷读 − 热读),
  *   这正是 tierClassify 把成本悬崖放在 R1→R2、并要求 P2 行为证据才上梯的量化理由。
  *
@@ -19,25 +21,25 @@ import path from 'node:path';
  * (实测只能给出 token 侧代价;"弱模型干重活"的质量损失无法从账本读出),改它们等于改优化目标,须人工决定。
  */
 
-/** 画像默认值(用户 2026-11-04 给定口径,M = 100 万 R1 等效 token)。 */
+/** 画像默认值(2026-11-04 用户给定口径;2026-11-06 换 R3 基准,M = 100 万 R3 等效 token)。 */
 export const DEFAULT_COST_PROFILE = {
   version: 1,
   builtAt: null,
-  source: 'user-profile-20261104',
+  source: 'user-profile-20261106-r3base',
   /** 单次请求的 token 构成锚点(仅用于报告口径换算,不参与判定)。 */
   requestMix: { perRequestM: 1.0, cachedM: 0.965, freshM: 0.034, outputM: 0.001 },
-  /** 档位单价倍率(相对 R1)。 */
-  tierMultiplier: { R1: 1, R2: 8, R3: 15, R4: 100 },
+  /** 档位单价倍率(相对 R3=1x 基准;2026-11-06 用户实测综合单价 R1/R2/R3/R4 = 0.16/1.6/3.2/11.6 元/MTok,倍率=单价÷R3)。 */
+  tierMultiplier: { R1: 0.05, R2: 0.5, R3: 1, R4: 3.625 },
   /** 隐式缓存:自动、命中 20%。 */
-  implicit: { hitDiscount: 0.2, hotM: 0.23, coldM: 1.0 },
+  implicit: { hitDiscount: 0.2, hotM: 0.0115, coldM: 0.05 },
   /** 显式缓存:创建 125% / 命中 10% / TTL 5min。 */
-  explicit: { hitDiscount: 0.1, createDiscount: 1.25, hotM: 0.13, coldM: 1.24, ttlMs: 5 * 60 * 1000 },
+  explicit: { hitDiscount: 0.1, createDiscount: 1.25, hotM: 0.0065, coldM: 0.062, ttlMs: 5 * 60 * 1000 },
   /** 当前计费面(隐式=默认;显式需主动开启,本机以隐式为主)。 */
   cacheMode: 'implicit',
   /** 漏升(该升没升)的返工模型:P2 要连续 2 轮失败才上梯,故空转轮数 = 2。 */
   underTier: { failTurns: 2 },
-  /** 每低一档的质量损失定价(M R1 等效;默认 1 个冷读轮 ≈ 一次返工,人工旋钮,非实测)。 */
-  qualityPenaltyPerStepM: 1.0,
+  /** 每低一档的质量损失定价(M R3 等效;默认 1 个冷读轮 ≈ 一次返工,人工旋钮,非实测)。 */
+  qualityPenaltyPerStepM: 0.05,
 };
 
 const TIERS = ['R1', 'R2', 'R3', 'R4'];
@@ -265,7 +267,7 @@ export function fitFromLedger({ rows = [], tierOf = null, minContextM = 0.05 } =
   };
 }
 
-// ---------- 综合费率(2026-11-05 v2,口径 A:实际费 ÷ R1 基准费;按四档价格表计价,不按真实模型) ----------
+// ---------- 综合费率(2026-11-05 v2;2026-11-06 基准换挡:口径 A=实际费 ÷ R3 基准费,按四档价格表计价,不按真实模型) ----------
 
 const _pricesCache = new Map();
 
@@ -284,9 +286,10 @@ export function loadModelPrices({ dataDir = null, file = null } = {}) {
 }
 
 /**
- * 一行账本 → 该请求实际费与 R1 基准费(元)。四段计价:输入 + 缓存写(cacheWrite 键,缺省按 input 计)
+ * 一行账本 → 该请求实际费与 R3 基准费(元)。四段计价:输入 + 缓存写(cacheWrite 键,缺省按 input 计)
  * + 缓存读 + 输出,价格按**难度档位**取
  * (费率表 tiers 段;档位=账本 tier 字段,sticky 轮缺 tier 时按模型名 tierOf 推档)。
+ * 基准费率 = R3 = 1x(2026-11-06 用户定档):base 段按 R3 单价计,rate=实际费÷基准费即"综合倍率"。
  * token 全缺/为 0 的行(失败请求)返回 null(不入分子分母);无表/无档 → null。
  */
 export function rowCost({ row = {}, priceTable = null, tierOf = null } = {}) {
@@ -296,23 +299,28 @@ export function rowCost({ row = {}, priceTable = null, tierOf = null } = {}) {
   const hasTokens = [inTok, cr, out].some((v) => Number.isFinite(v) && v > 0);
   if (!hasTokens) return null;
   const n = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
-  const tier = TIERS.includes(row.tier) ? row.tier : (tierOf ? tierOf(row.served || row.requested || '') : null);
+  // 计价轴(2026-11-06 修 37% 错配账):优先实弹服务档(servedTier 字段,代理 2026-11-06 起落账本)——
+  // 难度档(decision.tier)在门控拦截轮/降档轮/429 重选轮与实弹模型错位(实测 37% 行错配,最高虚 8x)。
+  // 旧账本行无 servedTier 时回落难度档(与旧行为一致,不倒退),再缺按模型名 tierOf 推档。
+  const tier = TIERS.includes(row.servedTier) ? row.servedTier
+    : TIERS.includes(row.tier) ? row.tier
+      : (tierOf ? tierOf(row.served || row.requested || '') : null);
   const price = tiers[tier] || null;
   if (!price) return null;
-  const r1 = tiers.R1;
-  if (!r1) return null;
+  const baseTier = tiers.R3;
+  if (!baseTier) return null;
   const m = 1e6;
   const cwP = price.cacheWrite ?? price.input;
-  const cwB = r1.cacheWrite ?? r1.input;
+  const cwB = baseTier.cacheWrite ?? baseTier.input;
   const actual = (n(inTok) * price.input + n(cw) * cwP + n(cr) * price.cacheRead + n(out) * price.output) / m;
-  const base = (n(inTok) * r1.input + n(cw) * cwB + n(cr) * r1.cacheRead + n(out) * r1.output) / m;
+  const base = (n(inTok) * baseTier.input + n(cw) * cwB + n(cr) * baseTier.cacheRead + n(out) * baseTier.output) / m;
   return { actual, base, tier };
 }
 
 /**
- * 综合费率(口径 A):Σ实际费 ÷ ΣR1 基准费。纯函数;rows=proxy-usage 子集(某会话/某日)。
+ * 综合费率(口径 A):Σ实际费 ÷ ΣR3 基准费。纯函数;rows=proxy-usage 子集(某会话/某日)。
  * 输出 {rate, actualCost, baseCost, reqs, failed, byTier:{R1:{reqs,tokens},...}}。
- * rate=1.0 ⇒ 这段流量等效全走 R1;rate=2.3 ⇒ 账单是全 R1 的 2.3 倍。
+ * rate=1.0 ⇒ 这段流量等效全走 R3(基准 1x);rate=0.05 ⇒ 等效全走 R1;auto 的"综合倍率"即此值。
  * 无费率表 ⇒ reqs=0/rate=null(调用方不注入),不做倍率合成兜底——价格口径唯一。
  */
 export function blendedRate({ rows = [], priceTable = null, tierOf = null } = {}) {
@@ -354,19 +362,19 @@ if (directRun) {
     const file = opt('--usage', path.join(DATA_DIR, 'usage', 'proxy-usage.jsonl'));
     let rows = [];
     try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { console.error(`账本不可读:${file}`); process.exit(1); }
-    const { tierOfModel } = await import('./modelRoute.mjs');
-    console.log(JSON.stringify(fitFromLedger({ rows, tierOf: (m) => tierOfModel(m) }), null, 1));
+    const { tierOfModel, tierClassifyOptions } = await import('./modelRoute.mjs');
+    console.log(JSON.stringify(fitFromLedger({ rows, tierOf: (m) => tierOfModel(m, tierClassifyOptions()) }), null, 1));
   } else if (argv.includes('--rate')) {
     const file = opt('--usage', path.join(DATA_DIR, 'usage', 'proxy-usage.jsonl'));
     let rows = [];
     try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { console.error(`账本不可读:${file}`); process.exit(1); }
-    const { tierOfModel } = await import('./modelRoute.mjs');
+    const { tierOfModel, tierClassifyOptions } = await import('./modelRoute.mjs');
     const prices = loadModelPrices({ dataDir: DATA_DIR });
     const conv = opt('--conv', null);
     const days = Number(opt('--days', 0));
     const cut = days > 0 ? Date.now() - days * 864e5 : 0;
     const picked = rows.filter((r) => (!conv || r.conv === conv) && r.ts >= cut);
-    const tierOf = (m) => tierOfModel(m);
+    const tierOf = (m) => tierOfModel(m, tierClassifyOptions());
     console.log(JSON.stringify(blendedRate({ rows: picked, priceTable: prices, tierOf }), null, 1));
   } else {
     const p = resolveCostProfile(null);

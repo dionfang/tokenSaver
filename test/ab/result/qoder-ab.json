@@ -1,0 +1,98 @@
+{
+  "window": {
+    "samples": [
+      {
+        "ts": "2026-10-31T08:44:42.427Z",
+        "preTokens": 178247,
+        "postTokens": 3534,
+        "ratio": 0.88452,
+        "window": 201518
+      },
+      {
+        "ts": "2026-10-31T12:38:00.569Z",
+        "preTokens": 169082,
+        "postTokens": 5836,
+        "ratio": 0.83307,
+        "window": 202963
+      },
+      {
+        "ts": "2026-10-31T12:59:59.573Z",
+        "preTokens": 173320,
+        "postTokens": 5611,
+        "ratio": 0.82661,
+        "window": 209676
+      }
+    ],
+    "value": 202963
+  },
+  "sessions": [
+    {
+      "file": "C:\\Users\\Administrator\\.qoder-cn\\projects\\D--HbuilderX-Project-TokenSaver\\a9911f43-b61a-4aec-b1ac-446cc64acab1.jsonl",
+      "calibration": {
+        "ts": "2026-10-31T08:44:42.427Z",
+        "hostPreTokens": 178247,
+        "postTokens": 3534,
+        "messages": 486,
+        "localTokens": 164868,
+        "factor": 1.0811497682994882
+      },
+      "analysis": {
+        "session": "a9911f43-b61a-4aec-b1ac-446cc64acab1",
+        "requests": 138,
+        "credits": 42.310456,
+        "boundaries": [
+          1793436282427,
+          1793450280569,
+          1793451599573
+        ],
+        "window": 202963,
+        "entryOnce": 15571,
+        "ledgerAccumulated": 600461,
+        "cappedAccumulated": 600461,
+        "ledgerTotal": 616032,
+        "cappedTotal": 616032,
+        "overcounted": 0,
+        "pendingUncapped": 1292393,
+        "pendingCapped": 0,
+        "potentialOvercount": 1292393,
+        "upper": 15238377,
+        "withinUpperBound": true,
+        "rows": [
+          {
+            "key": "Search|1793436286461|记账 model_io rollout usage inputTokens qoder 会话日志",
+            "kind": "Search",
+            "at": 1793436286461,
+            "tokens": 4128,
+            "ledgerCounted": 53,
+            "cappedCount": 53,
+            "allCount": 136,
+            "ledgerAccumulated": 218784,
+            "cappedAccumulated": 218784
+          },
+          {
+            "key": "Search|1793436300757|scanQoderUsage agent-usage scan-qoder segments 断点续读",
+            "kind": "Search",
+            "at": 1793436300757,
+            "tokens": 6854,
+            "ledgerCounted": 51,
+            "cappedCount": 51,
+            "allCount": 134,
+            "ledgerAccumulated": 349554,
+            "cappedAccumulated": 349554
+          },
+          {
+            "key": "Search|1793450175564|输入端节约 tokens 记账 savedTokens blockedBytes Rewrite 压缩率 session-savings",
+            "kind": "Search",
+            "at": 1793450175564,
+            "tokens": 4589,
+            "ledgerCounted": 7,
+            "cappedCount": 7,
+            "allCount": 90,
+            "ledgerAccumulated": 32123,
+            "cappedAccumulated": 32123
+          }
+        ]
+      }
+    }
+  ]
+}

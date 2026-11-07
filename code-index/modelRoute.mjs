@@ -12,7 +12,7 @@
  * role 两档制已废(2026-11-03 用户终裁:tier 四档难度制唯一;deriveRoleChains/roles 映射随 routeMode 删除,
  * resolveRole 保留为通用链解析器,resolveTier 每档内复用)。
  * CLI:node modelRoute.mjs --build-vectors | --classify [--l2] "<prompt>" | --resolve --tier R3 [--current p/m]
- *      | --score-golden [--golden 文件] | --doctor | --health-mark <provider/model> [--reason x] [--ttl 30m] | --health-clear <key> | --health-list
+ *      | --score-golden [--golden 文件] | --score-golden-dual [--golden 文件] | --doctor | --health-mark <provider/model> [--reason x] [--ttl 30m] | --health-clear <key> | --health-list
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -20,7 +20,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
 import { normalizeType, L1_TYPES, classifyPrompt } from './classify.mjs';
+import { SEMANTIC_AXIS, INTENSITY_AXIS } from './autoLabel.mjs';
 import { classifyDifficulty, loadTierCalibration, TIER_FROM_TYPE } from './tierClassify.mjs';
+import { tierTruthFromAxes } from './tierTruth.mjs';
 import { promptKey } from './buildExemplars.mjs';
 
 const HOME = os.homedir();
@@ -130,39 +132,57 @@ export function tierOf(modelId) {
   return 'normal';
 }
 
-// ---------- 四档模型分级(2026-11-02 用户定档;2026-11-06 v3 重排价带,v3.1 无后缀普通入 R2) ----------
-// v3.1 定档(2026-11-06 用户定档):flash **R1**;无后缀普通(glm-5.3/MiniMax-M3)入 **R2**(与 pro/max 同档);
-// 旗舰品牌分两层——普通旗舰款(Kimi-K3/K2.7-Code)**R3**,顶配 pro/max(k3.1-pro)**R4**。价带:
-//   R1 = flash——最便宜日常主力价带;
-//   R2 = 无后缀普通(非旗舰)/ pro/max(非旗舰)/ 一切便宜变体(preview/coding/turbo/mini/haiku/lite/base…);
-//   R3 = 旗舰品牌普通款(无便宜后缀、非 pro/max;K2.7-Code 的 code 不算便宜变体);
-//   R4 = 旗舰品牌顶配(pro/max)。
-const PREMIUM_BRAND_RE = /(kimi|moonshot|gpt|openai|claude|anthropic|gemini|grok|\bxai\b)/i;
-const KIMI_K_RE = /^k\d/i; // k3.1-pro = Kimi K3.1(裸 k+数字前缀)
-const CHEAP_VARIANT_TOKENS = new Set(['preview', 'coding', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base']); // v3:便宜变体+超便宜一律 R2
+// ---------- 四档模型分级(2026-11-02 用户定档;2026-11-06 v4 品牌三档+轻量降档,全配置面;v4.1 调档) ----------
+// v4 定档(2026-11-06 用户定档):模型名 → 档位 = **品牌三档默认表 + 轻量后缀降一档**,表与后缀全部进
+// data/code-index.config.json 的 modelRouting.modelTiers / lightSuffixes,可按需改:
+//   品牌三档:normal=deepseek/glm/qwen/minimax(默认 R2)/ mid=kimi/grok/gemini(默认 R3)/ high=claude/gpt(默认 R4)
+//   (v4.1 2026-11-06 用户调整:grok 从未入表、gemini 从 high 移入 mid,high 只剩 claude/gpt);
+//   未识别品牌按 normal(R2)兜底;品牌识别用 brandOf(k\d 前缀=kimi、别名收敛、连写子串兜底)。
+//   轻量后缀(flash/preview/coding/code/coder/turbo/mini/air/nano/event/haiku/luna/lite/base/sol/sonnet;sol/sonnet v4.1 补,
+//   code/coder 2026-11-06 再补——K2.7-Code 这类编码款按轻量款降档):命中即在默认档上**降一档**(R1 封底);
+//   flash 恒 R1(最便宜日常主力价带,品牌 flash 也截在此档)。
+//   pro/max 不再特殊:普通品牌 pro/max 留 R2、中档品牌全家 R3、高档品牌全家 R4——档位语义与品牌等级一一对应。
+//   例:gemini-2.5-pro=R3、claude-3-5-sonnet=R4−1=R3、Kimi-K2.7-Code=R3−1=R2、K2.8-Preview=R3−1=R2、qwen-turbo=R2−1=R1。
+const DEFAULT_LIGHT_SUFFIXES = ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'];
+export { DEFAULT_LIGHT_SUFFIXES };
 export const TIER_RANK = { R1: 1, R2: 2, R3: 3, R4: 4 };
 export const TIER_ORDER_DESC = ['R4', 'R3', 'R2', 'R1']; // 降档方向
+const TIER_BY_RANK = { 1: 'R1', 2: 'R2', 3: 'R3', 4: 'R4' };
 
-/** 模型 id → 四档(R1/R2/R3/R4)。v3.1 价带:flash→R1,无后缀普通/pro/max→R2,旗舰普通款→R3,旗舰顶配→R4。纯函数可测。 */
-export function tierOfModel(modelId) {
+/** 配置里的品牌三档表 → {品牌:档基数} 扁平序(normal/mid/high);非法键忽略、大小写收敛。 */
+export function normalizeModelTiers(modelTiers = null) {
+  const raw = modelTiers && typeof modelTiers === 'object' && !Array.isArray(modelTiers) ? modelTiers : null;
+  const order = {};
+  for (const grade of ['normal', 'mid', 'high']) {
+    const list = raw && Array.isArray(raw[grade]) ? raw[grade] : null;
+    for (const b of list || []) {
+      const name = String(b || '').trim().toLowerCase();
+      if (name) order[name] = grade;
+    }
+  }
+  return order;
+}
+
+/** 品牌三档默认表(2026-11-06 v4 用户定档;v4.1 grok/gemini 移入 mid):未识别品牌按 normal。 */
+export const DEFAULT_MODEL_TIERS = {
+  normal: ['deepseek', 'glm', 'qwen', 'minimax'],
+  mid: ['kimi', 'grok', 'gemini'],
+  high: ['claude', 'gpt'],
+};
+const GRADE_BASE = { normal: 'R2', mid: 'R3', high: 'R4' };
+
+/** 模型 id → 四档(R1/R2/R3/R4)。v4:品牌默认档,轻量后缀降一档,flash 恒 R1。纯函数可测。
+ *  非法入参(表为 null/数组、后缀非数组)在函数内回落默认表——解构默认值只兜 undefined,兜不住显式 null。 */
+export function tierOfModel(modelId, { modelTiers = DEFAULT_MODEL_TIERS, lightSuffixes = DEFAULT_LIGHT_SUFFIXES } = {}) {
   const id = String(modelId || '');
   const tokens = id.split(/[^A-Za-z0-9]+/).filter(Boolean).map((t) => t.toLowerCase());
-  const suffix = tierOf(id); // flash/normal/plus/pro/max(既有价格档,内部基元)
-  const premium = PREMIUM_BRAND_RE.test(id) || KIMI_K_RE.test(id);
-  // pro/max 判定要 token 感知:tierOf 只认词尾,pro-x/gpt-max-x 这类"后缀再接词"会被解析成 normal
-  const proMax = suffix === 'pro' || suffix === 'max' || tokens.includes('pro') || tokens.includes('max');
-  // 1. flash → R1(v3.1:flash=最便宜日常主力价带;品牌 flash 也截在此档不升 R3/R4)
-  if (suffix === 'flash' || tokens.includes('flash')) return 'R1';
-  // 2. 便宜变体/超便宜(preview/coding/turbo/haiku/lite/base…)一律 R2(2026-11-06 用户定档:与 pro/max 同档)
-  if (tokens.some((t) => CHEAP_VARIANT_TOKENS.has(t))) return 'R2';
-  // 3. 旗舰品牌:pro/max=顶配 R4;其余无便宜后缀普通款(Kimi-K3/K2.7-Code)⇒ 普通旗舰 R3(2026-11-06 用户定档)
-  if (premium) return proMax ? 'R4' : 'R3';
-  // 4. 非旗舰 pro/max ⇒ R2(增强档,v3 从 R3 降)
-  if (proMax) return 'R2';
-  // 5. 非旗舰无后缀普通(glm-5.3/MiniMax-M3)⇒ R2(v3.1:与 pro/max 同档,不再与 flash 同档)
-  if (suffix === 'normal') return 'R2';
-  // 6. plus 及其余 ⇒ R2
-  return 'R2';
+  // flash 恒 R1(2026-11-06 v3.1 口径保留:最便宜日常主力价带,品牌 flash 也截在此档)
+  if (tokens.includes('flash')) return 'R1';
+  const mt = modelTiers && typeof modelTiers === 'object' && !Array.isArray(modelTiers) ? modelTiers : DEFAULT_MODEL_TIERS;
+  const ls = Array.isArray(lightSuffixes) ? lightSuffixes.map((t) => String(t).toLowerCase()) : DEFAULT_LIGHT_SUFFIXES;
+  const grade = normalizeModelTiers(mt)[brandOf(id)] || 'normal'; // 未识别品牌=normal
+  const rank = TIER_RANK[GRADE_BASE[grade]] - (tokens.some((t) => ls.includes(t)) ? 1 : 0);
+  return TIER_BY_RANK[Math.max(1, Math.min(4, rank))];
 }
 
 // ---------- 品牌优先序(2026-11-03 用户需求:config 定义品牌调用顺序,只排"档内谁先被调",不改档位归属) ----------
@@ -192,16 +212,20 @@ function brandRank(brand, priority) {
 }
 
 /**
- * 四档链自动派生:从实时上游快照按 tierOfModel 分桶。
+ * 四档链自动派生:从实时上游快照按 tierOfModel 分桶(v4:品牌三档表+轻量后缀可经 modelTiers/lightSuffixes 配置覆盖)。
  * 档内排序(2026-11-03 用户裁定):**品牌优先序为主键**(config.modelRouting.brandPriority,决定"同档谁先被调"),
  *   同品牌再按档位序数升序(TIER_ORDER:flash0<normal1<plus2<pro3<max4,名字档位关键词的序数非真实单价,冷却时自然滑到次序),最后 modelId 保确定性。
  * 档位归属(tierOfModel)与降档级联(resolveTier)完全不受品牌序影响 —— 即"不影响动态模型路由的调用档位"。
  * 返回 {r1,r2,r3,r4, derived:true};空档为 []。排除图像/语音/视频/判定 API(NON_CHAT_RE 同口径)。
  */
-export function deriveTierChains(upstreams, { brandPriority = DEFAULT_BRAND_PRIORITY } = {}) {
+export function deriveTierChains(upstreams, { brandPriority = DEFAULT_BRAND_PRIORITY, modelTiers = null, lightSuffixes = null } = {}) {
   const priority = Array.isArray(brandPriority) && brandPriority.length
     ? brandPriority.map((b) => String(b).toLowerCase())
     : DEFAULT_BRAND_PRIORITY;
+  const tierOpts = {
+    modelTiers: modelTiers && typeof modelTiers === 'object' ? modelTiers : DEFAULT_MODEL_TIERS,
+    lightSuffixes: Array.isArray(lightSuffixes) ? lightSuffixes.map((s) => String(s).toLowerCase()) : DEFAULT_LIGHT_SUFFIXES,
+  };
   const buckets = { R1: [], R2: [], R3: [], R4: [] };
   const seen = new Set();
   for (const [pid, p] of Object.entries(upstreams?.providers || {})) {
@@ -210,7 +234,7 @@ export function deriveTierChains(upstreams, { brandPriority = DEFAULT_BRAND_PRIO
       const id = String(m || '');
       if (!id || seen.has(id) || NON_CHAT_RE.test(id)) continue;
       seen.add(id);
-      buckets[tierOfModel(id)].push({ modelId: id, price: TIER_ORDER[tierOf(id)] ?? 1, brand: brandOf(id) }); // price=名字档位序数,非真实单价
+      buckets[tierOfModel(id, tierOpts)].push({ modelId: id, price: TIER_ORDER[tierOf(id)] ?? 1, brand: brandOf(id) }); // price=名字档位序数,非真实单价
     }
   }
   const out = { derived: true };
@@ -232,11 +256,11 @@ export async function classifyRoute(prompt, { dataDir = DATA_DIR, cfg = null, em
   const mr = c.modelRouting || {};
   const l1 = classifyPrompt(prompt);
   if (l1 && l1.confidence >= 0.7) return { ...l1, source: 'L1' };
-  // L2 阈值可配(2026-11-01 黄金集扫描):minSim/minConf 缺省取常量;
+  // L2 阈值(统一走 resolveL2Config,2026-11-07 嵌套收口;旧顶层/旧 l2.minSim 形态兼容回落):
   // 扫描结论(minSim 0.55):minConf 0.75 覆盖 6/50 且准确 100%,0.6 覆盖 15/50 且准确 93%。
-  const l2cfg = mr.l2 && typeof mr.l2 === 'object' && !Array.isArray(mr.l2) ? mr.l2 : {};
-  const minSim = Number.isFinite(Number(l2cfg.minSim)) ? Number(l2cfg.minSim) : L2_MIN_SIM;
-  const minConf = Number.isFinite(Number(l2cfg.minConf)) ? Number(l2cfg.minConf) : L2_MIN_CONF;
+  const l2c = resolveL2Config(mr);
+  const minSim = l2c.voteMinSim;
+  const minConf = l2c.voteMinConf;
   // 无 embedFn(影子 CLI)时跳过 3MB 向量表加载——L2 本就需要嵌入,不白读
   const l2v = vectorsDoc || (embedFn ? loadVectors(dataDir) : null);
   if (l2v && embedFn) {
@@ -249,8 +273,26 @@ export async function classifyRoute(prompt, { dataDir = DATA_DIR, cfg = null, em
   return { source: 'none', type: l1?.type ?? null, confidence: l1?.confidence ?? 0 };
 }
 
-/** 影子结果落 shadow 日志(与 L1 的 routing-log 分开,口径不同)。 */
-export function logShadow({ dataDir = DATA_DIR, prompt = '', result = null } = {}) {
+/**
+ * L2 融合票(2026-11-06 进化回路接通:代理实弹消费向量库):难度词法定档后,若 L2 kNN 以高置信
+ * 投 **multi**(样本库 120/类,含代签回流),把 R1 定档救回 R2——只救回不压制:
+ *   ① 只在词法判 R1(不是 P2 上梯/降档/sticky 轮)时介入;② 只升到 R2(multi→R2 的设计映射),不碰 R3+;
+ *   ③ 与 L1 相左时 L1 强信号(≥0.7)优先,kNN 只兜"词法拿不准"的轮——与代签"决策票只许救回"同哲学。
+ * 纯函数可测;代理侧由 modelRouting.l2Live.enabled(默认关)门控 + fail-open,向量库/embedFn 缺失=零影响。
+ * 返回 {tier, confidence, rule} 或 null(不介入)。
+ */
+export function l2TierRescue(diff, l2, { minConf = 0.8 } = {}) {
+  try {
+    if (!diff || !l2) return null;
+    if (diff.tier !== 'R1') return null; // 只救 R1 误判;R2+ 不加码
+    const t = normalizeType(l2.type);
+    if (t !== 'multi') return null; // 只认 multi;light/routine 本就该在 R1,无救回意义
+    if (!(Number(l2.confidence) >= minConf)) return null; // 高门槛:kNN 置信须过 minConf(默认 0.8)
+    return { tier: 'R2', confidence: Number(l2.confidence), rule: `l2-rescue(${t}@${l2.confidence})` };
+  } catch { return null; }
+}
+
+/** 影子结果落 shadow 日志(与 L1 的 routing-log 分开,口径不同)。 */export function logShadow({ dataDir = DATA_DIR, prompt = '', result = null } = {}) {
   try {
     const rec = { ts: Date.now(), promptHead: String(prompt || '').slice(0, 200), source: result?.source ?? 'none', type: result?.type ?? null, confidence: result?.confidence ?? 0 };
     fs.mkdirSync(path.dirname(SHADOW_LOG), { recursive: true });
@@ -594,9 +636,12 @@ export function scoreGoldenTier({ dataDir = DATA_DIR, goldenFile = null, classif
   try {
     rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch { return { error: `黄金集不可读: ${file}` }; }
-  // R 真值 = 代签 T 标签经设计映射;无 humanLabel(T1-T8)或映射外(R4 恒无 T 来源)⇒ 无 R 真值,跳过
+  // R 真值 = 双轴派生(2026-11-06:强度轴优先,语义轴回落);无轴且无旧标签 ⇒ 无 R 真值,跳过
   const withTruth = rows
-    .map((r) => ({ r, tier: TIER_FROM_TYPE[String(r.humanLabel || '')] || null }))
+    .map((r) => {
+      const axes = tierTruthFromAxes(r);
+      return { r, tier: axes.tier, source: axes.source };
+    })
     .filter((x) => x.tier);
   const perTier = {};
   const misses = [];
@@ -639,6 +684,77 @@ export function scoreGoldenTier({ dataDir = DATA_DIR, goldenFile = null, classif
   };
 }
 
+// ---------- 双轴评测(2026-11-06) ----------
+
+/**
+ * 黄金集**双轴**打分(语义形态轴 / 行为强度轴各评各的)。
+ * 为什么:此前单一 humanLabel 同时承担"意图形态"与"行为强度"两把尺子——黄金集 multi 实为行为强度标签
+ * (46/46 行为 heavy),L1 的 multi 是句式形态标签(只认出 7/46),同标签名下比对 ⇒ multi 一致率被压到 0.2,
+ * 连带 R2 门禁不过。拆开后:
+ *   语义轴 = L1 词法预测 vs semanticType(意图侧合议真值)→ 衡量**分类器判形态**的准度;
+ *   强度轴 = 行为票重放 vs intensityType(结果侧真值)→ 衡量**行为口径**的准度(与分类器无关,天然可达 1.0)。
+ * 两轴真值都是机器合议的**弱真值**(无外部人工锚点),报告须如实标注,不得冒充外部准确率。
+ * 兼容:旧行无轴字段时,语义轴回落 humanLabel,强度轴按 evidence 重放现算(behavior 重放口径统一后可用)。
+ */
+export function scoreGoldenDual({ dataDir = DATA_DIR, goldenFile = null, classifyFn = classifyPrompt, behaviorFrom = null } = {}) {
+  const file = goldenFile || path.join(dataDir, 'routing', 'golden-set.jsonl');
+  let rows = [];
+  try {
+    rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch { return { error: `黄金集不可读: ${file}` }; }
+  const toIntensity = (t) => (t === 'multi' ? 'heavy' : t === 'light' ? 'light' : t === 'routine' ? 'normal' : null);
+  // 默认重放器:行为票口径(labelFromShape 同口径 w≥3||calls≥15 ⇒ multi;写1-2 ⇒ routine;零工具 ⇒ light)
+  const replay = behaviorFrom || ((r) => {
+    const ev = r.evidence || {};
+    const calls = Number(ev.toolCalls);
+    const writes = Number(ev.writeEdits);
+    if (!Number.isFinite(calls) || !Number.isFinite(writes)) return null;
+    if (writes === 0 && calls === 0) return { type: 'light' };
+    if (writes >= 3 || calls >= 15) return { type: 'multi' };
+    if (writes >= 1) return { type: 'routine' };
+    return null;
+  });
+  const semantic = { perType: {}, hit: 0, n: 0 };
+  const intensity = { perType: {}, hit: 0, n: 0 };
+  const misses = [];
+  for (const r of rows) {
+    // 语义轴:真值取 semanticType,缺则回落 humanLabel(旧行兼容);预测 = L1 词法
+    const semTruth = normalizeType(String(r.semanticType || r.humanLabel || ''));
+    if (SEMANTIC_AXIS.includes(semTruth)) {
+      const pred = normalizeType(classifyFn(r.prompt)?.type ?? 'uncertain');
+      const p = semantic.perType[semTruth] || (semantic.perType[semTruth] = { actual: 0, hit: 0 });
+      p.actual += 1; semantic.n += 1;
+      if (pred === semTruth) { p.hit += 1; semantic.hit += 1; }
+      else misses.push({ axis: 'semantic', id: r.id, actual: semTruth, pred, promptHead: String(r.prompt || '').slice(0, 60) });
+    }
+    // 强度轴:真值取 intensityType(签入时行为票的结果),预测 = 由 evidence 重放的行为票
+    // (重放口径与投票口径统一 ⇒ 这一格量的是"**签时与现在的行为判定是否一致**",不是自证的分类准确率;
+    //  签时用 labelFromShape,评测用重放,两者若有偏差会被这一格暴露出来)。
+    const intTruth = r.intensityType ? String(r.intensityType) : null;
+    if (intTruth && INTENSITY_AXIS.includes(intTruth)) {
+      const b = replay(r);
+      const pred = toIntensity(b?.type);
+      const p = intensity.perType[intTruth] || (intensity.perType[intTruth] = { actual: 0, hit: 0 });
+      p.actual += 1; intensity.n += 1;
+      if (pred === intTruth) { p.hit += 1; intensity.hit += 1; }
+      else misses.push({ axis: 'intensity', id: r.id, actual: intTruth, pred, promptHead: String(r.prompt || '').slice(0, 60) });
+    }
+  }
+  const acc = (o) => (o.n ? Number((o.hit / o.n).toFixed(3)) : null);
+  const perOut = (o) => {
+    const out = {};
+    for (const [t, v] of Object.entries(o.perType)) out[t] = { actual: v.actual, hit: v.hit, acc: Number((v.hit / v.actual).toFixed(3)) };
+    return out;
+  };
+  return {
+    total: rows.length,
+    note: '双轴真值均为机器合议弱真值(无外部人工锚点),不得当作外部准确率',
+    semantic: { n: semantic.n, accuracy: acc(semantic), perType: perOut(semantic), axis: '语义形态轴(L1 词法 vs 意图侧合议真值)' },
+    intensity: { n: intensity.n, accuracy: acc(intensity), perType: perOut(intensity), axis: '行为强度轴(签时行为票 vs evidence 重放;量的是口径一致性,非分类准确率)' },
+    misses: misses.slice(0, 20),
+  };
+}
+
 // ---------- doctor ----------
 
 export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentModel = null, upstreamsFile = null, host = 'zcode' } = {}) {
@@ -651,7 +767,7 @@ export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentMod
   const upstreams = readUpstreamsSnapshot(upstreamsFile || path.join(dataDir, 'routing', 'proxy-upstreams.json'));
   // 四档链与代理端同口径:从快照按 tierOfModel 派生(brandPriority 用配置覆盖默认);role 人工链已废(2026-11-03)
   const brandPriority = Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY;
-  const tierChains = deriveTierChains(upstreams, { brandPriority });
+  const tierChains = deriveTierChains(upstreams, { brandPriority, ...tierClassifyOptions(c, dataDir) });
   // 同名取序(2026-11-05):providerPriority(配置)优先,未进表的同名供应商按快照采集的 providerOrder
   // (宿主 UI 拖动序;Qoder 端=设置文件键序)排;报告口径=--host(默认 zcode)。配置同键 providerOrder 可覆盖快照序。
   const providerOrder = Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[host]) ? upstreams.providerOrder[host] : []);
@@ -665,6 +781,12 @@ export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentMod
   const proxyWarnings = resolved
     .filter((r) => r.result.providerId && !r.proxyReachable)
     .map((r) => `${r.tier} 档解析到 ${r.result.providerId}/${r.result.modelId},但代理快照里不可达(无 key / 不在清单 / 入口不一致)⇒ 代理端会判"不可达"并保持当前模型`);
+  // R4 链空提示(2026-11-06 设计内告警):R4=仅显式点名旗舰(v4 高档品牌 claude/gpt 普通款),池里没有
+  // 这类模型时链恒空——难度 R4 会被 resolveTier 静默降级到 R3(downgraded),客户端无感。属设计内行为,
+  // 但要点名让"用最强模型却拿到 R3"可解释;要接通 R4 须在客户端接入 claude/gpt 品牌模型并刷新快照。
+  if (tierChains && Array.isArray(tierChains.r4) && tierChains.r4.length === 0) {
+    proxyWarnings.push('R4 链为空:池内无高档品牌(claude/gpt)普通款模型,显式点名旗舰将静默降级到 R3 档(设计内;接入 claude/gpt 模型并刷新快照即可点亮)');
+  }
   // 同名多挂提示(2026-11-03 用户场景:多 Token Plan、同名模型不同额度):同名模型挂多个**可用**
   // 供应商(有 key、enabled)且未配 providerPriority 时,同名取序=快照键序——doctor 把它点名,
   // 提示把"额度多/想先调"的供应商写进 modelRouting.providerPriority(或链里 模型@供应商 钉死)。
@@ -707,12 +829,51 @@ export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentMod
 function b64(s) { return Buffer.from(String(s || ''), 'utf8').toString('base64'); }
 function unb64(s) { return Buffer.from(String(s || ''), 'base64').toString('utf8'); }
 
-/** L2 通电开关:显式 --l2 或配置 modelRouting.l2Shadow=true 才加载嵌入模型。
+/**
+ * L2 配置统一解析(2026-11-07 用户拍板收口嵌套):三个 L2 键语义是"总闸+两分闸"父子关系,目标形态
+ *   l2: { shadow(嵌入器资源总闸,原顶层 l2Shadow), vote:{minSim,minConf}(代签投票阈值,原 l2.minSim/minConf),
+ *         live:{enabled,minConf}(线上路由救回,原顶层 l2Live) }
+ * 新旧共用同一 `l2` 键名——旧配置的 l2:{minSim,minConf} 与新字段在同一对象内无冲突共存:
+ * **新结构优先、旧键回落**(兼容一个版本期后旧键可删)。四个消费方
+ * (l2ShadowEnabled/classifyRoute/autoExemplars.readL2MinConf/modelRouteProxy.mrRoutingOptions)统一走这里,
+ * 不得再各自散读。返回 {shadow, voteMinSim, voteMinConf, liveEnabled, liveMinConf}。
+ */
+export function resolveL2Config(mr = {}) {
+  const l2 = mr.l2 && typeof mr.l2 === 'object' && !Array.isArray(mr.l2) ? mr.l2 : {};
+  const vote = l2.vote && typeof l2.vote === 'object' && !Array.isArray(l2.vote) ? l2.vote : {};
+  const live = l2.live && typeof l2.live === 'object' && !Array.isArray(l2.live) ? l2.live : {};
+  const oldLive = mr.l2Live && typeof mr.l2Live === 'object' && !Array.isArray(mr.l2Live) ? mr.l2Live : {};
+  const num = (v) => Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null;
+  return {
+    // 总闸:新 l2.shadow 优先;缺则回落旧顶层 l2Shadow
+    shadow: l2.shadow !== undefined ? l2.shadow === true : mr.l2Shadow === true,
+    // 代签投票阈值:新 l2.vote 优先;缺则回落旧 l2.minSim/minConf(同键名旧形态)
+    voteMinSim: num(vote.minSim) ?? num(l2.minSim) ?? L2_MIN_SIM,
+    voteMinConf: num(vote.minConf) ?? num(l2.minConf) ?? L2_MIN_CONF,
+    // 线上救回:新 l2.live 优先;缺则回落旧顶层 l2Live;再缺 enabled=false/minConf=0.8(保守档)
+    liveEnabled: live.enabled !== undefined ? live.enabled === true : oldLive.enabled === true,
+    liveMinConf: num(live.minConf) ?? num(oldLive.minConf) ?? 0.8,
+  };
+}
+
+/** L2 通电开关:显式 --l2 或配置 l2.shadow=true(旧顶层 l2Shadow 兼容)才加载嵌入模型。
  *  默认关=影子/CLI 不碰嵌入后端(每轮影子子进程加载模型会与主会话争资源,而影子日志只是观测)。
  *  2026-11-01 实测:此前所有入口(--shadow-async/--classify)都不传 embedFn ⇒ L2 从未运行过,
  *  routing-shadow.jsonl 193 条全为 source:'none'。这里把"通电"变成一条开关,而不是默认行为。 */
 export function l2ShadowEnabled(cfg = {}, explicit = false) {
-  return explicit === true || !!(cfg.modelRouting && cfg.modelRouting.l2Shadow === true);
+  return explicit === true || resolveL2Config(cfg.modelRouting || {}).shadow;
+}
+
+/**
+ * 档位分类配置(2026-11-06 v4):从 modelRouting 段取 modelTiers(品牌三档表)与 lightSuffixes(轻量后缀),
+ * 缺省/非法回落默认。供 deriveTierChains/tierOfModel 的调用方统一解析——改档只改 data JSON 不动代码。
+ */
+export function tierClassifyOptions(cfg = null, dataDir = DATA_DIR) {
+  const c = cfg || readJson(path.join(dataDir, 'code-index.config.json')) || {};
+  const mr = c.modelRouting || {};
+  const modelTiers = mr.modelTiers && typeof mr.modelTiers === 'object' && !Array.isArray(mr.modelTiers) ? mr.modelTiers : DEFAULT_MODEL_TIERS;
+  const lightSuffixes = Array.isArray(mr.lightSuffixes) ? mr.lightSuffixes.map((s) => String(s).toLowerCase()) : DEFAULT_LIGHT_SUFFIXES;
+  return { modelTiers, lightSuffixes };
 }
 
 export async function l2EmbedFn({ dataDir = DATA_DIR, explicit = false } = {}) {
@@ -756,7 +917,7 @@ async function cli(argv) {
     const mr = cfg.modelRouting || {};
     const upstreams = readUpstreamsSnapshot(path.join(dataDir, 'routing', 'proxy-upstreams.json'));
     const brandPriority = Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY;
-    const r = resolveTier(tier, { cfg: { ...cfg, modelRouting: { ...mr, chains: deriveTierChains(upstreams, { brandPriority }), providerOrder: Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[val('--host', 'zcode')]) ? upstreams.providerOrder[val('--host', 'zcode')] : []) } }, inventory: inventoryFromUpstreams(upstreams), health: readHealth(dataDir), currentModel });
+    const r = resolveTier(tier, { cfg: { ...cfg, modelRouting: { ...mr, chains: deriveTierChains(upstreams, { brandPriority, ...tierClassifyOptions(cfg, dataDir) }), providerOrder: Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[val('--host', 'zcode')]) ? upstreams.providerOrder[val('--host', 'zcode')] : []) } }, inventory: inventoryFromUpstreams(upstreams), health: readHealth(dataDir), currentModel });
     console.log(JSON.stringify(r));
     return;
   }
@@ -776,6 +937,10 @@ async function cli(argv) {
   }
   if (has('--score-golden-tier')) {
     console.log(JSON.stringify(scoreGoldenTier({ dataDir, goldenFile: val('--golden', null) }), null, 1));
+    return;
+  }
+  if (has('--score-golden-dual')) {
+    console.log(JSON.stringify(scoreGoldenDual({ dataDir, goldenFile: val('--golden', null) }), null, 1));
     return;
   }
   if (has('--doctor')) {

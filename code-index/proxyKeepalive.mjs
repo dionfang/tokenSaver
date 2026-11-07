@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DATA_DIR } from './config.mjs';
 import { pidAlive, spawnLogged } from './proc.mjs';
+import { isAutoModelName } from './virtualProvider.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -129,7 +130,9 @@ export function shouldEnsureProxy(payload, { models = [] } = {}) {
       : { needed: false, reason: `载荷供应商=${provider}(非虚拟条目,不拉起)` };
   }
   const model = modelHintOf(payload);
-  if (model && models.length && !models.includes(model)) {
+  // 动态显示名(2026-11-07):虚拟条目名可为 "auto×0.189" 形态——判定走 isAutoModelName
+  // (剔除 × 后缀再比较),纯清单 includes 会把带后缀的动态名误判成"非路由会话"而漏拉起。
+  if (model && models.length && !isAutoModelName(model) && !models.includes(model)) {
     return { needed: false, reason: `载荷模型=${model} 不在虚拟条目清单(非路由会话)` };
   }
   if (model) return { needed: true, reason: `载荷模型=${model} 命中虚拟清单或来源不可辨(保活)` };

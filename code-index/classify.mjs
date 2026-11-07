@@ -71,6 +71,12 @@ export const LEGACY_TYPE_MAP = { T1: 'light', T2: 'routine', T3: 'routine', T4: 
 /** 类型归一:旧八类值折叠为新三类;新值/未知值原样返回。 */
 export function normalizeType(t) { return LEGACY_TYPE_MAP[t] || t; }
 
+/** 方案空想词(无实方案名词的"怎么做/想想"):isInquiryShape 与决策树 T5 分支共用。
+ *  2026-11-06 从 classifyRules 内提升为模块级——原为函数内局部常量,模块级 isInquiryShape 引用它会抛
+ *  ReferenceError 并被上游 catch 吞掉,黄金集复核整轮静默失效(P0 修复)。 */
+const PLAN_TASKLESS = new Set(['怎么做', '如何做', '想想', '思考一下', '盘一下']);
+export { PLAN_TASKLESS };
+
 /** 疑问/征询形态(2026-11-06 multi 标签翻案判据):有疑问结构(疑问词)+ 无祈使前缀
  *  + 无实改组锚(范围×重构 / 清剿式修复/结构性移除合成证据 / 强方案名词)⇒ 这条话是"问"不是"做"。
  *  消费方=autoExemplars.reviewGolden 的 multi 一票否决(行为票会把会话级工作强度漏进单轮标签)。
@@ -264,8 +270,7 @@ export function classifyRules(prompt, opts = {}) {
   }
   // T5:方案/规划
   // multi(旧 T5):方案/规划=深权衡的重活。疑问守卫只拦"纯征询"('这个怎么做'这类空想词,无实方案名词);
-  // 有实方案名词('出一版详细设计,怎么做才稳妥')即任务,不拦。
-  const PLAN_TASKLESS = new Set(['怎么做', '如何做', '想想', '思考一下', '盘一下']);
+  // 有实方案名词('出一版详细设计,怎么做才稳妥')即任务,不拦。(PLAN_TASKLESS 已提升为模块级常量)
   if (act(plan, 'plan', weights)) {
     const strongPlan = plan.filter((w) => !PLAN_TASKLESS.has(w));
     if (verify.length && !imperative.length && !strongPlan.length) return null;

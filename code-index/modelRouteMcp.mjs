@@ -7,8 +7,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from './config.mjs';
-import { classifyRoute, l2EmbedFn } from './modelRoute.mjs';
+import { classifyRoute, l2EmbedFn, tierOfModel, tierClassifyOptions } from './modelRoute.mjs';
 import { readHealth, markHealth, clearHealth } from './modelRoute.mjs';
+import { blendedRate, loadModelPrices } from './costProfile.mjs';
 
 const SERVER_INFO = { name: 'model-route-mcp', version: '1.0.0' };
 
@@ -27,7 +28,16 @@ function usageReport({ dataDir = DATA_DIR } = {}) {
   const rl = read(path.join(dataDir, 'usage', 'routing-log.jsonl'));
   const types = {};
   for (const r of rl) types[r.type ?? 'uncertain'] = (types[r.type ?? 'uncertain'] || 0) + 1;
-  return { agentUsage: byTool, routingLog: { records: rl.length, typeDistribution: types } };
+  // 代理账本按档位聚合(2026-11-06 v4):复用 blendedRate 单一价格口径(rowCost 按 model-prices.json
+  // 四档表计价,tier 缺失按 tierOfModel 推档);费率表缺失时 rate/cost 为 null,byTier 仍按档计数。
+  let proxyUsage = null;
+  try {
+    const prices = loadModelPrices({ dataDir });
+    const tcls = tierClassifyOptions(null, dataDir);
+    const r = blendedRate({ rows: read(path.join(dataDir, 'usage', 'proxy-usage.jsonl')), priceTable: prices, tierOf: (m) => tierOfModel(m, tcls) });
+    proxyUsage = { reqs: r.reqs, failed: r.failed, rate: r.rate, actualCost: r.actualCost, baseCost: r.baseCost, byTier: r.byTier };
+  } catch { /* 档位聚合失败不影响其余报表段 */ }
+  return { agentUsage: byTool, routingLog: { records: rl.length, typeDistribution: types }, proxyUsageByTier: proxyUsage };
 }
 
 const TOOLS = [
@@ -51,7 +61,7 @@ const TOOLS = [
   },
   {
     name: 'usage_report',
-    description: '用量与路由报表:agent-usage 按工具聚合 + routing-log 类型分布。',
+    description: '用量与路由报表:agent-usage 按工具聚合 + routing-log 类型分布 + 代理账本按档位聚合(proxyUsageByTier:各档 reqs/tokens 与综合费率,价格口径=model-prices.json)。',
     inputSchema: { type: 'object', properties: {} },
   },
 ];

@@ -322,7 +322,7 @@ async function main() {
   const gateLine = gateNoticeLine();
   if (gateLine) parts.push(gateLine);
   // auto 综合费率行(2026-11-05):仅路由宿主注入,受 modelRouting.blendNotice.enabled 开关(默认开)门控;
-  // 口径 A(实际费 ÷ R1 基准费)按**最近会话**(文件按 conv 覆盖,钩子载荷无会话键可核,不冒充"本会话")
+  // 口径 A(实际费 ÷ R3 基准费,2026-11-06 基准换挡)按**最近会话**(文件按 conv 覆盖,钩子载荷无会话键可核,不冒充"本会话")
   const blendLine = routingHostEnabled(host, cfg) ? blendNoticeLine(cfg) : null;
   if (blendLine) parts.push(blendLine);
   // 每轮实时状态句(最新值,模型原样搬运;会话开始那句仅作首轮兜底);无 prompt 时不注入
@@ -353,7 +353,8 @@ function gateNoticeLine() {
 
 /**
  * auto 综合费率行(2026-11-05,口径 A):读代理落盘的 data/usage/auto-blend.json(最近写入的 auto 会话累计),
- * 注入"[model-routing] 综合费率 ×N.NNN"——实际费 ÷ 同样 tokens 全走 R1 的费;×1=纯 R1,越大=高档用得越多。
+ * 注入"[model-routing] 综合费率 ×N.NNN"——实际费 ÷ 同样 tokens 全走 R3 的费(R3=1x 基准,2026-11-06 换挡);
+ * ×1=纯 R3 档流量,×0.05=纯 R1,越大=高档用得越多。
  * 档位分布与失败数一并带出(费率 null 时只带失败数)。
  * 开关 modelRouting.blendNotice.enabled(默认 true 注入);文件缺失/超 30 分钟旧(会话已断)不注入。fail-open。
  */
@@ -361,19 +362,32 @@ function blendNoticeLine(cfg) {
   try {
     if (cfg?.modelRouting?.blendNotice?.enabled === false) return null;
     const j = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage', 'auto-blend.json'), 'utf8'));
-    const hasRate = typeof j.rate === 'number' && Number.isFinite(j.rate);
-    const hasFailed = Number(j.failed) > 0;
-    if (!j || (!hasRate && !hasFailed)) return null;
+    if (!j) return null;
     if (Date.now() - Number(j.at || 0) > 30 * 60 * 1000) return null;
     const parts = [];
-    if (hasRate) {
-      const dist = Object.entries(j.byTier || {})
+    // 全期口径(2026-11-07 用户定案):单会话倍率波动极大(1-2 轮的会话 0.005~1.43 都可能)且
+    // 会话内模型名已定影,当期会话倍率没有参考意义——注入行显示全期累计倍率(跨会话单调累计,
+    // 首次由代理从账本全量重算做种子),本会话失败信息仍单独提示。
+    const g = j.global || null;
+    const gRate = g && typeof j.globalRate === 'number' && Number.isFinite(j.globalRate) ? j.globalRate : null;
+    if (gRate != null) {
+      const dist = Object.entries(g.byTier || {})
         .sort((a, b) => b[1].reqs - a[1].reqs)
         .map(([t, v]) => `${t}${v.reqs}轮`).join('/');
-      parts.push(`[model-routing] auto 综合费率 ×${j.rate.toFixed(3)}(最近会话 ${j.reqs} 轮${dist ? ':' + dist : ''})`);
+      parts.push(`[model-routing] auto 综合费率 ×${gRate.toFixed(3)}(全期 ${g.reqs} 轮${dist ? ':' + dist : ''})`);
+    } else {
+      // 兜底:文件尚未被新版代理更新过(无 global 段)→ 沿用最近会话口径
+      const hasRate = typeof j.rate === 'number' && Number.isFinite(j.rate);
+      if (hasRate) {
+        const dist = Object.entries(j.byTier || {})
+          .sort((a, b) => b[1].reqs - a[1].reqs)
+          .map(([t, v]) => `${t}${v.reqs}轮`).join('/');
+        parts.push(`[model-routing] auto 综合费率 ×${j.rate.toFixed(3)}(最近会话 ${j.reqs} 轮${dist ? ':' + dist : ''})`);
+      }
     }
-    if (hasFailed) parts.push(parts.length ? `失败 ${j.failed} 轮` : `[model-routing] auto 最近会话失败 ${j.failed} 轮(费率未定)`);
-    return parts.join(';');
+    const hasFailed = Number(j.failed) > 0;
+    if (hasFailed) parts.push(parts.length ? `本会话失败 ${j.failed} 轮` : `[model-routing] auto 本会话失败 ${j.failed} 轮(费率未定)`);
+    return parts.length ? parts.join(';') : null;
   } catch { return null; }
 }
 

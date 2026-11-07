@@ -97,6 +97,19 @@ async function main() {
         console.error('[decision-model] 断路器开启,已后台探活(成功自动复位,失败保持跳闸;留痕 data/routing/decision-model-breaker.json)');
       }
     } catch { /* 探活判定/拉起失败不影响会话 */ }
+    // 动态显示名刷新(2026-11-07 用户定案,唯一挂载点):会话开启时读**全量倍率**(globalRate,
+    // 跨会话累计——单会话口径波动大且会话内名字定影后无参考意义)刷进两端用户级条目名
+    // (auto×0.189 形态)。global 段由代理累计维护;缺失(新版代理还没跑过)时保持现名,fail-open。
+    try {
+      const blend = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage', 'auto-blend.json'), 'utf8'));
+      const rate = blend && Number.isFinite(Number(blend.globalRate)) ? Number(blend.globalRate) : null;
+      if (rate != null && rate > 0) {
+        const { refreshAutoModelName } = await import('./virtualProvider.mjs');
+        const rr = refreshAutoModelName({ rate });
+        const changed = [rr.zcode, rr.qoder].some((x) => x && x.refreshed);
+        if (changed) console.error(`[auto-name] 条目名已按全期费率刷成 ${rr.zcode?.note || rr.qoder?.note}(会话开启时刷新)`);
+      }
+    } catch { /* 刷名失败不影响会话 */ }
     const f = evalFreshness();
     if (f.need) {
       console.error(`[index] 保鲜判定:需要处理(${f.reason})`);

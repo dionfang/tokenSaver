@@ -127,9 +127,16 @@ export const DEFAULT_CONFIG = {
   // 二次人工配置:改 data/code-index.config.json 的 modelRouting 段(2026-11-03 起 role 两档制已废:routeMode/roles/chains
   // 均不再被读取,四档链恒由快照派生;providerPriority/brandPriority 仍生效)。
   // l2Shadow=true 才让影子级联加载嵌入模型(L2 kNN 通电);默认关——每轮影子起子进程加载模型会与主会话争资源。
+  // l2Live(2026-11-06 进化回路接通):{enabled=false, minConf=0.8}——代理实弹的 L2 融合票(词法判 R1 但 kNN 投 multi
+  //   且置信≥minConf ⇒ 救回 R2,只救回不压制),依赖嵌入模型与向量库,默认关;开了 l2Shadow 嵌入器才可用,两者需同开。
+  //   minConf 2026-11-06 实测定档 0.3(=旧口径 0.75 的同分位操作点;置信口径换边际差值后旧 0.6-0.8 几乎不触发)。
   // brandPriority(2026-11-03 用户需求):自定义品牌调用顺序,只决定"同一档位内谁先被调"(四档链档内排序主键),
   //   **不影响档位归属**(tierOfModel/classifyDifficulty/resolveTier 级联照旧)——即"不影响动态模型路由的调用档位"。
   //   未在列表里的品牌排到所有已列品牌之后;可改 data/code-index.config.json 的 modelRouting.brandPriority 覆盖。
+  // modelTiers/lightSuffixes(2026-11-06 v4 用户定档;v4.1 grok/gemini 移入 mid、后缀表补 sol/sonnet):模型名→档位的品牌面,全部可改 data JSON。
+  //   modelTiers=品牌三档默认表(normal=deepseek/glm/qwen/minimax→R2 / mid=kimi/grok/gemini→R3 / high=claude/gpt→R4,
+  //   未识别品牌按 normal 兜底);lightSuffixes=轻量版本后缀(命中即默认档降一档,R1 封底,flash 恒 R1)。
+  //   pro/max 不特殊:档位语义与品牌等级一一对应。改这里即可重排四档链,不用动代码。
   // retryOnRateLimit(2026-11-03):运行时 429/5xx 同轮重选开关,默认 true——转发拿到可重试错误时不向客户端透传空回复,
   //   而是同轮冷却失败模型→重跑 resolveTier(档内滑下一个 / R4→R3→R2→R1 降档)→换模型重发;maxRetries=同轮最多重发次数
   //   (默认 2,硬上限 5)。只在 tier 模式且能重解析出新模型时才真的重发,否则等价旧的单次透传;设 false 整体关闭回到旧行为。
@@ -157,7 +164,7 @@ export const DEFAULT_CONFIG = {
   //   minIntervalMs=节流间隔(默认 6h);folds/minN/priorN=折数/最小支持/平滑先验,量尺小时加大 priorN 更保守;
   //   grow=false 只评不扩样;fitCost=true 从 proxy-usage.jsonl 反标定冷热轮实测值(默认用人工画像);
   //   dry=true 只出报告不落档案;allowBoost=false 学到的高纯度信号也只降不升(升档代价 8 倍,升权是加杠杆)。
-  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], l2Shadow: false, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }], chunkSize: 1 }, brandPriority: ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], maxPhaseTurns: 4, switchGuard: { enabled: true, maxContextTokens: 200000 }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
+  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }], chunkSize: 1 }, brandPriority: ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: 4, switchGuard: { enabled: true, maxContextTokens: 200000 }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
 };
 
 export function loadConfig() {

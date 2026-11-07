@@ -47,8 +47,9 @@ import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
-import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY } from './modelRoute.mjs';
+import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { blendedRate, loadModelPrices } from './costProfile.mjs';
+import { isAutoModelName, normalizeAutoModel } from './virtualProvider.mjs';
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -580,7 +581,7 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE } = {}
       apiKey = prev.apiKey || apiKey;
       isIngress = true;
     }
-    const listed = models.filter((m) => m !== AUTO_MODEL);
+    const listed = models.filter((m) => !isAutoModelName(m));
     providers[pid] = {
       baseUrl: base,
       apiKey,
@@ -658,15 +659,16 @@ export function pickUpstream({ providerId, model, upstreams } = {}) {
 }
 
 /**
- * auto 综合费率落地(2026-11-05,口径 A:实际费 ÷ R1 基准费):
+ * auto 综合费率落地(2026-11-05,口径 A;2026-11-06 基准换挡:实际费 ÷ R3 基准费,R3=1x):
  * 每请求按 conv 累计进 data/usage/auto-blend.json(单文件最新会话覆盖,与 gate-notice 同先例),
  * prompt-guard 读它注入综合费率行。费率表(data/routing/model-prices.json)缺省时静默跳过。
  * fail-open:任何异常不写、不影响转发。
  */
-export function updateAutoBlend({ dataDir = DATA_DIR, conv = null, row = null, priceTable = null } = {}) {
+export function updateAutoBlend({ dataDir = DATA_DIR, conv = null, row = null, priceTable = null, configPath = null } = {}) {
   try {
     if (!conv || !row || !priceTable) return null;
-    const blended = blendedRate({ rows: [row], priceTable, tierOf: (m) => tierOfModel(m) });
+    const ro = mrRoutingOptions(configPath || path.join(DATA_DIR, 'code-index.config.json'));
+    const blended = blendedRate({ rows: [row], priceTable, tierOf: (m) => tierOfModel(m, { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes }) });
     if (!blended || (!blended.reqs && !blended.failed)) return null;
     const file = path.join(dataDir, 'usage', 'auto-blend.json');
     let cur = null;
@@ -686,10 +688,52 @@ export function updateAutoBlend({ dataDir = DATA_DIR, conv = null, row = null, p
       e.reqs += v.reqs;
       e.tokens += v.tokens;
     }
+    // 全期累计段(2026-11-07 用户定案:注入行/模型名定影都改读全量口径——单会话倍率波动极大且
+    // 会话内名字已定影,参考价值低)。首次缺失时从账本全量重算做种子,此后跨会话单调累计。
+    if (!cur.global || typeof cur.global !== 'object') cur.global = seedGlobalBlend({ dataDir, priceTable, configPath });
+    cur.global.actualCost = (Number(cur.global.actualCost) || 0) + blended.actualCost;
+    cur.global.baseCost = (Number(cur.global.baseCost) || 0) + blended.baseCost;
+    cur.global.reqs = (Number(cur.global.reqs) || 0) + blended.reqs;
+    cur.global.failed = (Number(cur.global.failed) || 0) + blended.failed;
+    for (const [t, v] of Object.entries(blended.byTier)) {
+      const e = cur.global.byTier[t] = cur.global.byTier[t] || { reqs: 0, tokens: 0 };
+      e.reqs += v.reqs;
+      e.tokens += v.tokens;
+    }
+    cur.globalRate = cur.global.baseCost > 0 ? Number((cur.global.actualCost / cur.global.baseCost).toFixed(3)) : null;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(cur));
+    // 名字刷新不在这里(2026-11-07 用户定案):动态显示名的唯一挂载点=会话开启钩子(auto.mjs
+    // SessionStart),运行时不再刷——名字在会话生命周期内稳定,新会话开启才吸收最新费率。
     return cur;
   } catch { return null; }
+}
+
+/**
+ * 全期倍率种子(2026-11-07 用户定案,注入行/模型名定影都改读全量口径):从代理账本
+ * 全量重算 auto 流量的实际费与 R3 基准费(global 段缺失时一次性回填,此后增量累计)。
+ * 行内 tier/servedTier 缺失的旧行按 served 模型名推档(与 updateAutoBlend 同口径)。
+ * 只读账本,不写;算不出任何行返回零值。
+ */
+export function seedGlobalBlend({ dataDir = DATA_DIR, priceTable = null, configPath = null } = {}) {
+  const out = { actualCost: 0, baseCost: 0, reqs: 0, failed: 0, byTier: {} };
+  try {
+    const ro = mrRoutingOptions(configPath || path.join(DATA_DIR, 'code-index.config.json'));
+    const prices = priceTable || loadModelPrices({ dataDir });
+    if (!prices?.tiers) return out;
+    const rows = readJsonlSafe(path.join(dataDir, 'usage', 'proxy-usage.jsonl')).filter((r) => r.requested === AUTO_MODEL);
+    const blended = blendedRate({ rows, priceTable: prices, tierOf: (m) => tierOfModel(m, { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes }) });
+    out.actualCost = blended.actualCost || 0;
+    out.baseCost = blended.baseCost || 0;
+    out.reqs = blended.reqs || 0;
+    out.failed = blended.failed || 0;
+    out.byTier = blended.byTier || {};
+  } catch { /* 全量重算失败 = 从零开始累计 */ }
+  return out;
+}
+
+function readJsonlSafe(p) {
+  try { return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; }
 }
 
 /**
@@ -745,14 +789,16 @@ export function resolveAutoBase({ tierChains = {}, providerPriority = [], provid
   return { modelId: null, providerId: null, warn: '四档链全部为空', tier: null };
 }
 
-export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, loopStreak = 0 } = {}) {
+export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, loopStreak = 0, tierClassify = null } = {}) {
   const g = { ...DEFAULT_GUARD, ...(guard && typeof guard === 'object' ? guard : {}) };
   const inPhase = !!(phase && phase.model);
+  // 档位分类配置(2026-11-06 v4):品牌三档表+轻量后缀(调用方注入,缺省=内置默认)
+  const tcls = tierClassify && typeof tierClassify === 'object' ? { modelTiers: tierClassify.modelTiers, lightSuffixes: tierClassify.lightSuffixes } : {};
   // auto 档(2026-11-02):请求模型是虚拟名,没有"客户端所选真实模型"——
   // sticky 基准=R1 档链头解析;阶段/门控逻辑对 auto 同样成立(客户端恒发 auto,不存在"人工改档"路径)。
   const isAuto = requestedModel === AUTO_MODEL;
   // 四档链解析源(优先级:调用方 tierChains > 快照自派生)
-  const tc = tierChains || deriveTierChains(upstreams);
+  const tc = tierChains || deriveTierChains(upstreams, tcls.modelTiers ? tcls : {});
   // auto 基准供应商也要驻留并随决策带回(2026-11-05 修复):此前只回 model 不回 providerId,
   // pickUpstream 落到"按模型名找快照第一个持有者"——不查健康冷却、providerPriority 失效,
   // 同名多供应商时配额墙账号每轮被反复选中。
@@ -776,7 +822,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   // R4 恒不可达(仅显式点名旗舰)。上梯成功后调用方把 errStreak 清零,新档重新积累 2 连才继续上梯。
   // 返回 {decision} 上梯成功 | {mark:false} 已封顶/目标档不可达/门控抑制(落到普通工具续接,streak 保持)。
   const ESC_NEXT = { R1: 'R2', R2: 'R3', R3: null, R4: null };
-  const servingTier = tierOfModel(inPhase ? phase.model : baseModel) || 'R1';
+  const servingTier = tierOfModel(inPhase ? phase.model : baseModel, tcls.modelTiers ? tcls : undefined) || 'R1';
   const escTarget = ESC_NEXT[servingTier] || null;
   const tryEscalate = () => {
     if (!escTarget) return { mark: false, decision: null };
@@ -831,8 +877,8 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   //   - R4 跨档不粘(修正#2:R4→R2 盈亏平衡 0.3 轮,100x 下步降当轮即回本);目标档高于阶段档不粘
   //     (修正#3:阶段里点名旗舰要立即升,不能被粘住吞掉);
   //   - R1 降档不受切换税门控(修正#5),门控只拦升档。
-  const baseTier = tierOfModel(baseModel) || null;
-  const phaseTier = inPhase ? (phase.tier || tierOfModel(phase.model) || null) : null;
+  const baseTier = tierOfModel(baseModel, tcls.modelTiers ? tcls : undefined) || null;
+  const phaseTier = inPhase ? (phase.tier || tierOfModel(phase.model, tcls.modelTiers ? tcls : undefined) || null) : null;
   const effTier = inPhase ? phaseTier : baseTier;
   const r1Asks = diff?.tier === 'R1';
   // 歧义→便宜档(2026-11-04 用户定策,代码内置不可配——与健康冷却 TTL 同先例):
@@ -1116,7 +1162,7 @@ function commitBufferedError(clientRes, usage) {
   } catch { try { clientRes.end(); } catch { /* 客户端已断开 */ } }
 }
 
-function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG) {
+function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG, configPath = null) {
   try {
     fs.mkdirSync(path.dirname(usageFile), { recursive: true });
     fs.appendFileSync(usageFile, JSON.stringify(rec) + '\n');
@@ -1126,7 +1172,7 @@ function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG) {
   if (rec.conv && rec.served && rec.requested === AUTO_MODEL) {
     try {
       const prices = loadModelPrices({ dataDir: DATA_DIR });
-      if (prices) updateAutoBlend({ dataDir: DATA_DIR, conv: rec.conv, row: rec, priceTable: prices });
+      if (prices) updateAutoBlend({ dataDir: DATA_DIR, conv: rec.conv, row: rec, priceTable: prices, configPath });
     } catch { /* 费率累计失败不影响记账 */ }
   }
 }
@@ -1136,6 +1182,7 @@ function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG) {
 export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE, basePath = '/apps/anthropic', chainsOverride = null, usageFile = PROXY_USAGE_LOG, healthDataDir = DATA_DIR, configPath = path.join(DATA_DIR, 'code-index.config.json') } = {}) {
   // chainsOverride:测试注入的四档位链(生产恒走快照派生)
   const state = new Map(); // convKey → {model,baseRequested,humanTurns}:升档阶段驻留(#1/#5 阶段粘住)
+  const sessionL2 = { embedFn: undefined, vectors: undefined }; // L2 融合票缓存(l2Live 关着时永不初始化)
   const server = http.createServer((req, res) => {
     const chunks = [];
     let size = 0;
@@ -1152,6 +1199,10 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       const adapter = bodyObj ? pickProtocolAdapter(req.url) : null;
       const convKey = convKeyOf(bodyObj, req.url, adapter || anthropicAdapter);
       prunePhases(state); // 空闲超限/超量的阶段先回收(H6)
+      // 动态显示名规范化(2026-11-07):客户端条目名可为 "auto×0.189" 形态(综合费率后缀,由
+      // refreshAutoModelName 写入用户级配置),入口统一剥后缀回纯 'auto' 再走全链——
+      // 下游 isAuto 严格匹配/账本口径零改动保持连续;非 auto 系名字原样透传。
+      if (bodyObj && isAutoModelName(bodyObj.model)) bodyObj.model = normalizeAutoModel(bodyObj.model);
       const requestedModel = bodyObj?.model || ''; // 改写前先留存:账本要能对出"客户端要什么/实际谁服务"
       let targetModel = requestedModel;
       let decision = { reason: 'passthrough' };
@@ -1174,6 +1225,23 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         // 档案(mtime 缓存,默认 disabled)⇒ 人工 --enable 后这里真的改判;读不到/未启用 = 纯词法,零影响
         if (lastKind === 'human') {
           try { diffDecision = classifyDifficulty(adapter.lastHumanText(bodyObj.messages), { calibration: loadTierCalibration() }); } catch { diffDecision = null; }
+          // L2 融合票(2026-11-06 进化回路接通):词法判 R1 但 kNN 投 multi 且置信过 l2Live.minConf ⇒ 救回 R2。
+          // modelRouting.l2Live.{enabled,minConf} 门控(ro 每请求现读,改配置即时生效),全程 fail-open:
+          // 向量表缺失/嵌入失败/任何异常 = 维持词法定档,零影响。embedFn/vectors 按会话缓存(热路径不重载)。
+          if (diffDecision && diffDecision.tier === 'R1' && ro.l2Live.enabled) {
+            try {
+              const l2fn = sessionL2.embedFn || (sessionL2.embedFn = await l2EmbedFn({ dataDir: DATA_DIR }));
+              if (l2fn) {
+                const doc = sessionL2.vectors || (sessionL2.vectors = loadVectors(DATA_DIR));
+                if (doc && doc.vectors) {
+                  const vec = await l2fn(adapter.lastHumanText(bodyObj.messages));
+                  const knn = knnClassify(vec, doc);
+                  const rescue = l2TierRescue(diffDecision, knn, { minConf: ro.l2Live.minConf });
+                  if (rescue) diffDecision = { ...diffDecision, tier: rescue.tier, confidence: rescue.confidence, reason: `${diffDecision.reason}+${rescue.rule}` };
+                }
+              }
+            } catch { /* L2 融合失败 = 维持词法定档 */ }
+          }
         }
         // 证据升级(P2,逐级上梯):连续 2 个工具轮含报错 tool_result → 申请上梯;
         // 目标档=当前服务档+1(decideTarget 内定,封顶 R3),上梯成功后 errStreak 清零重新积累
@@ -1193,7 +1261,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           escalate = errStreak >= 2 || loopStreak > 0;
         }
         // 四档链(同一份快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序;chainsOverride=测试注入的档位链)
-        const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority });
+        const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority, modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes });
         retryCtx = { ro, tierChains, providerOrder }; // 留给运行时 429 同轮重选:重跑 resolveTier 档内滑/降档
         // 健康/库存快照每轮读一次:实弹决策与难度裸解析审计共用(此前审计块各自重读一遍,同参数重复计算)
         const health0 = readHealth(healthDataDir);
@@ -1205,6 +1273,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           health: health0, upstreams,
           phase: phase0, guard: switchGuard(configPath), contextBytes: size,
           errStreak, escalate, loopStreak,
+          tierClassify: { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes },
         });
         decision = d;
         // 门控通知(2026-11-05):拦截连击/疲劳放行落 data/usage/gate-notice.json,prompt-guard 据此注入压缩建议
@@ -1238,7 +1307,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               decisionTier: d.tier || null,
               escalated: d.escalated === true || !!(d.nextPhase && d.nextPhase.escalated === true),
               switched: d.switched == null ? null : !!d.switched,
-              servedTier: tierOfModel(d.model || requestedModel) || null,
+              servedTier: tierOfModel(d.model || requestedModel, { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes }) || null,
               ambWouldTier: amb ? (amb.tier || null) : null,
               ambWouldModel: amb ? (amb.modelId || null) : null,
               host: reqHost,
@@ -1291,7 +1360,9 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       // 滑档起点(2026-11-04 用户定档):难度定档轮(R2-R4 及 R1 降档轮,decision.tier 有值)从生效档起滑;
       // sticky 请求(具体模型名且未触发 R1 降档、工具续接沿用模型)从 sticky 模型自身所在档位(tierOfModel)起滑。
       const rc = retryConfig(configPath);
-      const slideTier = decision.tier || (targetModel ? tierOfModel(targetModel) : null);
+      // ro 只在 adapter 分支作用域内;重试滑档用 retryCtx.ro(同一请求已捕获的配置),无则回落默认
+      const roSlide = retryCtx?.ro || { modelTiers: DEFAULT_MODEL_TIERS, lightSuffixes: DEFAULT_LIGHT_SUFFIXES };
+      const slideTier = decision.tier || (targetModel ? tierOfModel(targetModel, { modelTiers: roSlide.modelTiers, lightSuffixes: roSlide.lightSuffixes }) : null);
       const canRetryRoute = rc.enabled && !!retryCtx && !!slideTier;
       let curUpstream = pickUpstream({ providerId: decision.providerId, model: targetModel, upstreams });
       let curModel = targetModel;
@@ -1371,6 +1442,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         switched: decision.switched, reason: decision.reason,
         // 决策证据(2026-11-03 tier 唯一):l1Type=L1 分类,diffTier=难度定档,tier=实际生效档
         l1Type, tier: decision.tier || null,
+        servedTier: (usage.served || curModel) ? tierOfModel(usage.served || curModel, { modelTiers: retryCtx?.ro?.modelTiers, lightSuffixes: retryCtx?.ro?.lightSuffixes }) || null : null, // 实弹服务模型所在档(2026-11-06 计价轴:rowCost 优先按它计价)
         suppressed: decision.suppressed, estTokens: estimateContextTokens(size),
         escalated: decision.escalated === true || state.get(convKey)?.escalated === true, routeMode,
         // 死循环证据(2026-11-05 A 项;2026-11-06 起 loopRepeat 记原始尾连数,阈值下也记,供日后调阈值)
@@ -1380,7 +1452,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         cooled: cool || null, phaseTurns: state.get(convKey)?.humanTurns || 0,
         aborted: usage.aborted === true, // 客户端中断轮:上游已被拆除,本轮 outTok 只计到中断点
         durationMs: Date.now() - started,
-      }, usageFile);
+      }, usageFile, configPath);
     });
   });
   return server;
@@ -1395,19 +1467,34 @@ function fallbackUpstream(upstreams) {
 // inventory 统一由 modelRoute.mjs 的 inventoryFromUpstreams 提供(查询端/改写端同一份口径)。
 
 /** 代理改写端的解析输入:两个键一次取齐,缺省回落解析器默认。 */
-function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.config.json')) {
+/** L2 融合票开关(嵌套收口后由 resolveL2Config 统一解析,本函数保留供外部核对):
+ *  l2.live.enabled(旧顶层 l2Live.enabled 兼容)显式 true 才通电,默认关——
+ *  每轮嵌入与 3MB 向量表加载有成本;开着 live 不开 shadow 时 l2EmbedFn 返回 null(嵌入器未就绪),零影响。 */
+export function l2LiveEnabled(configPath = path.join(DATA_DIR, 'code-index.config.json')) {
+  try {
+    return resolveL2Config(readJson(configPath)?.modelRouting || {}).liveEnabled;
+  } catch { return false; }
+}
+
+/** 代理改写端的解析输入:两个键一次取齐,缺省回落解析器默认。导出供测试核 l2Live 透传。 */
+export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.config.json')) {
   const mr = readJson(configPath)?.modelRouting || {};
+  const l2c = resolveL2Config(mr); // L2 统一解析(嵌套收口,新结构优先旧键回落)
   return {
     providerPriority: Array.isArray(mr.providerPriority) ? mr.providerPriority : [],
     aliases: mr.aliases && typeof mr.aliases === 'object' && !Array.isArray(mr.aliases) ? mr.aliases : {},
     // 品牌优先序(2026-11-03):config.modelRouting.brandPriority 覆盖默认;只排四档链档内顺序,不改档位归属
     brandPriority: Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY,
+    // 档位分类配置(2026-11-06 v4):品牌三档表 + 轻量后缀,代理侧 tierOfModel/deriveTierChains 与 doctor/CLI 同口径
+    modelTiers: mr.modelTiers && typeof mr.modelTiers === 'object' && !Array.isArray(mr.modelTiers) ? mr.modelTiers : DEFAULT_MODEL_TIERS,
+    lightSuffixes: Array.isArray(mr.lightSuffixes) ? mr.lightSuffixes.map((s) => String(s).toLowerCase()) : DEFAULT_LIGHT_SUFFIXES,
+    // L2 融合票(2026-11-07 嵌套收口):统一走 resolveL2Config 的 liveEnabled/liveMinConf
+    // (新 l2.live 优先,旧顶层 l2Live 回落);minConf 缺省 0.8 保守档。
+    l2Live: { enabled: l2c.liveEnabled, minConf: l2c.liveMinConf },
   };
 }
 
-function hash(s) { let h = 0; for (let i = 0; i < s.length; i += 1) { h = (h * 31 + s.charCodeAt(i)) | 0; } return h; }
-
-// ---------- CLI ----------
+function hash(s) { let h = 0; for (let i = 0; i < s.length; i += 1) { h = (h * 31 + s.charCodeAt(i)) | 0; } return h; }// ---------- CLI ----------
 
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(self);
 if (directRun) {

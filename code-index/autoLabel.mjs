@@ -38,6 +38,49 @@ export function signable(prompt) {
 }
 
 /**
+ * 双轴标签(2026-11-06):把"这轮是重活/例行/杂务"这一个标签拆成**两个正交轴**——
+ *   语义形态轴 semanticType = multi/routine/light:由 L1 词法 / L2 向量 / 决策模型合议得出,
+ *     回答"**这句话要求的是不是多点改组**"(意图侧,prompt 形态);
+ *   行为强度轴 intensityType = heavy/normal/light:由行为票(该轮实际写了几次文件/调了几次工具)得出,
+ *     回答"**这一轮实际干了多重的活**"(结果侧,evidence 重放)。
+ * 为什么拆:此前两者塞进同一个 humanLabel 比较,而黄金集的 multi 实际是**行为强度标签**(46/46 行为 heavy),
+ * L1 的 multi 却是**句式形态标签**(只认出 7/46)⇒ 同一标签名下两把尺子,multi 一致率被压到 0.2,
+ * 连带 scoreGoldenTier 的 R2 门禁(acc 0.362)不过。拆开后各轴各评各的,天花板才可能翻。
+ * 两轴都是机器合议的**弱真值**,不是外部人工真值——报告里必须这样标注,不得冒充准确率。
+ */
+export const SEMANTIC_AXIS = ['multi', 'routine', 'light'];
+export const INTENSITY_AXIS = ['heavy', 'normal', 'light'];
+
+/** 行为强度标签(three-class 行为票)→ 双轴的强度轴取值。行为票只认 heavy(写≥3/调用≥15)与 light(零工具),中间=normal。 */
+export function toIntensity(type) {
+  const t = String(type || '');
+  if (t === 'multi') return 'heavy';
+  if (t === 'light') return 'light';
+  if (t === 'routine') return 'normal';
+  return null;
+}
+
+/**
+ * 双轴投票:同一批 voters 分两轴各算一次(纯函数)。
+ *   语义轴票源 = l1 / l2 / decision(意图侧);强度轴票源 = behavior(结果侧,唯一来源);
+ *   行为票**不参与**语义轴计票,决策/L1/L2 **不参与**强度轴——两轴互不污染。
+ * 强度轴只有行为票一个源 ⇒ 单源不构成 quorum(沿用"≥2 票且 ≥2 源"纪律的"源数≥1 即出结果"例外:
+ *   强度轴本就只有一条证据通道,拿不出票就置 null,不猜)。
+ * 返回 {semantic:{type,votes,sources,agreement}, intensity:{...}}。
+ */
+export function voteLabelDual(voters = {}) {
+  const semanticVoters = {};
+  for (const k of ['l1', 'l2', 'decision']) if (voters[k]) semanticVoters[k] = voters[k];
+  const semantic = voteLabel(semanticVoters);
+  const b = voters.behavior;
+  const intensityType = b && b.type ? toIntensity(b.type) : null;
+  const intensity = intensityType
+    ? { type: intensityType, votes: 1, sources: 1, total: 1, agreement: 1, voters: { [intensityType]: ['behavior'] }, contested: false }
+    : { type: null, votes: 0, sources: 0, total: 0, agreement: 0, voters: {}, contested: true };
+  return { semantic, intensity };
+}
+
+/**
  * 加权投票。voters: {l1:{type}, l2:{type}, decision:{type,confidence}, behavior:{type}}(L3 投票源已随层级取消删除);
  * 每个投票者可带 weight(默认 1)。决策模型按 confidence 给权重:≥0.9 记 2 票、≥0.6 记 1 票、更低弃权。
  *
@@ -54,7 +97,10 @@ export function voteLabel(voters = {}) {
   for (const [name, v] of Object.entries(voters)) {
     const t = v && v.type ? String(v.type) : null;
     if (!t) continue;
-    const w = Number.isFinite(Number(v.weight)) && Number(v.weight) > 0 ? Number(v.weight) : 1;
+    let w = Number.isFinite(Number(v.weight)) && Number(v.weight) > 0 ? Number(v.weight) : 1;
+    // 决策票加权只许"救回"不许压制(2026-11-06):行为票是四票里唯一的结果侧证据;决策票与行为票
+    // 相左时加权降回 1 票,回到同等话语权交其余票仲裁——防两个同源文本票(决策+L1)联合压掉行为证据。
+    if (name === 'decision' && w > 1 && voters.behavior && voters.behavior.type && t !== String(voters.behavior.type)) w = 1;
     tally[t] = (tally[t] || 0) + w;
     total += w;
     sources.add(name);
@@ -81,9 +127,13 @@ export function autoSign(candidates, votersOf, { minVotes = 2 } = {}) {
   const skipped = [];
   for (const c of candidates || []) {
     if (!signable(c.prompt)) { skipped.push({ ...c, reason: '不可独立分类(续写/过短)' }); continue; }
-    const v = voteLabel(votersOf(c));
+    const voters = votersOf(c);
+    const v = voteLabel(voters);
+    // 双轴(2026-11-06):语义轴合议走原口径(写 humanLabel,向后兼容);强度轴取行为票单源。
+    // 两者**分别记录**——评测时按轴各评各的,不再把两种尺子塞进同一标签名下比。
+    const dual = voteLabelDual(voters);
     if (v.contested || !v.type || v.votes < minVotes) {
-      contested.push({ ...c, vote: v });
+      contested.push({ ...c, vote: v, dual });
       continue;
     }
     signed.push({
@@ -91,13 +141,16 @@ export function autoSign(candidates, votersOf, { minVotes = 2 } = {}) {
       prompt: c.prompt,
       autoLabel: v.type,
       humanLabel: v.type,
+      // 双轴字段(2026-11-06):语义形态轴=意图侧合议;行为强度轴=结果侧证据(可能为 null=行为证据缺失)
+      semanticType: dual.semantic.type || v.type,
+      intensityType: dual.intensity.type,
       reviewed: true,
       autoSigned: true,
       labelRule: `ensemble(${Object.values(v.voters).flat().join('+')})`,
       agreement: v.agreement,
       votes: v.votes,
       sources: v.sources,
-      voters: votersOf(c),
+      voters,
       evidence: { toolCalls: c.shape ? c.shape.calls : '-', writeEdits: c.shape ? c.shape.writes : '-' },
     });
   }
@@ -117,6 +170,15 @@ export function mergeAutoSigned(freshRows, existing = []) {
     if (!byKey.has(k)) byKey.set(k, r);
   }
   const kept = [...byKey.values()];
+  // 双轴回填(2026-11-06):旧条目只有 humanLabel(单轴混合),从已存的 voters 反推两轴——
+  // 语义轴=l1/l2/decision 三票合议,强度轴=behavior 单源;回填只**加字段**,不改 humanLabel。
+  for (const r of kept) {
+    if (r.semanticType === undefined && r.voters) {
+      const d = voteLabelDual(r.voters);
+      if (d.semantic.type) r.semanticType = d.semantic.type;
+      if (d.intensity.type) r.intensityType = d.intensity.type;
+    }
+  }
   const seen = new Set(kept.map(keyOf));
   const out = [...kept];
   for (const r of freshRows) {
@@ -129,6 +191,9 @@ export function mergeAutoSigned(freshRows, existing = []) {
         old.agreement = r.agreement;
         old.votes = r.votes;
         old.sources = r.sources;
+        // 双轴字段(2026-11-06):随新鲜代签刷新,否则旧条目永远没有轴(两轴评测无从做起)
+        if (r.semanticType !== undefined) old.semanticType = r.semanticType;
+        if (r.intensityType !== undefined) old.intensityType = r.intensityType;
       }
       continue;
     }

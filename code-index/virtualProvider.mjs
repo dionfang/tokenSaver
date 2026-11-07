@@ -19,8 +19,28 @@ const ok = (msg) => console.log(msg);
 /** 虚拟档位名(客户端唯一可选的模型名)。 */
 export const AUTO_MODEL = 'auto';
 
-/** ZCode 端虚拟供应商条目的模型清单(恒为一个 auto 档)。 */
-export function virtualModelList() { return [AUTO_MODEL]; }
+/**
+ * 动态显示名(2026-11-07 用户定案):模型名可带综合费率后缀 "auto×0.189"——客户端选择器直接显示
+ * 当前倍率。解析规则(用户指定):**剔除 × 符号及其后面的字符,再去空格,再与 auto 比较**。
+ * 校验锚点一律走 isAutoModelName,不得再用 === AUTO_MODEL 精确比较(带后缀的动态名会被误判)。
+ */
+export function isAutoModelName(name) {
+  return String(name || '').split('×')[0].trim().toLowerCase() === AUTO_MODEL;
+}
+
+/** 规范化:isAutoModelName 为真 ⇒ 返回纯 'auto'(下游严格匹配/账本口径保持连续);否则原样返回。 */
+export function normalizeAutoModel(name) {
+  const n = String(name || '');
+  return isAutoModelName(n) ? AUTO_MODEL : n;
+}
+
+/** 目标显示名:rate 有效(有限正数)⇒ auto×0.189;无效 ⇒ 纯 auto(名字刷新退回锚名)。 */
+export function autoDisplayName(rate) {
+  return Number.isFinite(Number(rate)) && Number(rate) > 0 ? `${AUTO_MODEL}×${Number(rate).toFixed(3)}` : AUTO_MODEL;
+}
+
+/** ZCode 端虚拟供应商条目的模型清单(单 auto 档;autoName 可带倍率后缀)。 */
+export function virtualModelList(autoName = AUTO_MODEL) { return [autoName]; }
 
 /**
  * 镜像清单口径(保留供陈旧度迁移判定):真实自定义供应商的模型并集,先见先序去重;
@@ -52,17 +72,22 @@ export function virtualProviderStaleness({ home = os.homedir(), providerId = 'to
   const entry = rules.find((r) => r?.providerId === providerId);
   if (!entry) return { present: false, extra: [], stale: false, note: '条目不存在(尚未播种)' };
   const listed = entry.config?.personalModelIds || [];
-  const extra = listed.filter((m) => m !== AUTO_MODEL);
-  return { present: true, isAuto: listed.includes(AUTO_MODEL) && !extra.length, listed: listed.length, extra, stale: extra.length > 0 || !listed.includes(AUTO_MODEL) };
+  const extra = listed.filter((m) => !isAutoModelName(m));
+  return { present: true, isAuto: listed.some(isAutoModelName) && !extra.length, listed: listed.length, extra, stale: extra.length > 0 || !listed.some(isAutoModelName) };
 }
 
 /**
  * 虚拟供应商条目播种(auto 档位制):在 provider 配置文件幂等播种虚拟条目——
- * baseUrl 指向本地代理,模型清单恒为 ["auto"](客户端只选它,真实模型由决策层定)。
- * 条目已存在但清单是旧镜像形态 → 自动收敛为 ["auto"];tokenSaverMirror='manual' 则不动;
- * 写前备份。宿主形态按已实测接受的条目结构逐字段镜像(2026-11-01 活体验证)。
+ * baseUrl 指向本地代理,模型清单恒为单 auto 档(客户端只选它,真实模型由决策层定)。
+ * autoName(2026-11-07 定影语义):**只在会话开启刷新时传入**(auto.mjs SessionStart 是唯一
+ * 有资格改名的点);**缺省 = 保持配置现状**——幂等只要求"清单恰好一个 auto 系名字"
+ * (isAutoModelName),名字是什么(纯 auto / auto×0.189)一律不动。曾尝试"所有写入方从
+ * 倍率账本反算目标名",错在账本是最新会话口径(rate 随会话切换漂移/归 null),会话中期的
+ * snapshot-refresh 会把会话开启定好的名字静默刷掉——幂等锚应是配置自身,不是账本。
+ * 条目是旧镜像形态 → 收敛为当前清单里的 auto 系名(无则纯 auto);写前备份。
  */
-export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', baseUrl = 'http://127.0.0.1:8117/apps/anthropic', qoder = false } = {}) {
+export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', baseUrl = 'http://127.0.0.1:8117/apps/anthropic', qoder = false, autoName = null } = {}) {
+  const target = autoName != null && isAutoModelName(autoName) ? autoName : null; // null=保持现状;非 auto 系名字拒绝(锚不可漂移)
   let file;
   if (qoder) {
     // Qoder:用户级 settings.json 的 providers 键(2026-11-02 用户实测确认可写)
@@ -76,9 +101,9 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
   let pc;
   try { pc = JSON.parse(raw); } catch { return { seeded: false, note: '未播种(宿主配置非合法 JSON,不动)' }; }
 
-  const autoEntry = (providerName) => qoder
-    ? { baseUrl, apiKey: 'tokensaver-placeholder', type: 'openai-compatible', protocol: 'anthropic', authType: 'api-key', model: AUTO_MODEL, models: [{ model: AUTO_MODEL, displayName: 'TokenSaver auto', contextWindow: 200000, maxOutputTokens: 8192 }], displayName: providerName }
-    : { providerId, providerName, config: { group: 'standard-personal', access: { type: 'api-key', apiKey: 'tokensaver-placeholder' }, api: { type: 'anthropic-messages', baseUrl }, personalModelIds: [AUTO_MODEL], modelOrder: [AUTO_MODEL] } };
+  const autoEntry = (providerName, name) => qoder
+    ? { baseUrl, apiKey: 'tokensaver-placeholder', type: 'openai-compatible', protocol: 'anthropic', authType: 'api-key', model: name, models: [{ model: name, displayName: 'TokenSaver auto', contextWindow: 200000, maxOutputTokens: 8192 }], displayName: providerName }
+    : { providerId, providerName, config: { group: 'standard-personal', access: { type: 'api-key', apiKey: 'tokensaver-placeholder' }, api: { type: 'anthropic-messages', baseUrl }, personalModelIds: [name], modelOrder: [name] } };
 
   if (qoder) {
     // Qoder 形态:providers.{id} 对象;条目 id 用固定名(可读)
@@ -86,24 +111,27 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
     if (pc.providers[providerId]) {
       const e = pc.providers[providerId];
       const listed = (Array.isArray(e.models) ? e.models : []).map((m) => (typeof m === 'string' ? m : m?.model)).filter(Boolean);
-      const extra = listed.filter((m) => m !== AUTO_MODEL);
-      // baseUrl 变更(2026-11-04 双端隔离切宿主专属前缀)同样触发就地刷新,清单与地址一起对齐
+      const extra = listed.filter((m) => !isAutoModelName(m));
+      // 定影语义(2026-11-07):现有 auto 系名保持(target=null);仅显式 autoName(SessionStart)可改名
+      const keepName = listed.find(isAutoModelName) || AUTO_MODEL;
+      const writeName = target || keepName;
       const baseOk = String(e.baseUrl || '').replace(/\/+$/, '') === baseUrl;
-      if (listed.includes(AUTO_MODEL) && !extra.length && baseOk) return { seeded: false, note: '条目已存在(auto 档),无需改动' };
+      const nameOk = listed.length === 1 && listed.some(isAutoModelName) && (target == null || listed[0] === target);
+      if (nameOk && baseOk) return { seeded: false, note: '条目已存在(auto 档),无需改动' };
       if (e.tokenSaverMirror === 'manual') return { seeded: false, note: '条目已存在且标记手工维护,不改', extra };
       const backup = file + '.bak-tokensaver';
       fs.copyFileSync(file, backup);
-      pc.providers[providerId] = { ...autoEntry('TokenSaver'), tokenSaverMirrorAuto: true };
+      pc.providers[providerId] = { ...autoEntry('TokenSaver', writeName), tokenSaverMirrorAuto: true };
       fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
-      ok(`[user] Qoder 虚拟条目 ${providerId} 已刷新(auto 档${baseOk ? '' : ';baseUrl 已切到宿主专属前缀'};已备份 ${path.basename(backup)})`);
-      return { seeded: false, refreshed: true, note: baseOk ? '已收敛为 auto 档' : 'baseUrl 已切到宿主专属前缀(双端隔离)', extra };
+      ok(`[user] Qoder 虚拟条目 ${providerId} 已刷新(${nameOk ? 'auto 档' : `清单收敛为 ${writeName}`}${baseOk ? '' : ';baseUrl 已切到宿主专属前缀'};已备份 ${path.basename(backup)})`);
+      return { seeded: false, refreshed: true, note: nameOk ? 'baseUrl 已对齐' : `清单已刷新为 ${writeName}`, extra };
     }
     const backup = file + '.bak-tokensaver';
     fs.copyFileSync(file, backup);
-    pc.providers[providerId] = autoEntry('TokenSaver');
+    pc.providers[providerId] = autoEntry('TokenSaver', target || AUTO_MODEL);
     fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
     ok(`[user] 已播种 Qoder 虚拟供应商 ${providerId}:baseUrl→本地代理,单 auto 档;选择它即启用动态路由;已备份 ${path.basename(backup)}`);
-    return { seeded: true, models: [AUTO_MODEL], backup, file };
+    return { seeded: true, models: [target || AUTO_MODEL], backup, file };
   }
 
   // ZCode 形态
@@ -112,10 +140,14 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
   if (rules.some((r) => r?.providerId === providerId)) {
     const entry = rules.find((r) => r?.providerId === providerId);
     const listed = entry.config?.personalModelIds || [];
-    const extra = listed.filter((m) => m !== AUTO_MODEL);
-    // baseUrl 变更(2026-11-04 双端隔离:Qoder 专属前缀 /apps/qoder)同样触发就地刷新
+    const extra = listed.filter((m) => !isAutoModelName(m));
+    // baseUrl 变更(2026-11-04 双端隔离:Qoder 专属前缀 /apps/qoder)同样触发就地刷新;
+    // 定影语义(2026-11-07):现有 auto 系名保持(target=null);仅显式 autoName(SessionStart)可改名
+    const keepName = listed.find(isAutoModelName) || AUTO_MODEL;
+    const writeName = target || keepName;
     const baseOk = String(entry.config?.api?.baseUrl || '').replace(/\/+$/, '') === baseUrl;
-    if (listed.includes(AUTO_MODEL) && !extra.length && baseOk) return { seeded: false, note: '条目已存在(auto 档),清单恒定', extra };
+    const nameOk = listed.length === 1 && listed.some(isAutoModelName) && (target == null || listed[0] === target);
+    if (nameOk && baseOk) return { seeded: false, note: '条目已存在(auto 档),清单恒定', extra };
     // 手工维护退出通道
     if (entry.config?.tokenSaverMirror === 'manual') {
       return { seeded: false, note: '条目已存在且标记为手工维护(tokenSaverMirror=manual),不改清单', extra };
@@ -124,27 +156,54 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
     const backup = file + '.bak-tokensaver';
     fs.copyFileSync(file, backup);
     if (!baseOk && entry.config) entry.config.api = { ...(entry.config.api || { type: 'anthropic-messages' }), baseUrl };
-    entry.config.personalModelIds = [AUTO_MODEL];
-    if (Array.isArray(entry.config.modelOrder)) entry.config.modelOrder = [AUTO_MODEL];
+    entry.config.personalModelIds = [writeName];
+    if (Array.isArray(entry.config.modelOrder)) entry.config.modelOrder = [writeName];
     const modelRules = pc.config.modelConfigRules?.providerModelRules;
     if (Array.isArray(modelRules)) {
       pc.config.modelConfigRules.providerModelRules = [
-        ...modelRules.filter((x) => x?.providerId !== providerId),
-        { modelId: AUTO_MODEL, config: { enabled: true }, providerId },
+        ...modelRules.filter((x) => x?.providerId !== providerId || !isAutoModelName(x?.modelId)),
+        { modelId: writeName, config: { enabled: true }, providerId },
       ];
     }
     fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
-    ok(`[user] 虚拟供应商 ${providerId} 已刷新(${baseOk ? '收敛为 auto 档' : `auto 档;baseUrl 已切到 ${baseUrl}`};真实清单继续由快照维护;已备份 ${path.basename(backup)})`);
-    return { seeded: false, refreshed: true, note: baseOk ? '已收敛为 auto 档(不再镜像真实清单)' : 'baseUrl 已切换(双端隔离)', extra };
+    ok(`[user] 虚拟供应商 ${providerId} 已刷新(${nameOk ? 'auto 档' : `清单收敛为 ${writeName}`};${baseOk ? 'baseUrl 已对齐' : `baseUrl 已切到 ${baseUrl}`};真实清单继续由快照维护;已备份 ${path.basename(backup)})`);
+    return { seeded: false, refreshed: true, note: nameOk ? 'baseUrl 已对齐' : `清单已刷新为 ${writeName}`, extra };
   }
   const backup = file + '.bak-tokensaver';
   fs.copyFileSync(file, backup);
-  rules.push(autoEntry('TokenSaver'));
+  rules.push(autoEntry('TokenSaver', target || AUTO_MODEL));
   const order = pc.config.providerOrder;
   if (Array.isArray(order) && !order.includes(providerId)) order.push(providerId);
   const modelRules = pc.config.modelConfigRules?.providerModelRules;
-  if (Array.isArray(modelRules)) modelRules.push({ modelId: AUTO_MODEL, config: { enabled: true }, providerId });
+  if (Array.isArray(modelRules)) modelRules.push({ modelId: target || AUTO_MODEL, config: { enabled: true }, providerId });
   fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
   ok(`[user] 已播种虚拟供应商 ${providerId}:baseUrl→本地代理,单 auto 档(真实模型由决策层定);选择它即启用动态路由;已备份 ${path.basename(backup)}`);
-  return { seeded: true, models: [AUTO_MODEL], backup, file };
+  return { seeded: true, models: [target || AUTO_MODEL], backup, file };
+}
+
+/**
+ * 动态显示名刷新(2026-11-07):把两端用户级配置的虚拟条目名幂等刷成 autoDisplayName(rate)
+ * (如 auto×0.189)。fail-open:任何异常不抛、不影响调用方;手工维护条目与纯 auto(无有效费率)不动。
+ * 返回 {zcode, qoder} 两端的 ensure 结果摘要。
+ */
+export function refreshAutoModelName({ home = os.homedir(), rate = null } = {}) {
+  const autoName = autoDisplayName(rate);
+  if (autoName === AUTO_MODEL) return { zcode: { skipped: '无有效费率,名字保持纯 auto' }, qoder: { skipped: '无有效费率,名字保持纯 auto' } };
+  const out = {};
+  for (const qoder of [false, true]) {
+    try {
+      // Qoder 端条目 id 与 ZCode 不同(2026-11-02 播种定名 tokensaver-auto)——不传会按默认
+      // 'tokenSaverModel' 在 Qoder settings.json 里误播种一条脏条目(实测踩过)
+      const r = ensureVirtualProviderEntry({
+        home, qoder,
+        providerId: qoder ? 'tokensaver-auto' : 'tokenSaverModel',
+        autoName,
+        baseUrl: qoder ? 'http://127.0.0.1:8117/apps/qoder' : 'http://127.0.0.1:8117/apps/anthropic',
+      });
+      out[qoder ? 'qoder' : 'zcode'] = r;
+    } catch (e) {
+      out[qoder ? 'qoder' : 'zcode'] = { error: String(e && e.message ? e.message : e) };
+    }
+  }
+  return out;
 }

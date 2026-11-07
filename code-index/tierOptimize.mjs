@@ -2,9 +2,9 @@
  * 黄金集迭代优化器(2026-11-04,把"扩样 → 定真值 → 评成本 → 学参数 → 门控 → 报告"串成一轮可重复跑的循环)。
  *
  * 它优化的是什么:**难度档命中率的经济后果**,不是裸准确率。
- *   资费 R1 1x / R2 8x / R3 15x / R4 100x,缓存画像见 costProfile.mjs(隐式热 0.23 / 冷 1.00 / 税 0.77)。
+ *   资费(2026-11-06 实测,R3=1x 基准)R1 0.05x / R2 0.5x / R3 1x / R4 3.625x,缓存画像见 costProfile.mjs(隐式热 0.0115 / 冷 0.05 / 税 0.0385)。
  *   ⇒ 误升一档 = 换档必冷读 = 倍率 × 冷读(损失按倍率放大);漏升一档 = 弱档空转 failTurns 轮 + 之后照样冷读 + 质量损失。
- *   目标函数 = 逐行 decisionCost 之和(M R1 等效 token),报告里与 alwaysR1 / oracle 两条基准线并排给出。
+ *   目标函数 = 逐行 decisionCost 之和(M R3 等效 token),报告里与 alwaysR1 / oracle 两条基准线并排给出。
  *
  * 铁律(与 #14 治理一致,代码层强制):
  *   1. **预测不回灌**:真值只来自①结果侧行为形态(tierTruth.mjs,签名里没有 prompt)②T→R 设计映射。
@@ -185,7 +185,7 @@ export function evaluate({ rows = [], calibration = null, cost = null } = {}) {
  * (折边界状态重置,两边口径逐字一致 —— 否则序列代价因切分不同而不可比,这是本模块最容易骗自己的地方)。
  * 每折只学一次倍数,门槛组合复用;取折外总代价最低的一套进入接受门控。
  */
-export function crossValidate({ rows = [], cost = null, folds = DEFAULTS.folds, minN = DEFAULTS.minN, priorN = DEFAULTS.priorN, allowBoost = DEFAULTS.allowBoost, grid = DEFAULTS.grid } = {}) {
+export function crossValidate({ rows = [], cost = null, liveProfile = null, folds = DEFAULTS.folds, minN = DEFAULTS.minN, priorN = DEFAULTS.priorN, allowBoost = DEFAULTS.allowBoost, grid = DEFAULTS.grid } = {}) {
   const cp = resolveCostProfile(cost);
   const labeled = rows.filter((r) => r.trueTier);
   const buckets = [];
@@ -202,6 +202,9 @@ export function crossValidate({ rows = [], cost = null, folds = DEFAULTS.folds, 
     foldData.push({
       i,
       leg: evaluate({ rows: test, calibration: null, cost: cp }),
+      // live 对照腿(2026-11-06 P0):接受门控与逐折回归都以现网 live 为基准——旧实现只与"无档案基线"比,
+      // "比基线好 3% 但比现网差"的候选也能上线,把 live 换差(实测已发生:live 比无档案贵 0.05%)。
+      live: liveProfile ? evaluate({ rows: test, calibration: liveProfile, cost: cp }) : null,
       cand: combos.map((th) => evaluate({ rows: test, calibration: candidateProfile({ learned, thresholds: th }), cost: cp })),
     });
   }
@@ -237,6 +240,8 @@ export function crossValidate({ rows = [], cost = null, folds = DEFAULTS.folds, 
     };
   };
   const legacy = agg((fd) => fd.leg);
+  // live 腿:liveProfile 缺失或全部折都无 live 评估时为 null,消费方回落 legacy
+  const live = liveProfile && foldData.some((fd) => fd.live) ? agg((fd) => fd.live || fd.leg) : null;
   const runs = combos.map((th, idx) => ({ thresholds: th, ...agg((fd) => fd.cand[idx]) })).sort((a, b) => a.total - b.total);
   const best = runs[0] || null;
   // 接受门控:折外代价显著优于现网,或代价不升但准确率明显提升;且 R1 召回不倒退超容忍
@@ -252,10 +257,15 @@ export function crossValidate({ rows = [], cost = null, folds = DEFAULTS.folds, 
     if (gain >= num(DEFAULTS.minImprovement, 0.03)) accepted = true;
     else if (best.total <= legacy.total && accGain >= num(DEFAULTS.minAccGain, 0.05)) accepted = true;
     else reasons.push(`折外代价改善 ${(gain * 100).toFixed(1)}% < 门槛 ${DEFAULTS.minImprovement * 100}%,准确率变化 ${accGain >= 0 ? '+' : ''}${accGain.toFixed(3)}`);
+    // live 对照(P0):候选不但要赢基线,还要不劣于现网 live——防"赢基线输现网"的换差晋升
+    if (accepted && live && best.total > live.total) {
+      accepted = false;
+      reasons.push(`候选折外 ${best.total} 劣于现网 live ${live.total}(只赢无档案基线不算赢)`);
+    }
     if (accepted && recallDrop > num(DEFAULTS.maxR1RecallDrop, 0.02)) { accepted = false; reasons.push(`R1 召回倒退 ${recallDrop.toFixed(3)} > 容忍 ${DEFAULTS.maxR1RecallDrop}`); }
     if (accepted && best.under > legacy.under) reasons.push(`注意:漏升数 ${legacy.under}→${best.under}(代价仍降,因误升更贵)`);
   }
-  return { legacy, best, runs: runs.slice(0, 4), accepted, reasons, folds: folds, labeled: labeled.length, perBucket: buckets.map((b) => b.length) };
+  return { legacy, live, best, runs: runs.slice(0, 4), accepted, reasons, folds: folds, labeled: labeled.length, perBucket: buckets.map((b) => b.length) };
 }
 
 const ASCII_TOKEN = /[a-z][a-z0-9._+-]{2,}/g;
@@ -369,7 +379,7 @@ export async function applyCostFit({ dataDir = DATA_DIR, cost = null } = {}) {
   const rows = readJsonl(f(dataDir, 'usage'));
   if (!rows.length) return { ...base, fitted: null, fitNote: '账本不可读,沿用画像常数' };
   let tierOf = undefined;
-  try { ({ tierOfModel: tierOf } = await import('./modelRoute.mjs')); } catch { /* 拟合降级为不分档 */ }
+  try { const mr = await import('./modelRoute.mjs'); tierOf = (m) => mr.tierOfModel(m, mr.tierClassifyOptions()); } catch { /* 拟合降级为不分档 */ }
   const fit = fitFromLedger({ rows, tierOf });
   if (!fit.used) return { ...base, fitted: null, fitNote: '账本里没有可用 token 计数,沿用画像常数' };
   const out = {
@@ -518,8 +528,11 @@ export async function runIteration({
   const rows = loadEvalRows({ dataDir, truth });
   if (!rows.length) return { state: 'skipped', reason: `黄金集无可评估行(truth=${truth})` };
   const legacy = evaluate({ rows, calibration: null, cost });
+  // live 对照腿(2026-11-06 P0):现网 live 已启用才作为对照基准(关着时与基线同物,无对照意义)
+  const liveRaw = readJson(f(dataDir, 'profile'));
+  const liveProfile = liveRaw && liveRaw.enabled === true ? liveRaw : null;
   const learned = learnSignals({ rows, minN, priorN, allowBoost });
-  const cv = crossValidate({ rows, cost, folds, minN, priorN, allowBoost });
+  const cv = crossValidate({ rows, cost, liveProfile, folds, minN, priorN, allowBoost });
   const mined = mineTerms({ rows, cost });
   const history = readJsonl(f(dataDir, 'history'));
   const summary = {
@@ -573,8 +586,10 @@ export async function maybeOptimizeTier({ dataDir = DATA_DIR, minIntervalMs = 6 
     const st = readJson(f(dataDir, 'state')) || {};
     if (st.at && now - Number(st.at) < num(opt.minIntervalMs, minIntervalMs)) return { state: 'skipped', reason: '距上次不足间隔' };
     const r = await runIteration({ dataDir, now, grow: opt.grow !== false, fit: opt.fitCost === true, folds: num(opt.folds, DEFAULTS.folds), minN: num(opt.minN, DEFAULTS.minN), allowBoost: opt.allowBoost === true, dry: opt.dry === true });
-    const promote = await maybePromoteTier({ dataDir, lastRun: r, opt, now });
+    // 先回滚后晋升(2026-11-06 P0):旧顺序同轮"晋升→回滚检查",刚写的 promote 把回滚观察窗基准刷成 now,
+    // 24h 观察窗恒不满,回滚永不具备资格(台账 5 promote / 0 rollback)。对调后先结算既有晋升的观察窗。
     const rollback = await maybeRollbackTier({ dataDir, opt, now });
+    const promote = await maybePromoteTier({ dataDir, lastRun: r, opt, now });
     return { ...r, promote, rollback };
   } catch (e) { return { state: 'failed', reason: String(e && e.message ? e.message : e) }; }
 }
@@ -603,9 +618,14 @@ export async function maybePromoteTier({ dataDir = DATA_DIR, lastRun = null, opt
       }
     }
     const tol = 1.001 + (Number.isFinite(Number(p.perFoldTolerance)) ? Number(p.perFoldTolerance) : 0);
+    // 逐折对照基准=现网 live(2026-11-06 P0):无 live 腿时回落基线,与 crossValidate 的 live 门控同口径
+    const perFoldBase = cv.live || cv.legacy;
     for (const fl of cv.best.perFold || []) {
-      const same = (cv.legacy?.perFold || []).find((x) => x.fold === fl.fold);
+      const same = (perFoldBase?.perFold || []).find((x) => x.fold === fl.fold);
       if (same && fl.total > same.total * tol) return { state: 'skipped', reason: `折 ${fl.fold} 候选 ${fl.total} > 现网 ${same.total}(逐折无回归)` };
+    }
+    if (cv.live && cv.best.total > cv.live.total) {
+      return { state: 'skipped', reason: `候选折外 ${cv.best.total} 劣于现网 live ${cv.live.total},不换差` };
     }
     const cand = readJson(f(dataDir, 'candidate'));
     if (!cand) return { state: 'skipped', reason: '候选档案缺失' };
@@ -618,6 +638,21 @@ export async function maybePromoteTier({ dataDir = DATA_DIR, lastRun = null, opt
     const live = readJson(f(dataDir, 'profile'));
     if (live && live.enabled === true && profileSignature(live) === sig) {
       return { state: 'skipped', reason: '候选与正在运行的 live 同签名,不重复晋升' };
+    }
+    // 观察窗暂停阀(2026-11-06 P0,置于幂等/冷却检查之后):存在未满观察窗的活动晋升时不再晋升——
+    // 频繁晋升不断重置回滚观察窗等于关掉纠错(台账曾 5 promote / 0 rollback)。每完成一次观察窗
+    // (默认 24h)最多晋升一次;噪声级 0.001 抖动晋升同时被此阀拦住。
+    {
+      const lastPromote2 = [...ledger].reverse().find((e) => e.type === 'promote');
+      if (lastPromote2) {
+        const afterIdx2 = ledger.lastIndexOf(lastPromote2);
+        const interrupted2 = ledger.slice(afterIdx2 + 1).some((e) => e.type === 'rollback' || e.type === 'disable');
+        const observeMs2 = num(p.minObserveMs, 24 * 60 * 60 * 1000);
+        if (!interrupted2 && now - Number(lastPromote2.ts) < observeMs2) {
+          const leftH2 = Math.ceil((observeMs2 - (now - Number(lastPromote2.ts))) / 3600000);
+          return { state: 'skipped', reason: `上一个晋升观察窗未满(还剩约 ${leftH2}h),先观察再晋升` };
+        }
+      }
     }
     const r = promoteCandidate({ dataDir, reason: 'auto-promote', now });
     if (r.error) return { state: 'skipped', reason: r.error };
@@ -659,7 +694,7 @@ export async function maybeRollbackTier({ dataDir = DATA_DIR, opt = {}, now = Da
     const rows = readJsonl(f(dataDir, 'usage'));
     if (!rows.length) return { state: 'skipped', reason: '账本不可读' };
     let tierOf = null;
-    try { ({ tierOfModel: tierOf } = await import('./modelRoute.mjs')); } catch { /* 无 tierOf 时只认账本 tier 字段 */ }
+    try { const mr = await import('./modelRoute.mjs'); tierOf = (m) => mr.tierOfModel(m, mr.tierClassifyOptions()); } catch { /* 无 tierOf 时只认账本 tier 字段 */ }
     const cp = loadCostProfile({ dataDir });
     const cost = (row) => normalizedRowCost(row, cp, tierOf);
     const pre = rows.filter((r) => r.ts >= wentLiveAt - win && r.ts < wentLiveAt).map(cost).filter((v) => v !== null);

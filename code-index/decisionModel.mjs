@@ -150,21 +150,33 @@ export function buildBody({ items, criteria = TYPE_CRITERIA, model = DECISION_MO
   return { state: { items: items.map((it) => ({ id: it.id, text: it.text })) }, model, questions };
 }
 
-/** 解析 answers → [{id, type, confidence, probabilities}]。 */
+/** 解析 answers → [{id, type, confidence, probabilities}]。
+ *  校验(2026-11-06 决策票四防线):①标签值域——choice 不在三类/旧八类白名单的按弃权(null),
+ *  防未知值原样写进黄金集;②键位——answer 键解析出的序号超出本片 items 范围的整条丢弃,
+ *  防"判定安到别的候选行头上";③重复 id 先到先得,后写不覆盖(网关同题多答不再随机盖);
+ *  ④置信钳制——答案带 probabilities 时,所选标签的概率是网关独立给出的交叉校验,自报
+ *  confidence 取 min(自报, 概率),防 LLM 自报虚高白拿 2 票权重。 */
 export function parseAnswers(json, items = []) {
   const answers = (json && json.answers) || {};
+  const valid = /^(?:multi|routine|light|T[1-8])$/i;
   const out = [];
+  const seenIds = new Set();
   for (const [k, a] of Object.entries(answers)) {
+    if (!a || typeof a !== 'object') continue;
     const idx = Number(String(k).replace(/^\D+/, '')) - 1;
+    if (!(idx >= 0 && idx < items.length)) continue; // 键位越界:不猜归属,整条丢弃
     const it = items[idx] || {};
-    out.push({
-      id: it.id ?? idx + 1,
-      text: it.text ?? '',
-      type: a.choice || null,
-      confidence: Number(a.confidence ?? 0),
-      probabilities: a.probabilities || {},
-      raw: a,
-    });
+    const id = it.id ?? idx + 1;
+    if (seenIds.has(id)) continue; // 重复 id:先到先得
+    seenIds.add(id);
+    const choice = String(a.choice || '').trim();
+    const type = valid.test(choice) ? (/^T/i.test(choice) ? choice.toUpperCase() : choice.toLowerCase()) : null;
+    let confidence = Number(a.confidence ?? 0);
+    if (type && a.probabilities && typeof a.probabilities === 'object') {
+      const prob = Number(a.probabilities[choice] ?? a.probabilities[type]);
+      if (Number.isFinite(prob) && prob > 0) confidence = Math.min(confidence, prob);
+    }
+    out.push({ id, text: it.text ?? '', type, confidence: Number.isFinite(confidence) ? confidence : 0, probabilities: a.probabilities || {}, raw: a });
   }
   return out;
 }

@@ -18,6 +18,7 @@ import { localOnnxCached } from './localRerank.mjs';
 import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from './vectorStore.mjs';
 import { residentHealth } from './localResident.mjs';
 import { pidAlive, LOCK_TTL_MS } from './proc.mjs';
+import { isAutoModelName } from './virtualProvider.mjs';
 import { loadTokenizer, lookupModel } from 'tokenizer-core';
 
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
@@ -383,7 +384,7 @@ function latestQoderProxyServed(at, windowMs, usageFile) {
     const ts = Number(j.ts);
     if (!Number.isFinite(ts)) continue;
     const m = j.target || j.served;
-    if (!m || m === 'auto') continue;
+    if (!m || isAutoModelName(m)) continue; // 虚拟档名(含 auto×0.026 形态)不算真实模型(2026-11-07 统一口径)
     const diff = Math.abs(ts - at);
     if (diff <= windowMs && diff < bestDiff) { bestDiff = diff; best = j; }
   }
@@ -454,28 +455,46 @@ export function currentRemoteModel(sessionId, { dbPath = ZCODE_DB_PATH, agentUsa
       } finally { db.close(); }
     } catch { /* 库不可用落后续兜底 */ }
   }
-  if (anchor && anchor.modelId && anchor.modelId !== 'auto') return String(anchor.modelId);
+  // db 里记的是客户端条目名(2026-11-07 起可为 auto×0.026 带倍率形态)——isAutoModelName 归一:
+  // 带后缀的虚拟档不算真实模型,回落 proxy-usage 就近配对拿真实名,状态句【】段不显示 auto×名。
+  if (anchor && anchor.modelId && !isAutoModelName(anchor.modelId)) return String(anchor.modelId);
   if (anchor) {
     const served = nearestProxyServed(Number(anchor.at) || 0, windowMs, proxyUsageFile);
     if (served) return served;
   }
   const fromTranscript = qoderTranscriptModel(sessionId, { home });
   if (fromTranscript) {
-    // Qoder 虚拟档(auto 档位制):transcript 只记客户端所选条目名(…/auto),真实模型只在
-    // 代理账本 qoder 行里——就近取最近一次真实服务模型替换显示;查不到(窗口外/全是兜底行)保持原样。
+    // Qoder 虚拟档(auto 档位制,2026-11-07 起条目名可为 …/auto×0.026 带倍率形态):取最后一段
+    // isAutoModelName 判定,虚拟档即用代理账本最近一次真实服务模型替换显示;查不到保持原样。
     // 直连条目名(qoder-custom-*/<model>)与 <synthetic> 不替换;ZCode 分支(上方 anchor 路径)不涉。
-    if (String(fromTranscript).endsWith('/auto')) {
+    const seg = String(fromTranscript).split('/').pop() || '';
+    if (isAutoModelName(seg)) {
       const served = latestQoderProxyServed(Date.now(), windowMs, proxyUsageFile);
       if (served) return served;
+      return autoDisplaySafe(String(fromTranscript)); // 账本查不到也别把 auto×0.026 当真实模型名显示
     }
     return String(fromTranscript);
   }
   for (const line of readTailLines(agentUsagePath).reverse()) {
     let j;
     try { j = JSON.parse(line); } catch { continue; }
-    if (j && j.conversationId === sessionId && j.model) return String(j.model);
+    if (j && j.conversationId === sessionId && j.model) {
+      const m = String(j.model);
+      // agent-usage 记的也可能是虚拟档名(auto×0.026)——归一:虚拟档走代理账本就近替换
+      if (isAutoModelName(m)) {
+        const served = latestQoderProxyServed(Date.now(), windowMs, proxyUsageFile);
+        if (served) return served;
+        return autoDisplaySafe(m);
+      }
+      return m;
+    }
   }
   return null;
+}
+
+/** 虚拟档名安全显示:剔倍率后缀只留 auto——【当前远程模型】段不出现 auto×0.026(2026-11-07 统一口径)。 */
+function autoDisplaySafe(m) {
+  return String(m || '').split('×')[0].trim() || 'auto';
 }
 
 /**

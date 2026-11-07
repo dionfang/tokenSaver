@@ -35,12 +35,13 @@ export function stripInjectionMarkers(txt) {
   return txt;
 }
 
-/** 弱标签规则链(2026-11-06 三档定稿);返回 [label, confidence, rule]。 */
+/** 弱标签规则链(2026-11-06 三档定稿;heavy 门槛与投票口径合一——w≥3||total≥15,同 importRoutingLog.labelFromShape:
+ *  三套阈值并存时投票/建库/档位真值互相打架,可比样本一致率仅 87.5%,任何"多票合议"的精度提升都被口径噪声吃掉);返回 [label, confidence, rule]。 */
 export function labelTurn(prompt, total, we, rd, agent) {
   const p = prompt || '';
   if (REVIEW_RE.test(p)) return ['routine', 0.85, 'review-signal'];
   if (TEST_RE.test(p) && we > 0) return ['routine', 0.8, 'test-prompt+writes'];
-  if (we >= 3 && total >= 8) return ['multi', 0.85, 'heavy-writes'];
+  if (we >= 3 || total >= 15) return ['multi', 0.85, 'heavy-writes'];
   if (we >= 1 && total >= 3) return ['routine', 0.8, 'light-writes'];
   if (we === 0 && PLAN_RE.test(p)) return ['multi', 0.7, 'plan-signal'];
   if (we === 0 && ERROR_RE.test(p)) return ['routine', 0.7, 'error-text'];
