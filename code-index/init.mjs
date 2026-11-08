@@ -32,7 +32,7 @@
  *      --hooks all|cursor|zcode|qoder 可覆盖。每次运行只重写选中工具的用户级配置里本模块的钩子;
  *      同文件里的其他钩子保留。JSON 解析失败则不改该文件。
  *   4b) ZCode 专用:幂等播种虚拟供应商条目 tokenSaverModel(~/.zcode/v2/provider_config.json;
- *      baseUrl→本地代理(auto 前缀 /apps/anthropic),模型清单恒为单 auto 档(2026-11-02 档位制取代镜像清单制),
+ *      baseUrl→本地代理(auto 前缀 /apps/zcode(2026-11-07 前缀统一 /apps/<宿主>)),模型清单恒为单 auto 档(2026-11-02 档位制取代镜像清单制),
  *      占位 key 零真实凭据)。
  *      条目惰性:不被会话选中即零行为,选中=人工启用(#11 口径);已存在(含人工改过)原样保留,
  *      刷新=删条目重跑 init;写前备份 .bak-tokensaver;uninit 对称移除。宿主行为三项已活体验证
@@ -242,9 +242,18 @@ function wireAgents(root) {
   const block = withEol(disciplineBlock({ rel, dataRel, packed: PACKED_INSTALL }), eol);
   const snippet = eol + block;
   // 标记与标题之间允许空行(如 prettier 会插入),否则匹配失败会再追加一段
-  const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- (?:ponytail|output-diet)[^>]* -->|\r?\n## |$)/;
+  // 标记行做锚(2026-11-08 加固):不再锚定标题文字——用户改过 `## 代码检索纪律` 标题也能命中替换,
+  // 不会走追加分支产生双段;lookahead 兼容另一段 code-index/ponytail/output-diet 标记与任意 H2。
+  // 匹配体必须吞掉标记行+标题行(标题文字可变),否则 lookahead 会命中段内自己的 H2 只换掉标记行。
+  const sectionRe = /<!-- code-index[^>]*-->[^\r\n]*\r?\n[^\r\n]*[\s\S]*?(?=\r?\n<!-- (?:code-index|ponytail|output-diet)[^>]* -->|\r?\n## |$)/;
   if (content && sectionRe.test(content)) {
-    const next = content.replace(sectionRe, block);
+    // 全局替换兼历史双段自愈:第一段换新块,旧版本(标题被改时追加)残留的多余 code-index 段一并剥除
+    let seen = false;
+    const next = content.replace(new RegExp(sectionRe.source, 'g'), (m) => {
+      if (seen) return '';
+      seen = true;
+      return block;
+    });
     if (next === content) ok(`[${path.basename(root)}] AGENTS.md 纪律段已与当前模板一致,跳过`);
     else {
       fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + eol);
@@ -481,13 +490,16 @@ if (configExisted) {
     roots = [];
     ok('未传 --roots:roots 置空完成安装(钩子与配置已就位);请在 data/code-index.config.json 的 roots 填入项目目录后重跑 node init.mjs(见下方提示框)');
   }
-  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。knownAnnotations 已拆出本文件(2026-11-07):独立存 data/known-annotations.json,首装为空;init --roots 使 roots 变化时整表重置,未变则原样保留,由深挖后手工追加。';
+  const desc = '项目配置。数据在 TokenSaver 自己的 data/。改 roots 后重新 node init.mjs(不必带参)即纳入新目录并挂钩子。未写的键用 config.mjs 默认值。模型名、ollamaBase、gpu、OLLAMA_KEEP_ALIVE、OLLAMA_NUM_CTX 只写 config.mjs。roots: 本文件为清单;init --roots 并入;CODE_INDEX_ROOTS 运行时可临时盖掉。modelIn: --model-in > 本文件 > local。skipDirs 整表替换。v2Dir: ZCode 数据存储路径迁移后填实际路径(带/不带 .zcode/v2 均可,空=默认 ~/.zcode/v2)。staleNonGitMs: 非git root 的重建回退时钟(毫秒,默认 86400000=24h;git root 走 HEAD 指纹,不受此值影响)。knownAnnotations 已拆出本文件(2026-11-07):独立存 data/known-annotations.json,首装为空;init --roots 使 roots 变化时整表重置,未变则原样保留,由深挖后手工追加。';
   const skipDirs = [...new Set([...DEFAULT_CONFIG.skipDirs, path.basename(here), 'code-index', '.cursor', '.zcode', '.qoder'])];
   fs.writeFileSync(configPath, JSON.stringify({
     $说明: desc,
+    // v2Dir/staleNonGitMs 落盘(2026-11-08):结果框指引与实物对齐——用户直接改值即可,不必自建键
+    v2Dir: '',
     roots,
-    skipDirs,
     modelIn: chosenBackend,
+    skipDirs,
+    staleNonGitMs: DEFAULT_CONFIG.staleNonGitMs,
     modelRouting: modelRoutingScaffold(),
   }, null, 2));
   // 注解库独立文件(2026-11-07 拆出 config):首装建空表,已有则不动(增量沉淀)

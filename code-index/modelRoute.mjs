@@ -24,6 +24,7 @@ import { SEMANTIC_AXIS, INTENSITY_AXIS } from './autoLabel.mjs';
 import { classifyDifficulty, loadTierCalibration, TIER_FROM_TYPE } from './tierClassify.mjs';
 import { tierTruthFromAxes } from './tierTruth.mjs';
 import { promptKey } from './buildExemplars.mjs';
+import { resolveZcodeV2Dir } from './virtualProvider.mjs'; // doctor 库存走 v2Dir 配置制(与快照同源,无循环)
 
 const HOME = os.homedir();
 const VECTORS_PATH = path.join(DATA_DIR, 'routing', 'exemplars-vectors.json');
@@ -513,16 +514,20 @@ export function ingressProviders(upstreams) {
 // ---------- inventory 收集(best-effort) ----------
 
 /** ZCode:provider_config 的自定义供应商 + 内置模板的账号供应商(凭据存在才认)。 */
-export function collectInventory(home = HOME) {
+export function collectInventory(home = HOME, zcodeV2Dir = null) {
   const out = [];
-  const pc = readJson(path.join(home, '.zcode', 'v2', 'provider_config.json'));
+  // 路径自适应(2026-11-08):zcodeV2Dir 显式传入 > home 显式非默认主目录(测试旧拼接)> resolveZcodeV2Dir 探测。
+  // 恒读默认 ~/.zcode/v2 会在数据路径迁移后命中陈旧副本(inventoryCount/inventorySources 口径失真)。
+  const v2 = zcodeV2Dir
+    || (home && home !== HOME ? path.join(home, '.zcode', 'v2') : resolveZcodeV2Dir().dir);
+  const pc = readJson(path.join(v2, 'provider_config.json'));
   for (const r of pc?.config?.providerConfigRules?.providerRules || []) {
     const enabled = r.enabled !== false && r.config?.enabled !== false;
     for (const m of r.config?.personalModelIds || []) out.push({ providerId: r.providerId, modelId: m, enabled, source: 'zcode-custom' });
   }
   const builtinPath = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
   const builtin = builtinPath ? readJson(builtinPath) : null;
-  const cred = readJson(path.join(home, '.zcode', 'v2', 'credentials.json')) || {};
+  const cred = readJson(path.join(v2, 'credentials.json')) || {};
   const credKeys = Object.keys(cred);
   const hasBigmodel = credKeys.some((k) => k.includes('oauth:bigmodel:access_token'));
   const hasZai = credKeys.some((k) => k.includes('zcodejwttoken')) || credKeys.some((k) => k.includes('zai'));

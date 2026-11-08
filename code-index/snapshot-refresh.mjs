@@ -22,9 +22,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { DATA_DIR } from './config.mjs';
 import { snapshotUpstreams } from './modelRouteProxy.mjs';
-import { ensureVirtualProviderEntry } from './virtualProvider.mjs';
+import { ensureVirtualProviderEntry, ensureAutoEntryOnV2Dir, resolveZcodeV2Dir } from './virtualProvider.mjs';
 
-const PC_FILE = path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
+// 变更守卫同走路径自适应(2026-11-08):与快照本体(snapshotUpstreams→resolveZcodeV2Dir)同源,
+// 否则迁移数据路径后守卫仍盯旧 ~/.zcode/v2 的陈旧副本——mtime 恒不变,新路径改模型清单永不触发重抓。
+const PC_FILE = path.join(resolveZcodeV2Dir().dir, 'provider_config.json');
 // Qoder 双目录 settings.json 同受守卫监视(路径口径与 virtualProvider 一致:.qoder-cn 优先)
 const QODER_SETTINGS = ['.qoder-cn', '.qoder'].map((d) => path.join(os.homedir(), d, 'settings.json'));
 const SNAP_FILE = path.join(DATA_DIR, 'routing', 'proxy-upstreams.json');
@@ -48,6 +50,20 @@ function configMtimeMs() {
 }
 
 function main() {
+  // auto 档自愈兜底(2026-11-08 接线):用户改配 v2Dir 后,新路径 provider_config 是迁移副本时可能
+  // 没有 auto 条目(init 播种落的是播种时的旧路径);快照守卫 mtime 未变时又提前 return,不会走到
+  // 下面的 ensureVirtualProviderEntry——所以在任何同步逻辑之前先幂等检测+补种,保证宿主选择器在新
+  // 路径上有 auto 档可选。条目名与 SessionStart 刷名同口径(auto×全期倍率,无有效费率回落纯 auto)。
+  // 幂等:已有 auto 系条目即跳过,每轮 UserPromptSubmit 只多一次小 JSON 扫描;失败只留痕不阻断。
+  try {
+    let rate = null;
+    try {
+      const blend = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage', 'auto-blend.json'), 'utf8'));
+      if (blend && Number.isFinite(Number(blend.globalRate)) && Number(blend.globalRate) > 0) rate = Number(blend.globalRate);
+    } catch { /* 无账本 → 纯 auto */ }
+    const heal = ensureAutoEntryOnV2Dir({ rate });
+    if (heal.seeded) log(`auto-entry self-healed: ${heal.file}(兜底补种 auto 档,幂等)`);
+  } catch (e) { log(`auto-entry self-heal FAILED: ${e && e.message || e}`); }
   const snap = readJson(SNAP_FILE);
   const cfgMtimeMs = configMtimeMs();
   // 无变化快路径:快照已晚于(或等于)两侧配置里较新的修改时间。此路径每轮都会被

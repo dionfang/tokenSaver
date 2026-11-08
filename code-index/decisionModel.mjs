@@ -25,16 +25,19 @@
  *   换判定模型/换网关只改这两处,不用动代码。
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { DATA_DIR } from './config.mjs';
+import { resolveZcodeV2Dir } from './virtualProvider.mjs'; // provider_config 定位走 v2Dir 配置制(与快照同源,无循环)
 
-const HOME = os.homedir();
 export const DECISION_MODEL = 'decision-model-preview';
 export const SYSTEMONE_PATH = '/compatible-mode/v1/systemone';
 /** 单请求最多 16 道题(实测:questions 超过 16 直接 ValidationError)。超过就分片。 */
 export const MAX_QUESTIONS = 16;
-const PROVIDER_CONFIG = path.join(HOME, '.zcode', 'v2', 'provider_config.json');
+/** provider_config 定位(2026-11-08 路径自适应):显式传入优先,否则 resolveZcodeV2Dir(v2Dir 配置制);
+ *  恒读默认 ~/.zcode/v2 会在数据路径迁移后拿到陈旧候选(旧网关白试)。 */
+function defaultProviderConfigPath() {
+  return path.join(resolveZcodeV2Dir().dir, 'provider_config.json');
+}
 
 /** 三个任务类型的判据(2026-11-06 三档定稿,与 classify.mjs 语义三类同口径,措辞面向判定模型)。 */
 export const TYPE_CRITERIA = {
@@ -92,7 +95,8 @@ export function configProviders(cfg = null) {
  * 未配置时**由 Token Plan 网关自己提供**(实测:网关 /compatible-mode/v1/models 清单里就有
  * decision-model-preview,调用走同网关的专属路径)——收集所有带 key 的客户端供应商,逐个尝试专属端点,谁先通用谁。
  */
-export function decisionProviders({ config = null, providerConfigPath = PROVIDER_CONFIG, snapshotFile = path.join(DATA_DIR, 'routing', 'proxy-upstreams.json') } = {}) {
+export function decisionProviders({ config = null, providerConfigPath = null, snapshotFile = path.join(DATA_DIR, 'routing', 'proxy-upstreams.json') } = {}) {
+  const pcPath = providerConfigPath || defaultProviderConfigPath();
   const cfgd = configProviders(config);
   if (cfgd) return cfgd;
   const out = [];
@@ -106,7 +110,7 @@ export function decisionProviders({ config = null, providerConfigPath = PROVIDER
     out.push({ providerId, baseUrl: String(baseUrl).replace(/\/+$/, ''), apiKey, path: SYSTEMONE_PATH });
   };
   try {
-    const pc = JSON.parse(fs.readFileSync(providerConfigPath, 'utf8'));
+    const pc = JSON.parse(fs.readFileSync(pcPath, 'utf8'));
     for (const r of pc?.config?.providerConfigRules?.providerRules || []) {
       push(r.providerId, r.config?.api?.baseUrl, r.config?.access?.apiKey);
     }

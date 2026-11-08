@@ -109,8 +109,11 @@ export function resolveZcodeV2Dir({ dataDir = DATA_DIR, force = false, env = pro
   } catch { /* 配置缺失/坏 → 无 v2Dir */ }
   if (cfgV2) {
     if (looksAlive(cfgV2)) return { dir: cfgV2, source: 'config' };
+    // 主干自动接(2026-11-07 v2Dir 配置制):填的是数据主干(其下有 .zcode/v2)→ 自动拼接
+    const joined = path.join(cfgV2, '.zcode', 'v2');
+    if (looksAlive(joined)) return { dir: joined, source: 'config' };
     // 配了但目录不存活:不静默吞——回落探测但打印告警(用户填错路径要让 TA 看见)
-    console.error(`[zcode-v2] code-index.config.json 的 v2Dir="${cfgV2}" 不存在或缺少 ZCode 数据文件,回落自动探测`);
+    console.error(`[zcode-v2] code-index.config.json 的 v2Dir="${cfgV2}" 不存在或缺少 ZCode 数据文件(含 .zcode/v2 主干拼接),回落自动探测`);
   }
   // ② 显式 env
   const envDir = env.ZCODE_V2_DIR && String(env.ZCODE_V2_DIR).trim();
@@ -142,6 +145,11 @@ export function isAutoModelName(name) {
 export function normalizeAutoModel(name) {
   const n = String(name || '');
   return isAutoModelName(n) ? AUTO_MODEL : n;
+}
+
+/** 目标显示名:rate 有效(有限正数)⇒ auto×0.115;无效 ⇒ 纯 auto(名字刷新退回锚名)。 */
+export function autoDisplayName(rate) {
+  return Number.isFinite(Number(rate)) && Number(rate) > 0 ? `${AUTO_MODEL}×${Number(rate).toFixed(3)}` : AUTO_MODEL;
 }
 
 /** ZCode 端虚拟供应商条目的模型清单(单 auto 档;autoName 可带倍率后缀)。 */
@@ -202,7 +210,7 @@ function zcodeConfigFile({ home = os.homedir(), zcodeV2Dir = null } = {}) {
   return path.join(v2, 'provider_config.json');
 }
 
-export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', baseUrl = 'http://127.0.0.1:8117/apps/anthropic', qoder = false, autoName = null, zcodeV2Dir = null } = {}) {
+export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', baseUrl = 'http://127.0.0.1:8117/apps/zcode', qoder = false, autoName = null, zcodeV2Dir = null } = {}) {
   const target = autoName != null && isAutoModelName(autoName) ? autoName : null; // null=保持现状;非 auto 系名字拒绝(锚不可漂移)
   let file;
   if (qoder) {
@@ -222,7 +230,7 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
     // 倍率只进 displayName——选择器渲染 displayName 不渲染 id,可见性不受影响。
     // ZCode 无 per-model displayName 字段,倍率必须留在 id 里。
     ? { baseUrl, apiKey: 'tokensaver-placeholder', type: 'openai-compatible', protocol: 'anthropic', authType: 'api-key', model: AUTO_MODEL, models: [{ model: AUTO_MODEL, displayName: `TokenSaver ${name}`, contextWindow: 200000, maxOutputTokens: 8192 }], displayName: providerName }
-    : { providerId, providerName, config: { group: 'standard-personal', access: { type: 'api-key', apiKey: 'tokensaver-placeholder' }, api: { type: 'anthropic-messages', baseUrl }, personalModelIds: [name], modelOrder: [name] } };
+    : zcodeAutoRule(providerId, providerName, baseUrl, name);
 
   if (qoder) {
     // Qoder 形态:providers.{id} 对象;条目 id 用固定名(可读)
@@ -301,42 +309,60 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
   return { seeded: true, models: [target || AUTO_MODEL], backup, file };
 }
 
+/** ZCode 形态 auto 条目(播种/迁移兜底共用;name 恒为 auto 系名)。 */
+const zcodeAutoRule = (providerId, providerName, baseUrl, name) => ({ providerId, providerName, config: { group: 'standard-personal', access: { type: 'api-key', apiKey: 'tokensaver-placeholder' }, api: { type: 'anthropic-messages', baseUrl }, personalModelIds: [name], modelOrder: [name] } });
+
 /**
- * 全期倍率写根级字段(2026-11-07 用户定案,**取代动态模型名**):auto 档 model 名**恒为纯 'auto'、
- * 永不携带倍率后缀**——名字变更会导致客户端已选模型失效、每会话都要重新选模型(实弹痛点)。
- * 倍率改为写两端宿主配置文件的**根级字段** `tokenSaverAutoRate`(数字,数据层记录,不改任何虚拟条目字段)。
- * 只在会话开启时调用(auto.mjs SessionStart 唯一挂载点);幂等:值相同不写盘;fail-open。
- * 返回 {zcode, qoder} 两端结果摘要。
+ * v2Dir 主干兜底播种(2026-11-07 v2Dir 配置制):用户迁移数据路径后,迁移过来的 provider_config
+ * 可能没有 auto 条目——这里幂等补种一条,路由才有入口可选;已有 auto 系条目则定影不动。
+ * 条目名经 autoDisplayName(rate) 带倍率(ZCode 名字即 id,与 SessionStart 刷新同口径);rate 无效回落纯 auto。
+ * 只写虚拟条目,不碰真实供应商条目;**禁写根级杂字段**(2026-11-08 用户裁定,取代 writeAutoRateField)。
+ * fail-open:异常返回 {skipped}。
  */
-export function writeAutoRateField({ home = os.homedir(), rate = null, zcodeV2Dir = null, dataDir = null } = {}) {
-  const out = {};
-  if (!(Number.isFinite(Number(rate)) && Number(rate) > 0)) {
-    return { zcode: { skipped: '无有效费率' }, qoder: { skipped: '无有效费率' } };
+export function ensureAutoEntryOnV2Dir({ dataDir = DATA_DIR, rate = null, zcodeV2Dir = null } = {}) {
+  try {
+    const v2Dir = zcodeV2Dir || resolveZcodeV2Dir({ dataDir }).dir;
+    const file = path.join(v2Dir, 'provider_config.json');
+    if (!fs.existsSync(file)) return { skipped: '宿主配置不存在' };
+    const pc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const rules = pc?.config?.providerConfigRules?.providerRules;
+    if (!Array.isArray(rules)) return { skipped: '无 providerRules' };
+    if (rules.some((r) => (r?.config?.personalModelIds || []).some(isAutoModelName))) return { skipped: 'auto 条目已存在(名字定影)' };
+    const backup = file + '.bak-tokensaver';
+    fs.copyFileSync(file, backup);
+    rules.push(zcodeAutoRule('tokenSaverModel', 'TokenSaver', 'http://127.0.0.1:8117/apps/zcode', autoDisplayName(rate)));
+    const order = pc.config.providerOrder;
+    if (Array.isArray(order) && !order.includes('tokenSaverModel')) order.push('tokenSaverModel');
+    const modelRules = pc.config.modelConfigRules?.providerModelRules;
+    if (Array.isArray(modelRules)) modelRules.push({ modelId: autoDisplayName(rate), config: { enabled: true }, providerId: 'tokenSaverModel' });
+    fs.writeFileSync(file, JSON.stringify(pc, null, 2) + '\n');
+    return { seeded: true, file, backup };
+  } catch (e) {
+    return { skipped: String(e && e.message ? e.message : e) };
   }
-  const rateNum = Number(rate.toFixed(4));
+}
+
+/**
+ * 动态显示名刷新(2026-11-08 用户定案,**SessionStart 唯一改名挂载点**):把两端虚拟条目幂等刷成
+ * autoDisplayName(rate) 形态——Qoder 倍率只进 models[].displayName(id 恒纯 auto,选择器渲染
+ * displayName 照常可见),ZCode 进 personalModelIds/modelOrder(名字即 id,无 displayName 字段)。
+ * 会话中期禁改(名字变更令已选模型绑定失效,2026-11-07 实弹事故);禁写根级杂字段。
+ * fail-open;无有效费率不动。返回 {zcode, qoder} 两端 ensure 结果摘要。
+ */
+export function refreshAutoModelName({ home = os.homedir(), rate = null } = {}) {
+  const autoName = autoDisplayName(rate);
+  if (autoName === AUTO_MODEL) return { zcode: { skipped: '无有效费率,名字保持现名' }, qoder: { skipped: '无有效费率,名字保持现名' } };
+  const out = {};
   for (const qoder of [false, true]) {
-    const tag = qoder ? 'qoder' : 'zcode';
     try {
-      let file;
-      if (qoder) {
-        const dir = fs.existsSync(path.join(home, '.qoder-cn')) ? '.qoder-cn' : '.qoder';
-        file = path.join(home, dir, 'settings.json');
-      } else {
-        // ZCode 端路径自适应(2026-11-07 补齐):与 ensure/snapshot 同判据——用户改过数据存储路径时
-        // 走 resolveZcodeV2Dir 探测,不再写死 ~/.zcode/v2(实测漏接点:倍率字段曾写错位置)
-        const v2Dir = zcodeV2Dir || (home !== os.homedir() ? path.join(home, '.zcode', 'v2') : resolveZcodeV2Dir({ dataDir }).dir);
-        file = path.join(v2Dir, 'provider_config.json');
-      }
-      if (!fs.existsSync(file)) { out[tag] = { skipped: '宿主配置不存在' }; continue; }
-      const pc = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (pc.tokenSaverAutoRate === rateNum) { out[tag] = { skipped: '值未变,不写盘' }; continue; }
-      const backup = file + '.bak-tokensaver';
-      try { fs.copyFileSync(file, backup); } catch { /* 备份失败仍写 */ }
-      pc.tokenSaverAutoRate = rateNum;
-      fs.writeFileSync(file, JSON.stringify(pc, null, 2) + '\n');
-      out[tag] = { updated: true, rate: rateNum, backup };
+      out[qoder ? 'qoder' : 'zcode'] = ensureVirtualProviderEntry({
+        home, qoder,
+        providerId: qoder ? 'tokensaver-auto' : 'tokenSaverModel',
+        autoName,
+        baseUrl: qoder ? 'http://127.0.0.1:8117/apps/qoder' : 'http://127.0.0.1:8117/apps/zcode',
+      });
     } catch (e) {
-      out[tag] = { error: String(e && e.message ? e.message : e) };
+      out[qoder ? 'qoder' : 'zcode'] = { error: String(e && e.message ? e.message : e) };
     }
   }
   return out;

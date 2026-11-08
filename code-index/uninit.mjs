@@ -30,6 +30,7 @@ import {
   cleanQoderWorkspaceHooks,
   cleanZcodeWorkspaceHooks,
 } from './init.mjs';
+import { resolveZcodeV2Dir } from './virtualProvider.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PONYTAIL_MARK = '<!-- ponytail -->';
@@ -216,13 +217,17 @@ function collectRoots() {
 
 /** 移除 init 播种的虚拟供应商条目(ZCode=tokenSaverModel,连同 providerOrder/modelRules 引用;
  *  Qoder=tokensaver-auto,providers 键下条目),真实供应商与其他配置不动。 */
-export function removeVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', qoder = false } = {}) {
+export function removeVirtualProviderEntry({ home = os.homedir(), providerId = 'tokenSaverModel', qoder = false, zcodeV2Dir = null } = {}) {
   let file;
   if (qoder) {
     const dir = fs.existsSync(path.join(home, '.qoder-cn')) ? '.qoder-cn' : '.qoder';
     file = path.join(home, dir, 'settings.json');
   } else {
-    file = path.join(home, '.zcode', 'v2', 'provider_config.json');
+    // 路径自适应(2026-11-08):迁移数据路径后虚拟条目在新 v2 目录,恒读默认 ~/.zcode/v2 清不掉。
+    // 定序与快照同源:zcodeV2Dir 显式传入 > home 显式非默认主目录(测试旧拼接)> resolveZcodeV2Dir 探测。
+    const v2 = zcodeV2Dir
+      || (home && home !== os.homedir() ? path.join(home, '.zcode', 'v2') : resolveZcodeV2Dir().dir);
+    file = path.join(v2, 'provider_config.json');
   }
   const raw = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
   if (!raw) return { removed: false, note: qoder ? '无 Qoder settings.json' : '无 provider_config' };

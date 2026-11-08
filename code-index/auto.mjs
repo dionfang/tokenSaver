@@ -97,19 +97,20 @@ async function main() {
         console.error('[decision-model] 断路器开启,已后台探活(成功自动复位,失败保持跳闸;留痕 data/routing/decision-model-breaker.json)');
       }
     } catch { /* 探活判定/拉起失败不影响会话 */ }
-    // 全期倍率落根级字段(2026-11-07 用户定案,**模型名恒纯 auto 永不后缀**——名字变更会令客户端
-    // 已选模型失效、每会话都要重选):会话开启时把全期倍率写进两端宿主配置的根级字段
-    // tokenSaverAutoRate(数据层记录;快照/prompt 钩子排除虚拟条目字段,零接触)。fail-open。
+    // 动态显示名刷新(2026-11-08 用户定案,唯一改名挂载点):会话开启时读全期倍率(globalRate,
+    // 跨会话累计)刷进两端条目——Qoder 只进 displayName(id 恒纯 auto),ZCode 进
+    // personalModelIds/modelOrder。会话中期禁改(名字变更令绑定失效,2026-11-07 实弹事故);
+    // 禁写宿主根级杂字段。fail-open。
     try {
       const blend = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage', 'auto-blend.json'), 'utf8'));
       const rate = blend && Number.isFinite(Number(blend.globalRate)) ? Number(blend.globalRate) : null;
       if (rate != null && rate > 0) {
-        const { writeAutoRateField } = await import('./virtualProvider.mjs');
-        const rr = writeAutoRateField({ rate, dataDir: DATA_DIR });
-        const changed = [rr.zcode, rr.qoder].some((x) => x && x.updated);
-        if (changed) console.error(`[auto-rate] 全期倍率 ${rate} 已写入两端配置根级字段 tokenSaverAutoRate(会话开启时更新)`);
+        const { refreshAutoModelName } = await import('./virtualProvider.mjs');
+        const rr = refreshAutoModelName({ rate });
+        const changed = [rr.zcode, rr.qoder].some((x) => x && (x.refreshed || x.seeded));
+        if (changed) console.error(`[auto-name] 条目名已按全期费率刷成 ${rr.zcode?.note || rr.qoder?.note}(会话开启时刷新)`);
       }
-    } catch { /* 写入失败不影响会话 */ }
+    } catch { /* 刷名失败不影响会话 */ }
     const f = evalFreshness();
     if (f.need) {
       console.error(`[index] 保鲜判定:需要处理(${f.reason})`);

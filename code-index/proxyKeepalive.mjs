@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { DATA_DIR } from './config.mjs';
 import { pidAlive, spawnLogged } from './proc.mjs';
-import { isAutoModelName } from './virtualProvider.mjs';
+import { isAutoModelName, resolveZcodeV2Dir } from './virtualProvider.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -70,12 +70,15 @@ export function probeProxy(port = PROXY_PORT, timeoutMs = 300) {
 }
 
 /** 虚拟条目里的模型清单(auto 档下恒为 ["auto"])。读不到返回空数组。 */
-export function virtualProviderModels({ home = os.homedir(), providerId = null } = {}) {
+export function virtualProviderModels({ home = os.homedir(), providerId = null, zcodeV2Dir = null } = {}) {
+  // 路径自适应(2026-11-08):zcodeV2Dir 显式传入 > home 显式非默认主目录(测试旧拼接)> resolveZcodeV2Dir 探测。
+  const v2 = zcodeV2Dir
+    || (home && home !== os.homedir() ? path.join(home, '.zcode', 'v2') : resolveZcodeV2Dir().dir);
   const ids = providerId ? [providerId] : VIRTUAL_PROVIDER_IDS;
   const out = [];
   const push = (m) => { if (typeof m === 'string' && m && !out.includes(m)) out.push(m); };
   // ZCode 形态
-  const pc = readJson(path.join(home, '.zcode', 'v2', 'provider_config.json'));
+  const pc = readJson(path.join(v2, 'provider_config.json'));
   const rules = pc?.config?.providerConfigRules?.providerRules;
   if (Array.isArray(rules)) {
     for (const id of ids) {
