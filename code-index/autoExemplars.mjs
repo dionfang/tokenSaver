@@ -102,7 +102,10 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
   try {
     const statePath = path.join(dataDir, 'routing', STATE_FILE);
     const state = readJson(statePath) || {};
-    if (state.at && now - Number(state.at) < minIntervalMs) return { state: 'skipped', reason: '距上次不足间隔' };
+    // 节流(2026-11-08 时钟防御):负龄(上次时间戳在未来 = 机器时钟漂移过)不节流,立即放行并自愈——
+    // 实弹:错误时钟把 at 写成未来 5 天,6h 节流被判"还剩 131 小时",代签停摆数日无人察觉。
+    const age = now - Number(state.at || 0);
+    if (state.at && age >= 0 && age < minIntervalMs) return { state: 'skipped', reason: '距上次不足间隔' };
     // Step② 自动触发(2026-11-03 审读修):db→raw-labels 弱标签导出原是全闭环唯一的手动步;
     // 现在随池生长同步重导(本函数只在 prompt-guard --check 后台分支跑,不占注入时间),且放在
     // routing-log 对齐检查之前——db 全量导出是比 routing-log 更全的源头,无新日志时照样值得刷新。

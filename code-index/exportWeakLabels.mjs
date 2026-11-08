@@ -82,6 +82,21 @@ export function exportWeakLabels({ db: dbPath = DEFAULT_DB, out = DEFAULT_OUT, l
   try { db = new DatabaseSync(dbPath, { readOnly: true }); }
   catch (e) { return { error: `db 打不开:${e.message}` }; }
   const seenPrompt = new Map();
+  // 并集保护(2026-11-08):ZCode 会话库会被清理(旧 turn 从 db 消失),全量替换导出会让样本池缩水,
+  // 连带 exemplars 重建截断(实弹:769→32 触发 332→26)。写前与既有 out 文件按同款 prompt 哈希并集:
+  // 旧条目保留,db 重导仅在置信更高时覆盖——池只增不缩;测试注入 out 亦可密闭。
+  try {
+    for (const line of fs.readFileSync(out, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const o = JSON.parse(line);
+        if (o && o.prompt) {
+          const k = crypto.createHash('sha1').update(String(o.prompt).replace(/\s+/g, ' ').trim().toLowerCase(), 'utf8').digest('hex');
+          if (!seenPrompt.has(k)) seenPrompt.set(k, o);
+        }
+      } catch { /* 坏行跳过 */ }
+    }
+  } catch { /* 首装无旧文件 */ }
   let n = 0;
   try {
     const q = `
@@ -107,7 +122,7 @@ export function exportWeakLabels({ db: dbPath = DEFAULT_DB, out = DEFAULT_OUT, l
         const proj = path.basename(String(r.dir || '').replace(/[\\/]+$/, '')) || 'unknown';
         const key = crypto.createHash('sha1').update(prompt.replace(/\s+/g, ' ').trim().toLowerCase(), 'utf8').digest('hex');
         const prev = seenPrompt.get(key);
-        if (prev && conf <= prev.confidence) continue; // 同话重复 turn:保留标签置信更高的一条
+        if (prev && conf <= (Number(prev.confidence) || 0)) continue; // 同话重复 turn:保留标签置信更高的一条
         const rec = {
           id: 'w-' + key.slice(0, 12), turnId: r.tid, project: proj,
           prompt: prompt.slice(0, 600), toolCalls: total, writeEdits: we, reads: rd,
