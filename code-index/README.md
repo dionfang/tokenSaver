@@ -11,7 +11,7 @@ node init.mjs --roots "<项目目录>"
 node init.mjs
 ```
 
-也可把**本目录**复制到目标项目任意位置（建议 `scripts/code-index`；**带上 `hf-cache/`**，已含 local 两个模型；不要带 `node_modules`、`data`）。
+也可把**本目录**复制到目标项目任意位置（建议 `scripts/code-index`；**带上 `hf-cache/`**，已含 local 三个模型；不要带 `node_modules`、`data`）。
 
 ```bash
 cd 目标项目/scripts/code-index

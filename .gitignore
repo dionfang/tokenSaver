@@ -12,12 +12,17 @@ hf-cache/
 /.qoder/
 /data/
 
-# 开发期测试,不入库、不随仓库发给使用者
+# 开发期测试,不入库、不随仓库发给使用者(A/B 数据已迁 agent_reports/ab-logs,2026-11-11)
 /test/*
-!/test/ab/
 
 # 动态模型路由设计决策与实施文档,仅本地维护不推送
 /model-routing.md
+
+# 本地测试/审查/学习/夜间编排资产(2026-11-10 用户定:非部署文件,不入库、不进远程仓库)
+# 例外:A/B 实验原始证据 ab-logs/ 保持版本控制(2026-11-11 自 test/ab/result 迁入)
+/agent_reports/*
+!/agent_reports/ab-logs/
+/tools/
 
 # code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
 /C:/Users/Administrator/AppData/Local/Temp/tmp.FEHZdy3OVr/

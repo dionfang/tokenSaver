@@ -36,6 +36,20 @@ export function evidenceOf(row = {}) {
  * 结果侧证据 → 难度真值。返回 {tier, confidence, rule} 或 {tier:null}(证据不足就不编真值)。
  * 优先级:用户点名旗舰 > P2 上梯(最硬:低档真干不动了) > 疑难形态 > 重形态 > 轻问答/例行小改。
  */
+/** 三档类型口径·行为计数域(2026-11-10 二次审计 P1-10.4):importRoutingLog 与 profileCalibrate
+ *  两份独立实现合并为单一真源。light=零工具;multi=w≥3||c≥15;routine=w≥1;其余不猜(返回 null)。
+ *  注:exportWeakLabels.labelTurn 属 prompt 形态域(we/total 是从 prompt 文本估的写数/总轮数,
+ *  估计有噪 ⇒ routine 支多一道 total≥3 护栏),与行为计数域**有意不同**,勿盲目合并(见该文件头注)。 */
+export function labelFromCounts({ writes = 0, dispatches = 0, calls = 0 } = {}) {
+  const w = Number(writes) || 0;
+  const d = Number(dispatches) || 0;
+  const c = Number(calls) || 0;
+  if (w === 0 && d === 0 && c === 0) return 'light';
+  if (w >= 3 || c >= 15) return 'multi';
+  if (w >= 1) return 'routine';
+  return null;
+}
+
 export function deriveTierTruth(ev = {}) {
   const calls = Number.isFinite(ev.calls) ? ev.calls : null;
   const writes = Number.isFinite(ev.writes) ? ev.writes : null;
@@ -96,5 +110,29 @@ export function reconcile(row = {}, { prefer = 'behavior' } = {}) {
   const agree = !!(behavior.tier && map) ? behavior.tier === map : null;
   const tier = prefer === 'map' ? (map || behavior.tier || null) : (behavior.tier || map || null);
   const source = tier && tier === behavior.tier ? (map ? (agree ? 'both' : 'behavior') : 'behavior') : (tier ? `map:${axes.source}` : null);
-  return { behavior: behavior.tier, behaviorRule: behavior.rule, behaviorConfidence: behavior.confidence, map, mapSource: axes.source, agree, tier, source };
+  return { behavior: behavior.tier, behaviorRule: behavior.rule, behaviorConfidence: behavior.confidence, map, mapSource: axes.source, agree, tier, source, interval: tierIntervalOf(row) };
+}
+
+/**
+ * 结果侧证据 → 难度真值**区间**(自进化 v2,2026-11-08 重建裁定;推翻"点值即真值")。
+ * 任务所需档 N 是未知量,证据只给出区间 [min,max]:
+ *   - escalated(上梯)⇒ [目标档, 目标档] 精确点:低档已连续失败(硬下界)、目标档完成过该段任务(上界),双界同点;
+ *   - 疑难/重形态/轻问答等形状规则 ⇒ 与 v1 逐位相同的单点区间(量尺向后兼容,历史数可比);
+ *   - 行内已带 tierInterval/interval(离线抽取器产物,如干净完成 ⇒ [R1, served] 的可解性上界;上梯+段内
+ *     干净完成 ⇒ 精确点)——直接采用,抽取器已做时间线级证据合成,比行内形状规则强;
+ *   - 两通道都给不出 ⇒ null(该行不进量尺)。
+ * 优先序:行内区间证据 > 行为侧形状 > T→R 双轴回落。预测绝不参与(#14,本函数看不见 prompt)。
+ */
+export function tierIntervalOf(row = {}) {
+  const iv = row.tierInterval && typeof row.tierInterval === 'object' ? row.tierInterval
+    : (row.interval && typeof row.interval === 'object' ? row.interval : null);
+  if (iv && TIERS.includes(iv.min) && TIERS.includes(iv.max)) {
+    if (TIERS.indexOf(iv.min) <= TIERS.indexOf(iv.max)) return { min: iv.min, max: iv.max, src: iv.src || 'evidence' };
+    // 倒置区间=脏数据:不采信,继续走行为侧/映射回落(不 return null)
+  }
+  const b = deriveTierTruth(evidenceOf(row));
+  if (b.tier) return { min: b.tier, max: b.tier, src: `behavior:${b.rule}` };
+  const axes = tierTruthFromAxes(row);
+  if (axes.tier) return { min: axes.tier, max: axes.tier, src: `axes:${axes.source}` };
+  return null;
 }

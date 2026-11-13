@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DATA_DIR } from './config.mjs'; // v2Dir 配置的读取来源(config 不反向依赖本模块,无循环)
+import { atomicWriteFileSync } from './proc.mjs';
 
 const ok = (msg) => console.log(msg);
 
@@ -250,14 +251,14 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
       const backup = file + '.bak-tokensaver';
       fs.copyFileSync(file, backup);
       pc.providers[providerId] = { ...autoEntry('TokenSaver', writeName), tokenSaverMirrorAuto: true };
-      fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+      atomicWriteFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
       ok(`[user] Qoder 虚拟条目 ${providerId} 已刷新(${nameOk ? 'auto 档' : `清单收敛为 ${writeName}`}${baseOk ? '' : ';baseUrl 已切到宿主专属前缀'};已备份 ${path.basename(backup)})`);
       return { seeded: false, refreshed: true, note: nameOk ? 'baseUrl 已对齐' : `清单已刷新为 ${writeName}`, extra };
     }
     const backup = file + '.bak-tokensaver';
     fs.copyFileSync(file, backup);
     pc.providers[providerId] = autoEntry('TokenSaver', target || AUTO_MODEL);
-    fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+    atomicWriteFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
     ok(`[user] 已播种 Qoder 虚拟供应商 ${providerId}:baseUrl→本地代理,单 auto 档;选择它即启用动态路由;已备份 ${path.basename(backup)}`);
     return { seeded: true, models: [target || AUTO_MODEL], backup, file };
   }
@@ -293,7 +294,7 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
         { modelId: writeName, config: { enabled: true }, providerId },
       ];
     }
-    fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+    atomicWriteFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
     ok(`[user] 虚拟供应商 ${providerId} 已刷新(${nameOk ? 'auto 档' : `清单收敛为 ${writeName}`};${baseOk ? 'baseUrl 已对齐' : `baseUrl 已切到 ${baseUrl}`};真实清单继续由快照维护;已备份 ${path.basename(backup)})`);
     return { seeded: false, refreshed: true, note: nameOk ? 'baseUrl 已对齐' : `清单已刷新为 ${writeName}`, extra };
   }
@@ -304,7 +305,7 @@ export function ensureVirtualProviderEntry({ home = os.homedir(), providerId = '
   if (Array.isArray(order) && !order.includes(providerId)) order.push(providerId);
   const modelRules = pc.config.modelConfigRules?.providerModelRules;
   if (Array.isArray(modelRules)) modelRules.push({ modelId: target || AUTO_MODEL, config: { enabled: true }, providerId });
-  fs.writeFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+  atomicWriteFileSync(file, JSON.stringify(pc, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
   ok(`[user] 已播种虚拟供应商 ${providerId}:baseUrl→本地代理,单 auto 档(真实模型由决策层定);选择它即启用动态路由;已备份 ${path.basename(backup)}`);
   return { seeded: true, models: [target || AUTO_MODEL], backup, file };
 }
@@ -335,7 +336,7 @@ export function ensureAutoEntryOnV2Dir({ dataDir = DATA_DIR, rate = null, zcodeV
     if (Array.isArray(order) && !order.includes('tokenSaverModel')) order.push('tokenSaverModel');
     const modelRules = pc.config.modelConfigRules?.providerModelRules;
     if (Array.isArray(modelRules)) modelRules.push({ modelId: autoDisplayName(rate), config: { enabled: true }, providerId: 'tokenSaverModel' });
-    fs.writeFileSync(file, JSON.stringify(pc, null, 2) + '\n');
+    atomicWriteFileSync(file, JSON.stringify(pc, null, 2) + '\n');
     return { seeded: true, file, backup };
   } catch (e) {
     return { skipped: String(e && e.message ? e.message : e) };

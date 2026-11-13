@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * 部署产物一致性门禁:校验本仓 AGENTS.md 的两个注入段是否等于当前代码库模板。
+ * 部署产物一致性门禁:校验本仓 AGENTS.md 的两个注入段是否等于当前代码库模板,
+ * 并校验用户级 hooks 转发器的「安装⊆USER_FORWARDER_FILES 登记、uninit 清理≡登记」单源同步。
  *   node deploySync.mjs [--root 仓库根] [--json]
  *   node deploySync.mjs --selftest
  *
@@ -12,7 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findGitRoot, DATA_DIR } from './config.mjs';
-import { disciplineBlock, DIET_MARK, dietBlock } from './init.mjs';
+import { disciplineBlock, DIET_MARK, dietBlock, USER_FORWARDER_FILES } from './init.mjs';
+import { CURSOR_FORWARDERS, QODER_FORWARDERS } from './uninit.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -68,6 +70,29 @@ function stringify(content) {
   return typeof content === 'string' ? content : content.toString('utf8');
 }
 
+/** 从 init.mjs 源码提取用户级转发器安装名(rewrite*UserHooks 里 writeFileSync(path.join(hooksDir,'x.mjs')))。 */
+export function parseInitForwarders(src) {
+  return [...String(src || '').matchAll(/writeFileSync\(\s*path\.join\(\s*hooksDir\s*,\s*'([\w.-]+\.mjs)'\s*\)/g)].map(m => m[1]);
+}
+
+/** hooks 部署/卸载同步门禁(2026-11-10 纪律段第 10 条扩围):
+ *  ①init 实际安装(writeFileSync)⊆ USER_FORWARDER_FILES 登记的 current 并集——装了没登记,卸载与门禁都会漏;
+ *  ②uninit 清理清单 ≡ 登记的 current∪legacy——手抄漂移/漏项都会残留或误删。 */
+export function checkForwarderSync({ initSource = '' } = {}) {
+  const issues = [];
+  const allCurrent = new Set(Object.values(USER_FORWARDER_FILES).flatMap(x => x.current || []));
+  for (const f of parseInitForwarders(initSource)) {
+    if (!allCurrent.has(f)) issues.push(`hooks:init 安装的转发器 ${f} 未登记进 USER_FORWARDER_FILES(卸载会漏,请先登记再装)`);
+  }
+  const uninitLists = { cursor: CURSOR_FORWARDERS, qoder: QODER_FORWARDERS };
+  for (const [host, list] of Object.entries(uninitLists)) {
+    const reg = [...(USER_FORWARDER_FILES[host]?.current || []), ...(USER_FORWARDER_FILES[host]?.legacy || [])];
+    for (const f of reg) if (!list.includes(f)) issues.push(`hooks:${host} 的 uninit 清理清单缺 ${f}(卸载会残留)`);
+    for (const f of list) if (!reg.includes(f)) issues.push(`hooks:${host} 的 uninit 清理清单多出 ${f}(不在单源登记内,疑似手抄漂移)`);
+  }
+  return issues;
+}
+
 function selftest() {
   const rel = 'code-index', dataRel = 'data';
   const disc = disciplineBlock({ rel, dataRel, packed: false });
@@ -91,6 +116,13 @@ function selftest() {
   if (checkAgents(`# 项目\n\n${disc}\n${dietBad}`, { rel, dataRel }).ok) throw new Error('自检失败:输出纪律段差异未被识别');
   // 旧 ponytail 残留 → 判不同步
   if (checkAgents(`# 项目\n\n${disc}\n${diet}\n<!-- ponytail -->\n## Ponytail 模式\n\nold\n`, { rel, dataRel }).ok) throw new Error('自检失败:ponytail 残留未被识别');
+  // hooks 同步门禁:真实 init.mjs 源必须全过;漏登记/手抄漂移必须被识别
+  const realSrc = fs.readFileSync(path.join(here, 'init.mjs'), 'utf8');
+  const fw = checkForwarderSync({ initSource: realSrc });
+  if (fw.length) throw new Error('自检失败:hooks 单源不同步\n' + fw.join('\n'));
+  if (!checkForwarderSync({ initSource: "fs.writeFileSync(path.join(hooksDir, 'ghost.mjs'), x)" }).some(x => x.includes('ghost.mjs'))) {
+    throw new Error('自检失败:未登记的安装未被识别');
+  }
   console.log('[selftest] deploySync ok');
 }
 
@@ -108,10 +140,12 @@ if (!fs.existsSync(agentsPath)) {
   process.exit(1);
 }
 const result = checkAgents(fs.readFileSync(agentsPath, 'utf8'), { rel, dataRel });
+result.issues.push(...checkForwarderSync({ initSource: fs.readFileSync(path.join(here, 'init.mjs'), 'utf8') }));
+result.ok = result.issues.length === 0;
 if (argv.includes('--json')) {
   console.log(JSON.stringify({ root, rel, dataRel, ...result }, null, 1));
 } else if (result.ok) {
-  console.log(`[ok] ${agentsPath} 的两个注入段与当前代码库模板一致(${rel})`);
+  console.log(`[ok] ${agentsPath} 的两个注入段与当前代码库模板一致(${rel}),hooks 单源同步通过`);
 } else {
   console.error(`[err] ${agentsPath} 与代码库模板不一致,共 ${result.issues.length} 处:`);
   for (const i of result.issues) console.error('  - ' + i);

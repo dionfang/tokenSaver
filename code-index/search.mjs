@@ -27,6 +27,7 @@ import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, resolve
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
 import { assessModelStatus, addInputSavings, appendReadEvent, countInputTokensPair, ollamaHasModel } from './modelStatus.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
+import { embedBusy, EMBED_BUSY_REASON } from './embedGate.mjs';
 import { residentEmbed, residentScorePairs } from './localResident.mjs';
 import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from './vectorStore.mjs';
 
@@ -62,7 +63,34 @@ if (!fs.existsSync(chunksPath)) {
   console.error('[err] 索引尚未建立(data/chunks.jsonl 不存在):请运行 node build.mjs 建立块清单(免模型),再运行 node embed.mjs 生成向量;或等待下次会话启动时 auto.mjs 自动构建');
   process.exit(1);
 }
-const chunks = fs.readFileSync(chunksPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+let chunks = fs.readFileSync(chunksPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+
+// ---------- 语料选择(2026-11-11):签名过期 ≠ 不可检索 ----------
+// embeddings.bin 与 chunks.paired.jsonl 逐位置自洽(embed 写入时同批落盘),快照本身就是
+// 一份完整可检索语料(略旧)。此前签名过期直接抛错降级 bm25——代码一改语义检索整轮失效。
+// 现改为:过期时优先把语料切到嵌入时快照跑完整混合检索(命中优先);仅快照缺失/损坏
+// (字节数 ≠ 块数×dim×4)才保持当前块清单,由向量段指纹校验拒绝后降级 bm25。
+// --mode bm25 显式纯词法,不吃快照。
+let vecSnapshot = false;
+if (MODE !== 'bm25') {
+  const vb = activeBackend();
+  const vm0 = readVectorMeta(vb);
+  if (vm0 && vectorSignatureStale(vm0)) {
+    try {
+      const paired = fs.readFileSync(vectorPaths(vb).paired, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const dim = Number(vm0.dim);
+      const expect = paired.length * dim * 4;
+      const size = fs.statSync(vectorPaths(vb).emb).size;
+      // 覆盖度守卫(2026-11-11 崩溃复盘):嵌入中断留下的部分快照可能只有几十行,
+      // 不得吞掉整个语料——只有覆盖当前块清单一半以上才值得切过去
+      if (paired.length && paired.length * 2 >= chunks.length && Math.abs(size - expect) <= 4) {
+        chunks = paired;
+        vecSnapshot = true;
+        console.error(`[warn] 签名过期,基于嵌入时快照检索(快照 ${paired.length} 块/当前 ${chunks.length} 块;新改动待重嵌后可见: node embed.mjs)`);
+      }
+    } catch { /* 快照不可读:保持当前块清单,向量段指纹校验会拒绝并降级 bm25 */ }
+  }
+}
 
 // ---------- 分词:标识符拆分 + CJK 二元组 ----------
 function tokenize(text) {
@@ -145,8 +173,9 @@ const canVector = wantVector && vmeta && fs.existsSync(embPath)
   && (indexBackend === 'local' || (indexBackend === 'ollama' && ollamaUp));
 if (canVector) {
   try {
-    // 指纹校验:块清单已变而当前路径向量未重生成时,拒绝使用过期向量
-    if (vectorSignatureStale(vmeta)) {
+    // 指纹校验:签名过期时语料已切到嵌入时快照(逐位置自洽,直接可用);
+    // 只有快照切换失败(语料仍是当前块清单,与向量错位)才拒绝,交由外层降级 bm25
+    if (vectorSignatureStale(vmeta) && !vecSnapshot) {
       throw new Error('向量与块清单不一致(代码已变更未重嵌入),请运行 node embed.mjs');
     }
     let q = null;
@@ -278,6 +307,12 @@ async function rerankLocal(query, pool, firstStage, chunks) {
 async function rerankCandidates(query, pool, firstStage, chunks) {
   if (loadConfig().modelIn === 'local') return rerankLocal(query, pool, firstStage, chunks);
   if (!ollamaUp) return null;
+  // 批量嵌入让行(2026-11-11):ollama 单并发队列,重嵌期间精排跳过(返回 null=沿用一阶段排序)。
+  // 忙跳过≠故障,不触发断路器;local 精排不占 ollama 队列(modelIn=local 在上方已提前返回),不受此闸影响。
+  if (embedBusy()) {
+    process.stderr.write(`[rerank] ${EMBED_BUSY_REASON},精排跳过\n`);
+    return null;
+  }
   const base = resolveBase();
   try {
     // 固定模型,不做其他 reranker 的探测/回退;名字只来自 config.mjs
@@ -320,6 +355,7 @@ async function rerankCandidates(query, pool, firstStage, chunks) {
               options: { num_predict: 1, temperature: 0, ...gpuOptions() },
               logprobs: true, keep_alive: OLLAMA_KEEP_ALIVE,
             }),
+            signal: AbortSignal.timeout(20000), // 单对判定超时兜底,失败走半权回退(2026-11-10 审计修复)
           });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const v = verdict((await resp.json()).logprobs);
@@ -330,7 +366,7 @@ async function rerankCandidates(query, pool, firstStage, chunks) {
         process.stderr.write(`\r[rerank] ${done}/${pool.length}`);
       }
     }
-    await Promise.all(Array.from({ length: 4 }, worker));
+    await Promise.all(Array.from({ length: 2 }, worker)); // 并发 4→2(2026-11-11 WHEA 缓解):ollama 单队列串行执行,客户端并发只加排队深度
     process.stderr.write(`  模型:${rrModel}${failedCount ? `(失败${failedCount}已回退)` : ''}\n`);
     return results;
   } catch (e) {
@@ -352,13 +388,16 @@ function snippet(c) {
 
 let toolOutput = '';
 if (AS_JSON) {
-  toolOutput = JSON.stringify(kept.map(i => ({
+  // S4-F3(2026-11-10 夜审):包 mode 字段——实际生效臂(bm25 降级/--rerank 均可见),
+  // 回归指标可据此甄别"被降级臂污染的指标";消费方沿用 hits 数组(regress 的数组提取不受外层对象影响)。
+  const jsonMode = (MODE === 'bm25' || !vecScores) ? 'bm25' : MODE;
+  toolOutput = JSON.stringify({ mode: jsonMode + (rrScores ? '+rerank' : ''), hits: kept.map(i => ({
     score: Number((rrScores ? rrScores.get(i) : scores[i]).toFixed(4)),
     ...(rrScores ? { firstStage: Number(scores[i].toFixed(4)) } : {}),
     file: chunks[i].p,
     lines: [chunks[i].s, chunks[i].e],
     symbol: chunks[i].y || '',
-  })), null, 1);
+  })) }, null, 1);
 } else {
   const modeUsed = (MODE === 'bm25' || !vecScores) ? 'bm25' : MODE;
   const lines = [`# 查询: ${query}  (模式:${modeUsed}${rrScores ? '+rerank' : ''}, 命中 ${kept.length}/${chunks.length} 块)`];

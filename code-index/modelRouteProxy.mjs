@@ -44,10 +44,13 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR } from './config.mjs';
+import { DATA_DIR, loadConfig } from './config.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
+import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
+import { resolveDecisionProfile } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
 import { blendedRate, loadModelPrices } from './costProfile.mjs';
 import { isAutoModelName, normalizeAutoModel, resolveZcodeV2Dir } from './virtualProvider.mjs';
 
@@ -75,6 +78,34 @@ const GATE_COMPRESS_RATIO = 0.7;
 // 缓存热窗口(修正#4):显式缓存有效期 5min 确定性过期;隐式缓存 TTL 不确定,按同值保守处理。
 // 距上一轮超过该窗口 → 宽限/粘住偏好全部关闭(热缓存假设不成立,换档不再有额外税,黏旧档只是多花钱)。
 const CACHE_TTL_MS = 5 * 60 * 1000;
+
+// ---------- R-ref 预兜底票(v2.1 2026-11-08) ----------
+// 判定缓存:同 prompt 判一次,按 pkey 缓存(进程级,代理长驻);TTL 6h、容量 200,简单 LRU。
+// 影子账 data/usage/r-ref-shadow.jsonl:逐条记 L1 vs 决策票对照——决策票能否晋升实弹,
+// 唯一依据是它与结果侧证据(上梯/干净完成)的一致率,这里只攒数据。
+const RREF_AMB_CONF = 0.5; // 词法置信 ≤ 此值的 R1 才属"词法最瞎区",才值得现查判定模型
+const RREF_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const RREF_CACHE_MAX = 200;
+const rRefCache = new Map(); // key = pkey|decisionModel(2026-11-09 加模型身份):切换决策模型后旧模型结果不再被命中,防 6h 缓存串味
+function rRefCacheGet(pkey, decisionModel = '') {
+  const k = pkey ? `${pkey}|${decisionModel}` : null;
+  const e = k ? rRefCache.get(k) : null;
+  if (!e) return null;
+  if (Date.now() - Number(e.at || 0) > RREF_CACHE_TTL_MS) { rRefCache.delete(k); return null; }
+  return e;
+}
+function rRefCacheSet(pkey, v, decisionModel = '') {
+  const k = `${pkey}|${decisionModel}`;
+  rRefCache.delete(k); // 先删后插 = 简单 LRU(插入序即新鲜序)
+  if (rRefCache.size >= RREF_CACHE_MAX) { const old = rRefCache.keys().next().value; if (old) rRefCache.delete(old); }
+  rRefCache.set(k, { ...v, at: Date.now() });
+}
+function logRRefShadow(usageDir, rec) {
+  try {
+    fs.mkdirSync(usageDir, { recursive: true });
+    fs.appendFileSync(path.join(usageDir, 'r-ref-shadow.jsonl'), JSON.stringify(rec) + '\n');
+  } catch { /* 影子失败不影响路由 */ }
+}
 
 // 冷却 TTL 分级(2026-11-03 用户定档,按错误性质而非单纯状态码;从低到高 5min/30min/2h/5h):
 //   transient 临时限流/并发超限/引擎过载/超时/5xx(可重试,很快恢复)                              → 5min
@@ -599,7 +630,7 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE, zcode
     if (isIngress) ingress.push(pid);
   }
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  fs.writeFileSync(outFile, JSON.stringify({ version: 5, snapshottedAt: Date.now(), providers, ingress, providerOrder }, null, 1) + '\n');
+  atomicWriteFileSync(outFile, JSON.stringify({ version: 5, snapshottedAt: Date.now(), providers, ingress, providerOrder }, null, 1) + '\n');
   return { providers: Object.keys(providers).length, ingress, providerOrder, outFile };
 }
 
@@ -649,6 +680,12 @@ export function pickUpstream({ providerId, model, upstreams } = {}) {
     for (const id of ingress) {
       const q = ok(id);
       if (q && (q.models || []).includes(model)) return { providerId: id, ...q };
+    }
+    // H4(2026-11-09 夜审 S1-F2 修复):与无钉住路径对齐——模型不在入口清单仍只发入口供应商
+    // (modelNotListed 让"这个账号没有这个模型"的错由它自己返回),绝不越权兜底到别的账户
+    if (ingress.length) {
+      const q = ok(ingress[0]);
+      if (q) return { providerId: ingress[0], ...q, modelNotListed: true };
     }
     return resolveUpstreamForModel(model, upstreams) || fallbackUpstream(upstreams);
   }
@@ -707,7 +744,7 @@ export function updateAutoBlend({ dataDir = DATA_DIR, conv = null, row = null, p
     }
     cur.globalRate = cur.global.baseCost > 0 ? Number((cur.global.actualCost / cur.global.baseCost).toFixed(3)) : null;
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(cur));
+    atomicWriteFileSync(file, JSON.stringify(cur)); // 原子写(2026-11-10 二次审计 P1-3)
     // 名字刷新不在这里(2026-11-07 用户定案):动态显示名的唯一挂载点=会话开启钩子(auto.mjs
     // SessionStart),运行时不再刷——名字在会话生命周期内稳定,新会话开启才吸收最新费率。
     return cur;
@@ -763,12 +800,12 @@ export function updateGateNotice({ dataDir = DATA_DIR, decision = null, est = 0,
       released: false,
     };
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(notice));
+    atomicWriteFileSync(file, JSON.stringify(notice)); // 原子写(2026-11-10 二次审计 P1-3)
     return notice;
   }
   if (decision && decision.gateRelease === true) {
     const notice = { ...prev, at: now, released: true };
-    try { fs.writeFileSync(file, JSON.stringify(notice)); } catch { /* 留痕失败不影响路由 */ }
+    try { atomicWriteFileSync(file, JSON.stringify(notice)); } catch { /* 留痕失败不影响路由 */ }
     return notice;
   }
   return prev;
@@ -794,7 +831,7 @@ export function resolveAutoBase({ tierChains = {}, providerPriority = [], provid
   return { modelId: null, providerId: null, warn: '四档链全部为空', tier: null };
 }
 
-export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, loopStreak = 0, tierClassify = null } = {}) {
+export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, eagerR3 = false, loopStreak = 0, tierClassify = null } = {}) {
   const g = { ...DEFAULT_GUARD, ...(guard && typeof guard === 'object' ? guard : {}) };
   const inPhase = !!(phase && phase.model);
   // 档位分类配置(2026-11-06 v4):品牌三档表+轻量后缀(调用方注入,缺省=内置默认)
@@ -825,6 +862,8 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   // 证据升级(P2,2026-11-04 逐级上梯):连续 2 轮修复失败 → 从**当前服务档**上梯一档(R1→R2→R3,封顶 R3)。
   // 资费语义(用户定档):R3 只在"R2 明确无法解决"后才调用——R1 会话先试 R2(8x),R2 再失败才 R3(15x),不越级;
   // R4 恒不可达(仅显式点名旗舰)。上梯成功后调用方把 errStreak 清零,新档重新积累 2 连才继续上梯。
+  // P2 提前一拍(v2 2026-11-08 重建裁定):eagerR3=true(开关+1 连败+本轮任务定档 R2)且服务档=R2 时,
+  // 第 1 次报错即上 R3——R2 难度任务第 1 次报错就是"R2 可能不够"的真实行为证据,省一轮 8x 空转;R1→R2 仍 2 连败。
   // 返回 {decision} 上梯成功 | {mark:false} 已封顶/目标档不可达/门控抑制(落到普通工具续接,streak 保持)。
   const ESC_NEXT = { R1: 'R2', R2: 'R3', R3: null, R4: null };
   const servingTier = tierOfModel(inPhase ? phase.model : baseModel, tcls.modelTiers ? tcls : undefined) || 'R1';
@@ -833,13 +872,15 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
     if (!escTarget) return { mark: false, decision: null };
     // 同一段死循环只升一次(2026-11-05 A 项):已经因循环升过档就不要再升——否则同一循环会连吃多次冷读税。
     if (loopStreak > 0 && phase?.loopEscalated === true) return { mark: false, decision: null };
+    // 提前一拍仅限 R2→R3 且已有 1 连败(R1→R2 维持 2 连败;R3 已封顶 escTarget=null 更早拦截)
+    if (eagerR3 && (servingTier !== 'R2' || Number(errStreak) < 1)) return { mark: false, decision: null };
     const target = resolveTier(escTarget, { cfg: { modelRouting: { chains: tc, providerPriority, providerOrder, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
     const model = target?.modelId || null;
     // 解析结果必须真落在目标档:目标档链空时 resolveTier 会级联降到低档模型,拿它冒充"升级"是纯浪费(白付一次冷读)
     if (!model || target.tier !== escTarget || !isProxyReachable({ providerId: target.providerId, model, upstreams })) return { mark: false, decision: null };
     const est = estimateContextTokens(contextBytes);
     // 切换税门控对死循环证据豁免(2026-11-06):门控假设"升档可能不必要",而死循环按定义不会自愈,
-    // 拦住升档=R1 空烧到人来救;errStreak 类证据(可能自愈)仍受门控。
+    // 拦住升档=R1 空烧到人来救;errStreak 类证据(可能自愈)仍受门控,提前一拍同属此类,受门控约束。
     if (g.enabled && loopStreak === 0 && est > g.maxContextTokens) return { mark: false, decision: null };
     const nextPhase = {
       model, providerId: target.providerId,
@@ -852,12 +893,14 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
     };
     const why = loopStreak > 0
       ? `死循环(同参数工具调用连续 ${loopStreak} 次,工具都"成功"但没进展)`
-      : `连续 ${Math.max(errStreak, 2)} 轮修复失败`;
-    return { mark: true, decision: { model, providerId: target.providerId, switched: model !== baseModel, escalated: true, reason: `证据升级(${why},${servingTier}→${escTarget} 逐级上梯)`, nextPhase } };
+      : (eagerR3 && Number(errStreak) < 2
+        ? `连续 1 轮修复失败 + 本轮任务为 R2 难度(提前一拍,不等第 2 连败)`
+        : `连续 ${Math.max(errStreak, 2)} 轮修复失败`);
+    return { mark: true, decision: { model, providerId: target.providerId, switched: model !== baseModel, escalated: true, escalationFrom: servingTier, escalationTo: escTarget, reason: `证据升级(${why},${servingTier}→${escTarget} 逐级上梯)`, nextPhase } };
   };
 
   if (lastKind !== 'human') {
-    if (escalate) {
+    if (escalate || eagerR3) {
       const e = tryEscalate();
       if (e.decision) return e.decision;
       // 已封顶(R3/R4 服务档)/目标档不可达/门控抑制 → 普通工具续接(errStreak 保持;门控抑制轮上下文变薄后下轮重试)
@@ -895,7 +938,9 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   const r1Streak = phase?.r1Streak || 0;
   const phaseAtCap = inPhase && (phase.humanTurns || 0) >= g.maxPhaseTurns;
   // R1 宽限:热缓存 + 服务档 R2-R4 + 未到轮数上限 + 非歧义轮 → 第 1 个连续 R1 轮留在现档;第 2 连/缓存已冷/到顶/歧义才降档。
-  if (r1Asks && !ambiguousR1 && !cacheCold && !phaseAtCap && r1Streak < 1 && (effTier === 'R2' || effTier === 'R3' || effTier === 'R4')) {
+  // S1-F5(2026-11-10 夜审):无状态(无阶段)会话 cacheCold 恒真,旧口径下宽限分支永不可达——明确 R1 冷启动轮被
+  // 即时降档;冷启动会话同样进宽限计数(维持现档一轮,r1Streak 落阶段,下轮仍 R1 再降档)。
+  if (r1Asks && !ambiguousR1 && (!cacheCold || !inPhase) && !phaseAtCap && r1Streak < 1 && (effTier === 'R2' || effTier === 'R3' || effTier === 'R4')) {
     const keep = inPhase ? phase.model : baseModel;
     return {
       model: keep, ...provKey(inPhase ? phase.providerId : baseProvider),
@@ -1034,6 +1079,9 @@ export function shouldCoolDown({ status, bodyHead } = {}) {
   if (s === 408 || s >= 500 || TRANSIENT_RE.test(b)) return 'transient';
   // 未知错误兜底 → 5h:≥400 且带错误信封但无法归类;裸 4xx(无 body)不轻判,多为请求格式错
   if (s >= 400 && hasEnvelope) return 'unknown';
+  // S12-A1(2026-11-11 夜审):2xx+错误信封且无对话载荷也归 unknown——此前恒 null(≥400 兜底盖不到
+  // 2xx 信封),网关伪成功不冷却不重选,下轮仍选同一坏上游;有对话载荷的 2xx 已在前方放行(2026-11-04 守卫)。
+  if (s >= 200 && s < 300 && hasEnvelope) return 'unknown';
   return null;
 }
 
@@ -1081,6 +1129,9 @@ function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthro
     const mod = u.protocol === 'https:' ? https : http;
     let settled = false;
     const finish = (info) => { if (settled) return; settled = true; resolve(info); };
+    // 首字节超时(2026-11-10 审计修复):上游 30s 无响应即断连,走下方 error 路径(可重试/502);
+    // 只卡"连接后无首字节",不设流中空闲超时——推理模型长思考停顿属合法流量,流中悬挂由客户端 close 兜底。
+    const firstByteTimer = setTimeout(() => { try { req.destroy(); } catch { /* 已断开 */ } }, 30000);
     const req = mod.request({
       hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search,
       method: 'POST',
@@ -1091,6 +1142,7 @@ function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthro
         'accept': clientRes.req?.headers?.accept || '*/*',
       },
     }, (up) => {
+      clearTimeout(firstByteTimer); // 首字节已到,超时使命完成
       // 仅状态码即可判定为可重试(config/billing/transient/unknown 任一非 null 族):同轮重选,先不碰客户端。
       // 裸 4xx(如 400 请求格式错)状态码判为 null → 不进重试,照常透传,避免为请求方的错换模型。
       if (allowRetry && shouldCoolDown({ status: up.statusCode })) {
@@ -1108,7 +1160,13 @@ function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthro
       }
       const headers = { ...up.headers };
       delete headers['content-length']; // 流式透传时长度不可预知
-      clientRes.writeHead(up.statusCode, headers);
+      const streaming = !!reqMeta.stream;
+      // S12-A1(2026-11-10 落地):非流式整包先缓冲判型再 writeHead——2xx 但 body 是垃圾(非 JSON 且
+      // 无对话载荷)时不透传给客户端,改走 502 + unknown 族冷却,防"200 垃圾"静默记成功、下轮仍选同一坏上游。
+      // 流式(SSE)无法整包判型,维持原即时透传路径(守卫仅对 stream:false 生效)。
+      let headSent = false;
+      const held = [];
+      const sendHead = () => { if (!headSent) { headSent = true; clientRes.writeHead(up.statusCode, headers); } };
       const acc = { inTok: null, outTok: null, cacheRead: null, cacheWrite: null, cacheReported: null, usageRaw: null, served: null };
       let buf = '';
       let sbuf = '';
@@ -1120,9 +1178,9 @@ function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthro
         finish({ ...acc, status: up.statusCode, aborted: true });
       });
       up.on('data', (chunk) => {
-        clientRes.write(chunk);
+        if (!streaming) { held.push(chunk); } else { sendHead(); clientRes.write(chunk); }
         if (sbuf.length < 8 * 1024 * 1024) sbuf += chunk.toString('utf8');
-        if (reqMeta.stream) {
+        if (streaming) {
           buf += chunk.toString('utf8');
           let i;
           while ((i = buf.indexOf('\n')) >= 0) {
@@ -1137,17 +1195,43 @@ function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthro
         }
       });
       up.on('end', () => {
-        if (!reqMeta.stream && sbuf) {
-          try {
-            const d = JSON.parse(sbuf);
-            adapter.grabBodyUsage(d, acc);
-          } catch { /* 非 JSON 忽略 */ }
+        if (!streaming) {
+          // 垃圾判型(S12-A1):JSON.parse 失败且无对话载荷 = 坏体;超采样上限(8MB)判不动 → 放行防误杀
+          let malformed = false;
+          if (sbuf && sbuf.length < 8 * 1024 * 1024) {
+            try { const d = JSON.parse(sbuf); if (d != null) adapter.grabBodyUsage(d, acc); }
+            catch { malformed = !CHAT_PAYLOAD_RE.test(sbuf.slice(0, 2000)); }
+            // S12-A1(2026-11-11 夜审):2xx+错误信封且无对话载荷 = 网关伪成功(200 裹 internal_error/
+            // {"code":...}/success:false 等),与垃圾体同判:502+unknown 冷却+同轮重选,不把错误信封当成功透传。
+            // 判据三重:2xx、命中 ERR_ENVELOPE_RE、无任何对话/用量/模型载荷(防误杀带 error 字段的正常体)。
+            if (!malformed && up.statusCode >= 200 && up.statusCode < 300
+                && ERR_ENVELOPE_RE.test(sbuf.slice(0, 2000)) && !CHAT_PAYLOAD_RE.test(sbuf.slice(0, 2000))
+                && !acc.served && acc.inTok == null && acc.outTok == null) {
+              malformed = true;
+            }
+          }
+          if (malformed) {
+            const bad = { ...acc, status: 502, malformed: true, cool: 'unknown', bodyHead: 'upstream returned malformed payload', netError: false };
+            if (allowRetry) { resolve({ ...bad, retry: true }); }
+            else {
+              try { clientRes.writeHead(502, { 'content-type': 'application/json' }); clientRes.end(JSON.stringify({ error: { message: 'upstream returned malformed payload' } })); } catch { /* 客户端已断开 */ }
+              resolve({ ...bad, retry: false });
+            }
+            return;
+          }
+          // 干净:补送头部并整体回放缓冲体
+          sendHead();
+          for (const c of held) clientRes.write(c);
+          held.length = 0;
+          clientRes.end(); resolve({ ...acc, status: up.statusCode, bodyHead: sbuf.slice(0, 2000) });
+          return;
         }
         clientRes.end(); resolve({ ...acc, status: up.statusCode, bodyHead: sbuf.slice(0, 2000) });
       });
       up.on('error', () => { try { clientRes.end(); } catch {} resolve({ ...acc }); });
     });
     req.on('error', () => {
+      clearTimeout(firstByteTimer);
       if (allowRetry) { resolve({ retry: true, status: null, cool: 'transient', netError: true }); return; }
       try { clientRes.writeHead(502, { 'content-type': 'application/json' }); clientRes.end(JSON.stringify({ error: { message: 'proxy upstream error' } })); } catch {}
       resolve({});
@@ -1219,21 +1303,44 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       let loopStreak = 0; // 死循环证据(2026-11-05 A 项):块内检测,账本写入(块外)要读,故在外层声明
       let loopName = null;
       let loopRaw = 0; // 原始尾连数(阈值下也记,账本诊断用)
+      let roundErrCount = null; // 本轮 tool_result 报错数(v2 证据采集 2026-11-08):块内数,账本(块外)要读
+      let roundErrStreak = 0; // 决策时点的连败计数(账本记决策证据;非状态最终值)
+      let rRefUsed = null; // R-ref 预兜底票(v2.1):本轮被救到的档位(账本结构化留痕;影子账里另有逐条明细)
+      let lastKindLog = null; // 显式轮型(此前靠 reason 反推,v2 起直接落账)
+      let prevHuman = null; // 前轮人类 prompt 摘要≤400 字(人类轮提取;rRef/D4 咨询 context 与账本 prevHead 共用)
+      let promptHeadLog = null; // 本轮任务的人类 prompt 头(与影子/黄金集同 200 字口径,pkey join 用)
       if (adapter && Array.isArray(bodyObj.messages)) {
         const ro = mrRoutingOptions(configPath);
         // 同名取序(2026-11-05):快照采集的宿主 UI 拖动序(providerOrder[reqHost]),resolveRole 在
         // providerPriority 之后按它排同名供应商——UI 把谁排前,冷却滑动就先耗谁的额度。
         const providerOrder = Array.isArray(upstreams.providerOrder?.[reqHost]) ? upstreams.providerOrder[reqHost] : [];
         const lastKind = adapter.lastMessageKind(bodyObj.messages);
+        lastKindLog = lastKind;
+        try {
+          const head = String(adapter.lastHumanText(bodyObj.messages) || '').slice(0, 200);
+          if (head) promptHeadLog = head;
+        } catch { /* prompt 头取不到不阻塞记账 */ }
+        // 前轮人类 prompt 摘要(2026-11-09 S3/D4):人类轮算一次——rRef/D4 咨询的 context 与账本 prevHead 字段共用;
+        // 直接写外层 prevHuman(1262 行声明),勿在块内重复 let 同名遮蔽——账本在块外读同一变量(2026-11-10 审计 P0 修复)
+        if (lastKind === 'human') {
+          try {
+            const msgs = bodyObj.messages || [];
+            for (let i = msgs.length - 2; i >= 0; i--) {
+              const m = msgs[i];
+              if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) { prevHuman = String(m.content).slice(0, 400); break; }
+            }
+          } catch { /* 取不到不带上下文 */ }
+        }
         const l1 = lastKind === 'human' ? classifyPrompt(adapter.lastHumanText(bodyObj.messages)) : null;
         // 难度定档:人类轮算一次,tier 实弹决策与四档影子共用同一结果
         // 档案(mtime 缓存,默认 disabled)⇒ 人工 --enable 后这里真的改判;读不到/未启用 = 纯词法,零影响
         if (lastKind === 'human') {
           try { diffDecision = classifyDifficulty(adapter.lastHumanText(bodyObj.messages), { calibration: loadTierCalibration() }); } catch { diffDecision = null; }
           // L2 融合票(2026-11-06 进化回路接通):词法判 R1 但 kNN 投 multi 且置信过 l2Live.minConf ⇒ 救回 R2。
+          // v2(2026-11-08):词法判 R2 + kNN 高置信投 R3 ⇒ 救回 R3(向量库无 R3 类时自然投不出,fail-open)。
           // modelRouting.l2Live.{enabled,minConf} 门控(ro 每请求现读,改配置即时生效),全程 fail-open:
           // 向量表缺失/嵌入失败/任何异常 = 维持词法定档,零影响。embedFn/vectors 按会话缓存(热路径不重载)。
-          if (diffDecision && diffDecision.tier === 'R1' && ro.l2Live.enabled) {
+          if (diffDecision && (diffDecision.tier === 'R1' || diffDecision.tier === 'R2') && ro.l2Live.enabled) {
             try {
               const l2fn = sessionL2.embedFn || (sessionL2.embedFn = await l2EmbedFn({ dataDir: DATA_DIR }));
               if (l2fn) {
@@ -1247,12 +1354,119 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               }
             } catch { /* L2 融合失败 = 维持词法定档 */ }
           }
+          // R3 词法总闸(v2 2026-11-08):r3Lexical.enabled=false 时词法 R3 一律降 R2——
+          // 只改实弹决策输入,审计与账本以降档后口径为准(与实弹一致);权威语义见 tierClassify 文件头"同击制"。
+          if (diffDecision && diffDecision.tier === 'R3' && !ro.r3Lexical.enabled) {
+            diffDecision = { ...diffDecision, tier: 'R2', reason: `${diffDecision.reason};r3Lexical 关闭,词法 R3 降 R2` };
+          }
+          // R-ref 预兜底票,双臂(v2.1-v2.4 2026-11-08;v3 2026-11-09 档案制):
+          //   arm1 歧义 R1:触发窗按档案 window——'ambiguous'=词法置信≤RREF_AMB_CONF(旧窄缝),
+          //     'all-r1'=全部 R1 轮咨询(本地零成本标定窗);法官投到 R1 以上任何档都
+          //     **只按 R2 救回**(v2.4 用户裁定:一步一档封顶,R3 一跃留给 arm2 的 R2→R3 通道);
+          //     live=false 影子先行(只记不改);R4 恒不救(只认显式点名)。
+          //   arm2 R2 救回:词法定档 R2 即现查(r3Rescue 独立开关),法官投 R3 过 r3MinConf ⇒ 救回 R3 执行;
+          //     判定失败/投他档/置信不足 = 维持 R2 原档(fail-open)。
+          // 双臂共用:总闸 decisionOn(本地恒开)、断路器未开、prompt ≤ maxChars、pkey 缓存 6h(按模型身份分键)、
+          // 影子账逐条留痕(arm/rescueTier 字段区分)。v2.3:次闸 rRef.enabled 已删(总闸+两臂闸即完整开关面)。
+          // D4 快照(2026-11-09 审查修):原始词法档 + 临界 flags 必须在**臂改档之前**取——
+          // 臂1/arm2 救回会改写 diffDecision.tier,事后直读会把"救回后的档"记成词法档,污染 flags 分布对账。
+          const d4Flags = diffDecision && diffDecision.flags && typeof diffDecision.flags === 'object' ? diffDecision.flags : null;
+          const d4L1Tier = diffDecision ? diffDecision.tier : null;
+          const d4L1Conf = diffDecision ? Number(diffDecision.confidence) : null;
+          const rRefArm1 = !!(diffDecision && diffDecision.tier === 'R1'
+            && (ro.rRef.window === 'all-r1' || Number(diffDecision.confidence) <= RREF_AMB_CONF)
+            && ro.decisionOn);
+          const rRefArm2 = !!(diffDecision && diffDecision.tier === 'R2' && ro.decisionOn && ro.rRef.r3Rescue);
+          if (rRefArm1 || rRefArm2) {
+            const consultText = String(adapter.lastHumanText(bodyObj.messages) || '');
+            if (consultText.length <= ro.rRef.maxChars) {
+              // 前轮摘要已在人类轮公共处提取(prevHuman):指代类 prompt("刚才的测试…")盲判是决策模型漏判主因
+              const cKey = promptHeadLog ? promptKey(promptHeadLog) : null;
+              const cached = rRefCacheGet(cKey, ro.decisionModel);
+              let vote = cached ? { tier: cached.tier, confidence: cached.confidence, cached: true } : null;
+              let voteLatency = null;
+              if (!vote) {
+                try {
+                  const dm = await import('./decisionModel.mjs');
+                  // 断路器按该实例配置目录隔离(生产=DATA_DIR,隔离测试=注入临时目录,互不绑架)
+                  if (!dm.breakerOpen(path.dirname(configPath))) {
+                    const jr = await dm.judgeTier(consultText, { context: prevHuman, config: readJson(configPath), timeoutMs: Math.min(5000, ro.rRef.maxLatencyMs || 5000) });
+                    if (jr.answer && /^R[1-4]$/.test(String(jr.answer.type))) {
+                      vote = { tier: String(jr.answer.type), confidence: Number(jr.answer.confidence) || 0, cached: false };
+                      voteLatency = Number(jr.latencyMs) || null;
+                      if (cKey) rRefCacheSet(cKey, vote, ro.decisionModel);
+                    }
+                  }
+                } catch { /* 判定失败/超时/异常 = fail-open,维持词法定档 */ }
+              }
+              if (vote) {
+                const conf = Number(vote.confidence);
+                // 救回目标档(v2.4):臂1 恒封顶 R2——法官投到 R1 以上任何档(R2/R3/R4),一步一档只到 R2;
+                // 臂2 只在法官投 R3 且过 r3MinConf 时到 R3。两臂都不压制、都受各自置信闸。
+                const arm1Rescue = rRefArm1 && ro.rRef.live && vote.tier !== 'R1' && conf >= ro.rRef.minConf;
+                const arm2Rescue = rRefArm2 && vote.tier === 'R3' && conf >= ro.rRef.r3MinConf;
+                const rescueTier = arm2Rescue ? 'R3' : (arm1Rescue ? 'R2' : null);
+                logRRefShadow(path.dirname(usageFile || PROXY_USAGE_LOG), {
+                  ts: Date.now(), pkey: cKey, promptHead: promptHeadLog,
+                  arm: rRefArm2 ? 'r3-rescue' : 'r1-amb',
+                  l1Tier: rRefArm2 ? 'R2' : 'R1', l1Conf: Number(diffDecision.confidence),
+                  rTier: vote.tier, rConf: conf, cached: vote.cached === true, rescueTier,
+                  live: rRefArm2 ? true : !!ro.rRef.live, applied: !!rescueTier, host: reqHost,
+                  latencyMs: voteLatency, window: rRefArm2 ? null : ro.rRef.window, // v3:D3 参与度入账(延迟/触发窗)
+                });
+                if (rescueTier) {
+                  rRefUsed = rescueTier;
+                  const capped = rescueTier !== vote.tier ? `,臂1 封顶 R2(法官原票 ${vote.tier})` : '';
+                  diffDecision = {
+                    ...diffDecision, tier: rescueTier, confidence: conf,
+                    reason: `${diffDecision.reason}+rRef救回(决策票 ${vote.tier}@${conf.toFixed(2)}${capped},${rRefArm2 ? 'R2→R3' : '兜底前'})`,
+                  };
+                }
+              }
+            }
+          }
+          // D4 临界轮仲裁票(影子,2026-11-09 v3 方案 §3 D4):三类词法临界——verifyBlocked(疑问拦截 R1)/
+          // r3NearMiss(顶格词命中但独立印证不足,落 R2)/ marginalR2(单信号边际置信 R2)——咨询决策票,
+          // **只记不改档**(applied 恒 false):影子对账(rrefAudit)达标后才谈救回权。与 arm1/arm2 共用
+          // pkey+模型身份缓存 6h(同轮零重复判定);判定失败/超时 = 影子行缺失,fail-open。
+          if (d4Flags && ro.decisionOn) {
+            const consultText4 = String(adapter.lastHumanText(bodyObj.messages) || '');
+            if (consultText4.length <= ro.rRef.maxChars) {
+              const cKey4 = promptHeadLog ? promptKey(promptHeadLog) : null;
+              const cached4 = rRefCacheGet(cKey4, ro.decisionModel);
+              let vote4 = cached4 ? { tier: cached4.tier, confidence: cached4.confidence, cached: true } : null;
+              let latency4 = null;
+              if (!vote4) {
+                try {
+                  const dm4 = await import('./decisionModel.mjs');
+                  if (!dm4.breakerOpen(path.dirname(configPath))) {
+                    const jr4 = await dm4.judgeTier(consultText4, { context: prevHuman, config: readJson(configPath), timeoutMs: Math.min(5000, ro.rRef.maxLatencyMs || 5000) });
+                    if (jr4.answer && /^R[1-4]$/.test(String(jr4.answer.type))) {
+                      vote4 = { tier: String(jr4.answer.type), confidence: Number(jr4.answer.confidence) || 0, cached: false };
+                      latency4 = Number(jr4.latencyMs) || null;
+                      if (cKey4) rRefCacheSet(cKey4, vote4, ro.decisionModel);
+                    }
+                  }
+                } catch { /* D4 影子 fail-open */ }
+              }
+              if (vote4) {
+                logRRefShadow(path.dirname(usageFile || PROXY_USAGE_LOG), {
+                  ts: Date.now(), pkey: cKey4, promptHead: promptHeadLog, arm: 'd4-critical',
+                  flags: d4Flags, l1Tier: d4L1Tier, l1Conf: d4L1Conf,
+                  rTier: vote4.tier, rConf: Number(vote4.confidence), cached: vote4.cached === true,
+                  rescueTier: null, live: false, applied: false, host: reqHost,
+                  latencyMs: latency4, window: null,
+                });
+              }
+            }
+          }
         }
         // 证据升级(P2,逐级上梯):连续 2 个工具轮含报错 tool_result → 申请上梯;
         // 目标档=当前服务档+1(decideTarget 内定,封顶 R3),上梯成功后 errStreak 清零重新积累
         const phase0 = state.get(convKey) || null;
         let errStreak = 0;
         let escalate = false;
+        let eagerR3 = false; // P2 提前一拍(v2 2026-11-08):R2 难度第 1 次报错即上 R3,见下方工具轮块
         // 死循环检测(2026-11-05 A 项):同工具同参数连续调用 ≥4 次 = 模型在"空烧"(工具全成功但没用)。
         // 这类失败不产生 is_error ⇒ P2 等不到;直接当上梯证据(换强模型是最正当的破局理由)。
         const loop = typeof adapter.countRepeatCalls === 'function' ? adapter.countRepeatCalls(bodyObj.messages) : { count: 0, name: null, key: null, sameOut: 0 };
@@ -1262,9 +1476,17 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         loopRaw = loop.count || 0;
         if (lastKind === 'tool') {
           const errs = adapter.countToolErrors(bodyObj.messages);
+          roundErrCount = errs;
           errStreak = errs > 0 ? ((phase0?.errStreak || 0) + 1) : 0;
           escalate = errStreak >= 2 || loopStreak > 0;
+          // P2 提前一拍(v2 2026-11-08 重建裁定):R2 难度任务第 1 次报错即上 R3,不等第 2 连败;
+          // R1→R2 仍维持 2 连败不变。工具轮的 lastHumanText 恒可读(即本轮任务的人类 prompt)。
+          // 服务档是否真在 R2 由 decideTarget 内验(档位语义只在决策层一处)。
+          if (!escalate && ro.r3Lexical.enabled && ro.r3Lexical.eagerEscalate && errStreak >= 1 && loopStreak === 0) {
+            try { eagerR3 = classifyDifficulty(adapter.lastHumanText(bodyObj.messages))?.tier === 'R2'; } catch { eagerR3 = false; }
+          }
         }
+        roundErrStreak = errStreak;
         // 四档链(同一份快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序;chainsOverride=测试注入的档位链)
         const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority, modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes });
         retryCtx = { ro, tierChains, providerOrder }; // 留给运行时 429 同轮重选:重跑 resolveTier 档内滑/降档
@@ -1277,12 +1499,26 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           inventory: inventory0,
           health: health0, upstreams,
           phase: phase0, guard: switchGuard(configPath), contextBytes: size,
-          errStreak, escalate, loopStreak,
+          errStreak, escalate, eagerR3, loopStreak,
           tierClassify: { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes },
         });
         decision = d;
         // 门控通知(2026-11-05):拦截连击/疲劳放行落 data/usage/gate-notice.json,prompt-guard 据此注入压缩建议
         try { updateGateNotice({ dataDir: healthDataDir, decision: d, est: estimateContextTokens(size) }); } catch { /* 通知失败不影响路由 */ }
+        // P2 上梯事件影子(v2 2026-11-08):上梯发生在工具轮,而影子账本此前只记人类轮 ⇒ escalated 回流
+        // 通道事实性失效(全史 shadow escalated 仅 1 行)。上梯成功当轮补一行事件:tier 留空(工具轮无定档),
+        // prompt 用本轮任务的人类 prompt(loadShadowEvidence 按 pkey 捕获该任务的硬下界证据),tierReason 记来源。
+        if (d.escalated === true) {
+          try {
+            logTierShadow({
+              dataDir: healthDataDir, prompt: adapter.lastHumanText(bodyObj.messages),
+              tier: null, tierConfidence: 0, tierReason: `p2-escalation:${d.reason}`,
+              servedModel: d.model, decisionTier: d.tier || null, escalated: true, switched: d.switched === true,
+              servedTier: tierOfModel(d.model, { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes }) || null,
+              escalationFrom: d.escalationFrom || null, escalationTo: d.escalationTo || null, host: reqHost,
+            });
+          } catch { /* 事件影子失败不影响转发 */ }
+        }
         l1Type = l1 && l1.type ? l1.type : null;
         // 难度裸解析审计(原"四档影子",2026-11-04 复审正名):tier 已是唯一实弹,这里记的是
         // **只按难度、不受阶段粘住/切换税门控/sticky 约束**时会解析到哪个模型(wouldTier/wouldModel),
@@ -1382,7 +1618,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         usage = await forward(res, curUpstream, suffix, curBody, meta, adapter || anthropicAdapter, { allowRetry });
         // netError(上游连不上/DNS 失败)没有状态码可复算:采信 forward 标的 transient——
         // 复算得 null 会被当"客户端请求内容错"直接提交,同轮重选对网络故障形同虚设(2026-11-04 修复)。
-        cool = usage.netError ? (usage.cool || 'transient') : shouldCoolDown(usage);
+        cool = usage.malformed ? 'unknown' : (usage.netError ? (usage.cool || 'transient') : shouldCoolDown(usage));
         if (!usage.retry) break; // 已提交客户端(成功 / 末次错误透传)
         // body 复算后判为客户端请求内容错(cool=null,如 403 实为内容安全拦截):不是模型可用性问题,
         // 直接把缓冲的错误交回客户端——不换模型、不冷却(换模型也会因同一 prompt 再被拦,冷却更会误伤健康模型)。
@@ -1425,13 +1661,18 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       }
       // 同轮重选换过模型:把阶段状态回写成最终实际服务的模型(2026-11-05 修复)——
       // 否则下一轮"阶段延续"又发给刚 429 的模型,每轮白付一次重试。
-      if (attempts > 0 && curModel) {
+      // S1-F3(2026-11-10 夜审):重选**全败**时末次服务的是刚失败且已冷却的模型,旧逻辑照样回写阶段,
+      // 下轮 sticky 直发坏模型;限制为仅当末次是干净成功(与下方成功清零同口径)才回写。
+      if (attempts > 0 && curModel && !usage?.retry && !usage?.netError && Number(usage?.status) >= 200 && Number(usage?.status) < 300) {
         const ph = state.get(convKey);
         if (ph && ph.model && ph.model !== curModel) state.set(convKey, { ...ph, model: curModel, providerId: curUpstream?.providerId || ph.providerId });
       }
       // 成功清零(2026-11-04):一次干净成功(2xx)即删除该 provider/model 的健康记录,重置渐进退避计数——
       // 恢复中的模型不被历史失败放大冷却;失败透传/客户端错/netError 不清(无记录时 clearHealth 不写盘,热路径零开销)。
-      if (!usage?.retry && !usage?.netError && Number(usage?.status) >= 200 && Number(usage?.status) < 300 && curUpstream?.providerId && curModel) {
+      // S12-A1(2026-11-11 夜审):清零前复算错误族——2xx 错误信封(api_error 类)刚在末次补记写入的冷却
+      // 会被这里的 2xx 清零立即抹掉(P5 实证 cool=[]),信封体不算干净成功。
+      if (!usage?.retry && !usage?.netError && Number(usage?.status) >= 200 && Number(usage?.status) < 300 && curUpstream?.providerId && curModel
+          && !shouldCoolDown({ status: usage.status, bodyHead: usage.bodyHead || '' })) {
         clearHealth({ dataDir: healthDataDir, modelKey: `${curUpstream.providerId}/${curModel}` });
       }
       logProxyUsage({
@@ -1447,9 +1688,15 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         switched: decision.switched, reason: decision.reason,
         // 决策证据(2026-11-03 tier 唯一):l1Type=L1 分类,diffTier=难度定档,tier=实际生效档
         l1Type, tier: decision.tier || null,
+        prevHead: prevHuman, // v3 S3 数据面(2026-11-09):前轮人类 prompt 摘要≤400 字(null=无前轮/非人类轮)——代签候选带上下文的供血字段
         servedTier: (usage.served || curModel) ? tierOfModel(usage.served || curModel, { modelTiers: retryCtx?.ro?.modelTiers, lightSuffixes: retryCtx?.ro?.lightSuffixes }) || null : null, // 实弹服务模型所在档(2026-11-06 计价轴:rowCost 优先按它计价)
         suppressed: decision.suppressed, estTokens: estimateContextTokens(size),
         escalated: decision.escalated === true || state.get(convKey)?.escalated === true, routeMode,
+        // v2 证据采集(2026-11-08 重建):逐轮错误/轮型/prompt 键直接落账——离线重建区间真值不再靠 reason 反推
+        lastKind: lastKindLog, errCount: roundErrCount, errStreak: roundErrStreak,
+        rRef: rRefUsed, // R-ref 预兜底票实弹留痕(null=未触发/未救;非空=救到的档)
+        escalationFrom: decision.escalationFrom || null, escalationTo: decision.escalationTo || null,
+        promptHead: promptHeadLog, pkey: promptHeadLog ? promptKey(promptHeadLog) : null,
         // 死循环证据(2026-11-05 A 项;2026-11-06 起 loopRepeat 记原始尾连数,阈值下也记,供日后调阈值)
         loopRepeat: loopRaw, loopFired: loopStreak > 0, loopTool: loopName,
         retryAttempts: attempts, retryTrail: retryTrail.length ? retryTrail : null, // 同轮重选轨迹(失败模型→重解析出的下一个)
@@ -1496,6 +1743,28 @@ export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.co
     // L2 融合票(2026-11-07 嵌套收口):统一走 resolveL2Config 的 liveEnabled/liveMinConf
     // (新 l2.live 优先,旧顶层 l2Live 回落);minConf 缺省 0.8 保守档。
     l2Live: { enabled: l2c.liveEnabled, minConf: l2c.liveMinConf },
+    // 决策模型身份(2026-11-09):R-ref 缓存 key 的一部分——切换 tev1↔strands 后旧票不串味。
+    // 模型名只认 config.mjs(models 段),与 judgeLocal 的后端分派同源。
+    decisionModel: (() => { try { const c = loadConfig(); return c.modelIn === 'local' ? String(c.models?.localDecision || 'local') : String(c.models?.decision || 'ollama'); } catch { return ''; } })(),
+    // R3 词法通道总闸(v2 重建 2026-11-08):enabled 缺省开(直接实弹,用户裁定)、eagerEscalate=P2 提前一拍缺省开。
+    // fail-open:配置缺段按默认生效;kill-switch = 显式 enabled:false 或 eagerEscalate:false。语义见 tierClassify 文件头。
+    r3Lexical: (() => { const r = mr.r3Lexical && typeof mr.r3Lexical === 'object' ? mr.r3Lexical : {}; return { enabled: r.enabled !== false, eagerEscalate: r.eagerEscalate !== false }; })(),
+    // 决策模型 R-ref 预兜底票(v2.1→v2.6 2026-11-08;v4 2026-11-09 远程链删,恒本地档案制):
+    // decisionOn 恒 true(本地判定恒启用,断路器另有挡闸);rRef 参数走模型判定档案——
+    // 默认表 tev1 0.4/all-r1、strands 0.8/all-r1,data JSON profiles 可覆盖,未建档回退 FALLBACK(旧硬编码,零漂移)。
+    decisionOn: true,
+    rRef: (() => {
+      const prof = resolveDecisionProfile(readJson(configPath));
+      return {
+        live: prof.arm1.live !== false,
+        minConf: Number.isFinite(Number(prof.arm1.minConf)) ? Number(prof.arm1.minConf) : 0.75,
+        maxChars: Number.isFinite(Number(prof.arm1.maxChars)) ? Math.max(200, Math.floor(Number(prof.arm1.maxChars))) : 1200,
+        maxLatencyMs: Number.isFinite(Number(prof.arm1.maxLatencyMs)) ? Math.max(1000, Math.floor(Number(prof.arm1.maxLatencyMs))) : 5000, // S9-F1: 档案可配的判定延迟预算,judgeTier 超时上限
+        r3Rescue: prof.arm2.rescue !== false,
+        r3MinConf: Number.isFinite(Number(prof.arm2.r3MinConf)) ? Number(prof.arm2.r3MinConf) : 0.85,
+        window: prof.arm1.window === 'all-r1' ? 'all-r1' : 'ambiguous',
+      };
+    })(),
   };
 }
 

@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR, HF_CACHE_DIR, loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
+import { DATA_DIR, HF_CACHE_DIR, loadConfig, OLLAMA_KEEP_ALIVE, decisionLocalWanted } from './config.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
 import { pidAlive, spawnLogged } from './proc.mjs';
 
@@ -33,7 +33,10 @@ function readStateFile() {
 
 function modelsMatch(state) {
   const cfg = loadConfig().models;
-  return state?.embedding === cfg.localEmbedding && state?.reranker === cfg.localReranker;
+  // decision 也参与比对(2026-11-08):旧版本状态文件缺该键即视为不匹配 → 换新常驻加载 /decision;
+  // decisionLocalWanted=false(开关关/显式远程)时 wanted=null,写到状态文件也是 null,同口径比对
+  return state?.embedding === cfg.localEmbedding && state?.reranker === cfg.localReranker
+    && state?.decision === (decisionLocalWanted() ? cfg.localDecision : null);
 }
 
 async function readBody(req, limit = 32 * 1024 * 1024) {
@@ -65,6 +68,50 @@ async function loadEmbedder(modelId) {
     env.remoteHost = 'https://hf-mirror.com';
     return pipeline('feature-extraction', modelId, { dtype: 'q8' });
   }
+}
+
+/** local 决策模型(2026-11-09 切换定档):Strands-Decider-2B ONNX 指针头(q4f16 默认档)。
+ *  分词与 offsets 走官方 tokenizers Rust binding(与 Python 官方栈同一 crate,逐 token 一致,
+ *  见 test/strands-align.test.mjs 金标准对照);前向走 onnxruntime-node 直跑图
+ *  (input_ids+attention_mask+answer_pos+option_pos → logits)。
+ *  modelSpec = 'strands:<hf-cache 目录名>[:档位]'(档位缺省 q4f16,可选 q8);旧 Decision-2.0-Eos 已删(零兼容)。
+ *  档位对照(同批 60 条):q4f16 73.3%/1.77s/1.04GB vs q8 70.0%/3.76s/1.72GB——q4f16 全面胜出。 */
+export async function loadLocalDecision(modelSpec) {
+  const m = /^strands:([^:]+)(?::(q4f16|q8|quantized))?$/.exec(String(modelSpec || ''));
+  if (!m) throw new Error(`localDecision 暂只支持 strands:<目录>[:档位](收到 ${modelSpec})`);
+  const dir = path.join(HF_CACHE_DIR, m[1]);
+  const quant = m[2] === 'q8' ? 'quantized' : (m[2] || 'q4f16');
+  const onnxPath = path.join(dir, quant === 'quantized' ? 'model_quantized.onnx' : `model_${quant}.onnx`);
+  if (!fs.existsSync(onnxPath)) throw new Error(`strands 权重缺失: ${onnxPath}(应位于 code-index/hf-cache/${m[1]}/)`);
+  const { loadStrandsTokenizer, STRANDS_CHOICE_TEMPERATURE } = await import('./strandsAlign.mjs');
+  const ort = (await import('onnxruntime-node')).default;
+  const t0 = Date.now();
+  const session = await ort.InferenceSession.create(onnxPath);
+  const tokenizer = loadStrandsTokenizer(dir);
+  console.error(`[info] strands ONNX ${quant} 会话就绪 ${((Date.now() - t0) / 1000).toFixed(1)}s(${m[1]},input=${session.inputNames.join(',')})`);
+  return { tokenizer, session, ort, temperature: STRANDS_CHOICE_TEMPERATURE, backend: `strands-onnx-${quant}` };
+}
+
+/** Strands 指针头前向打分:返回 {keys,scores,probabilities}(logits 先除 choice 温度再 softmax,和为 1)。 */
+export async function decisionScorePairs(decision, { context, question, options }) {
+  const { renderStrandsChoice } = await import('./strandsAlign.mjs');
+  const rq = renderStrandsChoice({ state: context, instructions: question, options });
+  const { ids, optionPos, answerPos } = await decision.tokenizer.encodePrompt(rq, 4096);
+  const L = ids.length;
+  const K = optionPos.length;
+  const feeds = {
+    input_ids: new decision.ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, L]),
+    attention_mask: new decision.ort.Tensor('int64', BigInt64Array.from(new Array(L).fill(1), BigInt), [1, L]),
+    answer_pos: new decision.ort.Tensor('int64', BigInt64Array.from([answerPos], BigInt), [1]),
+    option_pos: new decision.ort.Tensor('int64', BigInt64Array.from(optionPos, BigInt), [1, K]),
+  };
+  const out = await decision.session.run(feeds);
+  const t = out[decision.session.outputNames[0]];
+  const raw = Array.from(t.data, Number).slice(0, K).map((v) => v / decision.temperature);
+  const mx = Math.max(...raw);
+  const exps = raw.map((v) => Math.exp(v - mx));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  return { keys: rq.keys, scores: raw, probabilities: exps.map((v) => v / sum) };
 }
 
 async function fetchHealth(state, ms) {
@@ -131,14 +178,25 @@ function startDetached() {
   return spawnLogged(path.join(here, 'localResident.mjs'), LOG_PATH, here).pid;
 }
 
-/** 保证与当前 config 模型一致的常驻进程在跑。返回 /health;超时或失败为 null。 */
-export async function ensureLocalResident(onInfo = () => {}) {
+/** 保证与当前 config 模型一致的常驻进程在跑。返回 /health;超时或失败为 null。
+ *  retryDecision(2026-11-08,预热路径专用):常驻匹配但决策模型未就绪时,停旧拉新重试一次
+ *  (决策模型只在常驻启动时加载,不重启就永远弃权);嵌入/精排正常时仅 warm 传 true,其余调用方默认不打断。 */
+export async function ensureLocalResident(onInfo = () => {}, { retryDecision = false } = {}) {
   const state = readStateFile();
   if (state && pidAlive(state.pid) && modelsMatch(state)) {
     const health = await waitReady(180000);
-    if (health?.ready) return health;
-    onInfo('[warn] local 常驻进程无响应,将重新拉起');
-    await stopLocalResident();
+    if (health?.ready) {
+      // decisionLocalWanted=false(开关关/显式远程)时 decisionOk 恒 false 属预期,不算需要重拉
+      if (retryDecision && decisionLocalWanted() && health.decisionOk !== true) {
+        onInfo('[info] local 常驻决策模型未就绪,将重启常驻重拉');
+        await stopLocalResident();
+      } else {
+        return health;
+      }
+    } else {
+      onInfo('[warn] local 常驻进程无响应,将重新拉起');
+      await stopLocalResident();
+    }
   } else if (state && pidAlive(state.pid)) {
     onInfo('[info] local 常驻进程的模型与配置不一致,将重新拉起');
     await stopLocalResident();
@@ -175,8 +233,10 @@ async function postJson(pathname, body, ms = 600000) {
   } catch { return null; }
 }
 
-/** 常驻进程已加载且模型与配置一致时返回 /health,否则 null。 */
-export async function residentHealth(ms = 800) {
+/** 常驻进程已加载且模型与配置一致时返回 /health,否则 null。
+ *  ⚠️ 预算别给太小(2026-11-09 实测):undici 首次建连要 ~600ms,800ms 预算一冷就超时
+ *  → 误判"常驻没就绪" → 自愈去拉起第二个常驻(实测双常驻 4.8GB 的起因)。 */
+export async function residentHealth(ms = 3000) {
   const state = readStateFile();
   if (!state?.port || !pidAlive(state.pid) || !modelsMatch(state)) return null;
   try {
@@ -201,14 +261,25 @@ export async function residentScorePairs(pairs) {
   return json.scores;
 }
 
+/** 常驻本地决策模型可用时返回最优/概率,否则 null(调用方弃权/跳闸,绝不拖回本进程)。 */
+export async function residentDecide({ context, question, options }, ms = 120000) {
+  const json = await postJson('/decision', { context, question, options }, ms);
+  if (!json?.ok || !Array.isArray(json?.probabilities) || !json.probabilities.length) return null;
+  return { keys: json.keys, scores: json.scores, probabilities: json.probabilities };
+}
+
 if (directRun) {
   const cfg = loadConfig();
   const embeddingId = cfg.models.localEmbedding;
   const rerankerId = cfg.models.localReranker;
+  const decisionWanted = decisionLocalWanted();
+  const decisionId = decisionWanted ? cfg.models.localDecision : null;
   let pipe = null;
   let reranker = null;
+  let decision = null;
   let embedOk = false;
   let rerankOk = false;
+  let decisionOk = false;
   let ready = false;
   let idleTimer = null;
 
@@ -222,7 +293,7 @@ if (directRun) {
       touchIdle();
       const url = req.url || '/';
       if (req.method === 'GET' && url === '/health') {
-        send(res, 200, { ready, embedOk, rerankOk, embedding: embeddingId, reranker: rerankerId });
+        send(res, 200, { ready, embedOk, rerankOk, decisionOk, embedding: embeddingId, reranker: rerankerId, decision: decisionId });
         return;
       }
       if (req.method === 'POST' && url === '/shutdown') {
@@ -257,6 +328,17 @@ if (directRun) {
         send(res, 200, { scores });
         return;
       }
+      if (req.method === 'POST' && url === '/decision') {
+        if (!decision) { send(res, 503, { error: '本地决策模型未就绪' }); return; }
+        const body = await readBody(req);
+        const options = Array.isArray(body.options) ? body.options.slice(0, 16) : null;
+        const question = String(body.question || '');
+        const context = String(body.context || '');
+        if (!question || !options || options.length < 2) { send(res, 400, { error: '需 question 与 2..16 个 options;一题一判' }); return; }
+        const out = await decisionScorePairs(decision, { context, question, options });
+        send(res, 200, { ok: true, ...out });
+        return;
+      }
       send(res, 404, { error: '未知路径' });
     } catch (e) {
       if (!res.headersSent) send(res, 500, { error: e.message });
@@ -266,7 +348,7 @@ if (directRun) {
   server.listen(0, '127.0.0.1', async () => {
     const port = server.address().port;
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(STATE_PATH, JSON.stringify({ pid: process.pid, port, embedding: embeddingId, reranker: rerankerId }));
+    fs.writeFileSync(STATE_PATH, JSON.stringify({ pid: process.pid, port, embedding: embeddingId, reranker: rerankerId, decision: decisionId }));
     console.error(`[info] local 常驻进程监听 127.0.0.1:${port}`);
     try {
       pipe = await loadEmbedder(embeddingId);
@@ -283,6 +365,23 @@ if (directRun) {
       console.error(`[ok] ${rerankerId} 已加载`);
     } catch (e) {
       console.error(`[fail] local 精排模型拉起失败(${e.message})`);
+    }
+    if (decisionId) {
+      try {
+        decision = await loadLocalDecision(decisionId);
+        const probe = await decisionScorePairs(decision, { context: '健康探活', question: '这条探活文本属于哪类任务?', options: [{ key: 'a', description: '甲类' }, { key: 'b', description: '乙类' }] });
+        if (!probe || probe.probabilities.length !== 2) throw new Error('打分输出形状异常');
+        decisionOk = true;
+        console.error(`[ok] ${decisionId} 已加载(Decision2 选项打分判定)`);
+      } catch (e) {
+        // 2026-11-12 ④:失败行补 e.stack 首帧——20261110 首装窗口期(权重/tokenizer 资产未齐)
+        // 出现过无法定位的 undefined.length 崩溃,当时日志只有 message 无位置;资产齐后未再复现。
+        // 补位置后若再复发可直接定位(探活/加载/分词任一层)。
+        const at = e.stack ? String(e.stack).split('\n')[1]?.trim() || '' : '';
+        console.error(`[fail] local 决策模型拉起失败(${e.message}${at ? ';at ' + at : ''}),决策票将弃权(fail-open)`);
+      }
+    } else {
+      console.error('[info] 决策模型走显式远程(providers 已配/开关关),常驻不加载本地决策模型');
     }
     if (!embedOk && !rerankOk) {
       console.error('[fail] 嵌入和精排都没拉起,常驻进程退出');

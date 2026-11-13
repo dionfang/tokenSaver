@@ -11,10 +11,9 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { DATA_DIR } from './config.mjs'; // 走统一目录布局(不硬编码 here/../data,npm packed 布局下不指错)
+import { takeJsonLock, releaseJsonLock } from './proc.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(here, '..', 'data');
 const EVENTS = path.join(DATA_DIR, 'read-guard', 'events.jsonl');
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'tiff', 'tif', 'heic', 'heif']);
 const isImage = (f) => IMAGE_EXTS.has(path.extname(String(f || '')).slice(1).toLowerCase());
@@ -31,5 +30,7 @@ console.log(`发现图片类事件 ${victims.length} 条,虚计 tokens 合计 ${
 for (const r of victims) console.log(`  [${r.kind}] ${r.file} bytes=${r.bytes} (~${tokensOf(r).toLocaleString()} tok) ${String(r.session).slice(0, 24)}`);
 if (process.argv.includes('--dry')) { console.log('--dry:未写入'); process.exit(0); }
 const shadow = victims.map((r) => JSON.stringify({ at: r.at, session: r.session, kind: r.kind, file: r.file, bytes: r.bytes, void: true, repairedAt: Date.now(), reason: 'image-visual-token-rebase(图片按视觉 token 口径,不进文本节约账)' }));
-fs.appendFileSync(EVENTS, shadow.join('\n') + '\n');
+const lockPath = EVENTS + '.lock';
+if (!takeJsonLock(lockPath)) { console.log('事件账正被其他进程写入,请稍后重跑'); process.exit(0); }
+try { fs.appendFileSync(EVENTS, shadow.join('\n') + '\n'); } finally { releaseJsonLock(lockPath); }
 console.log(`已追加 ${shadow.length} 条 void 影子行 ⇒ 下次重放(computeAccumulation)自动跳过并退回已入账金额`);

@@ -1,11 +1,12 @@
 /**
  * 自动代签(2026-11-02,用户要求:彻底去掉人工签字环节)。
  *
- * 做法:**三投票 + 一加权**(2026-11-03 用户定档,L3 层已取消——语义兜底由四档分档承担):
+ * 做法:**四票合议**(2026-11-03 三投票+一加权定档;2026-11-09 v3 口径正式化——决策票为常驻合议方,
+ *   起投/2 票权重门槛按模型判定档案标定;L3 层已取消——语义兜底由四档分档承担):
  *   ① L1 规则(classify.mjs)      —— 词法信号,1 票
  *   ② L2 向量 kNN(modelRoute.mjs) —— 语义近邻,1 票
  *   ③ 行为形态(importRoutingLog)  —— 该轮实际写了几个文件/调了几次工具(结果侧证据),1 票
- *   加权 = 决策模型(decisionModel.mjs)—— 开关生效且可达时按置信加权计票,可影响代签结果;
+ *   ④ 决策模型(decisionModel.mjs)—— 常驻合议方,按档案门槛加权计票,可影响代签结果;
  *          断网/跳闸自动弃权,三票照常。
  * 投给黄金集(label=该轮真实动作类型)——**行为票与词法/语义互不自我确认**,是打破闭环的关键。
  *
@@ -23,6 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from './config.mjs';
 import { promptKey } from './buildExemplars.mjs';
+import { normalizeType } from './classify.mjs';
 
 /** 续写类指令:不可独立分类,排除。 */
 export const CONTINUATION_RE = /^\s*(继续|接着|然后|下一步|那就|好的|go on|continue|next)/i;
@@ -48,8 +50,8 @@ export function signable(prompt) {
  * 连带 scoreGoldenTier 的 R2 门禁(acc 0.362)不过。拆开后各轴各评各的,天花板才可能翻。
  * 两轴都是机器合议的**弱真值**,不是外部人工真值——报告里必须这样标注,不得冒充准确率。
  */
-export const SEMANTIC_AXIS = ['multi', 'routine', 'light'];
-export const INTENSITY_AXIS = ['heavy', 'normal', 'light'];
+// 双轴值域常量已物理下沉到 buildExemplars(2026-11-10 审计修复:modelRoute 取常量不必加载本模块全图);此处重导出兼容旧调用方
+export { SEMANTIC_AXIS, INTENSITY_AXIS } from './buildExemplars.mjs';
 
 /** 行为强度标签(three-class 行为票)→ 双轴的强度轴取值。行为票只认 heavy(写≥3/调用≥15)与 light(零工具),中间=normal。 */
 export function toIntensity(type) {
@@ -100,11 +102,12 @@ export function voteLabel(voters = {}) {
     let w = Number.isFinite(Number(v.weight)) && Number(v.weight) > 0 ? Number(v.weight) : 1;
     // 决策票加权只许"救回"不许压制(2026-11-06):行为票是四票里唯一的结果侧证据;决策票与行为票
     // 相左时加权降回 1 票,回到同等话语权交其余票仲裁——防两个同源文本票(决策+L1)联合压掉行为证据。
-    if (name === 'decision' && w > 1 && voters.behavior && voters.behavior.type && t !== String(voters.behavior.type)) w = 1;
+    if (name === 'decision' && w > 1 && voters.behavior && voters.behavior.type && normalizeType(t) !== normalizeType(String(voters.behavior.type))) w = 1; // 归一后比较:行为票旧 T1-T8 值折叠为三类再比,防跨值域恒不相等误降权(2026-11-10 审计修复)
     tally[t] = (tally[t] || 0) + w;
     total += w;
     sources.add(name);
-    detail[t] = (detail[t] || []).concat(name);
+    // 血缘(2026-11-09):决策票在 labelRule 里带模型身份(decision@<model>);存量旧票无 model 照旧输出 decision。
+    detail[t] = (detail[t] || []).concat(name === 'decision' && v.model ? `decision@${v.model}` : name);
   }
   const entries = Object.entries(tally).sort((a, b) => b[1] - a[1]);
   if (!entries.length) return { type: null, votes: 0, sources: 0, agreement: 0, voters: detail, contested: true };

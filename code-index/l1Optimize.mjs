@@ -23,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 import { classifyRules, L1_LEXICON, META_MARKERS, stripCitations, hitsOf, normalizeType } from './classify.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -51,7 +52,7 @@ function readJsonl(p) {
   try { return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; }
 }
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
-function writeJson(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(obj, null, 1) + '\n'); }
+function writeJson(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); atomicWriteFileSync(p, JSON.stringify(obj, null, 1) + '\n'); }
 
 /** 稳定折划分:同一条目跨迭代恒定在同折(趋势可比),与 tierOptimize.foldOf 同算法。 */
 export function foldOf(key, k = DEFAULTS.folds) {
@@ -325,7 +326,8 @@ function runIterate({ dataDir, opts }) {
   }
   const mined = mineCandidates({ dataDir });
   const text = reportText({ rows, truth: opts.truth, cv, verdict, profile, mined });
-  if (!opts.dry) { fs.mkdirSync(path.dirname(f(dataDir, 'report')), { recursive: true }); fs.writeFileSync(f(dataDir, 'report'), text); }
+  // 原子写(2026-11-10 二次审计 P1-3):行内 // 注释会吞掉同行闭括号,注释上移(自踩坑修正)
+  if (!opts.dry) { fs.mkdirSync(path.dirname(f(dataDir, 'report')), { recursive: true }); atomicWriteFileSync(f(dataDir, 'report'), text); }
   console.log(text);
   return { ok: verdict.ok, rows: rows.length };
 }

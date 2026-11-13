@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "prepack": "node ../sync-npm.mjs",
-    "test": "node ../test/config.test.mjs && node ../test/build.test.mjs && node ../test/init.test.mjs && node ../test/uninit.test.mjs && node ../test/ollamaGuard.test.mjs && node ../test/read-guard.test.mjs && node ../test/read-nudge.test.mjs && node ../test/prompt-guard.test.mjs && node ../test/prefetch.test.mjs && node ../test/gen-questions.test.mjs && node ../test/modelStatus.test.mjs && node ../test/usageReport.test.mjs && node ../test/ab-selftest.test.mjs && node ../test/input-ab.test.mjs && node ../test/deploySync.test.mjs"
+    "test": "node ../test/config.test.mjs && node ../test/build.test.mjs && node ../test/init.test.mjs && node ../test/uninit.test.mjs && node ../test/hooks/ollamaGuard.test.mjs && node ../test/hooks/cleanup.test.mjs && node ../test/hooks/read-guard.test.mjs && node ../test/hooks/read-nudge.test.mjs && node ../test/hooks/prompt-guard.test.mjs && node ../test/hooks/prefetch.test.mjs && node ../test/gen-questions.test.mjs && node ../test/modelStatus.test.mjs && node ../test/usageReport.test.mjs && node ../test/hooks/ab-selftest.test.mjs && node ../test/hooks/input-ab.test.mjs && node ../test/deploySync.test.mjs"
   },
   "repository": {
     "type": "git",
@@ -28,7 +28,9 @@
   "license": "MIT",
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
-    "tokenizer-core": "^0.1.1"
+    "onnxruntime-node": "^1.30.0",
+    "tokenizer-core": "^0.1.1",
+    "tokenizers": "^0.23.2"
   },
   "engines": {
     "node": ">=18"

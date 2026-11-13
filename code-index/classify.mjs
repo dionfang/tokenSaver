@@ -361,12 +361,18 @@ export function routingContextLine(c, diff, { tierLive = false } = {}) {
 
 /** 影子分类(model-routing.md #9 Step③):L1 uncertain 时派发 modelRoute.mjs 影子子进程
  *  跑级联,结果只写 routing-shadow.jsonl(不影响注入,零延迟)。级联为 L1→L2(L3 远端兜底已取消):
- *  L2 要 modelRouting.l2Shadow=true 才通电(影子子进程加载嵌入模型会与主会话争资源)。
+ *  L2 要 modelRouting.l2.shadow=true(旧顶层 l2Shadow 兼容)才通电(影子子进程加载嵌入模型会与主会话争资源)。
  *  dataDir 与向量判定同源:测试注入临时目录时无向量文件,自然不派发。 */
 export function spawnShadow(prompt, { dataDir = DATA_DIR } = {}) {
   try {
     if (String(prompt || '').trim().length < 6) return false; // 空/超短 prompt 必弃权,不白起子进程(实测影子日志里有 promptHead 为空的行)
-    if (!fs.existsSync(path.join(dataDir, 'routing', 'exemplars-vectors.json'))) return false;
+    // 分层向量库(2026-11-10):任一 exemplars-vectors*.json(base/local/legacy,含模型 slug 变体)存在即派发
+    let hasVec = false;
+    try {
+      hasVec = fs.readdirSync(path.join(dataDir, 'routing'))
+        .some((f) => /^exemplars-vectors.*\.json$/.test(f));
+    } catch { /* 目录不存在=无向量 */ }
+    if (!hasVec) return false;
     const cli = path.join(path.dirname(self), 'modelRoute.mjs');
     const child = spawn(process.execPath, [cli, '--shadow-async', '--prompt', Buffer.from(String(prompt || ''), 'utf8').toString('base64')], { detached: true, stdio: 'ignore', windowsHide: true });
     child.unref();

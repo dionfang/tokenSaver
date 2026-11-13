@@ -21,6 +21,7 @@ import { createRequire } from 'node:module';
 import { DATA_DIR } from './config.mjs';
 import { WRITE_TOOLS, DISPATCH_TOOLS, READ_TOOLS } from './calibrateSignals.mjs';
 import { promptKey } from './buildExemplars.mjs';
+import { labelFromCounts } from './tierTruth.mjs';
 
 const require = createRequire(import.meta.url);
 const HOME = process.env.USERPROFILE || require('node:os').homedir();
@@ -35,15 +36,11 @@ export function isProbeRow(row) {
   return PROBE_RE.test(String(row && row.promptHead) || '');
 }
 
-/** 行为形态 → 弱标签(2026-11-06 三档定稿)。只标行为上确定的:写≥3 或调用≥15=multi;写1-2=routine;零工具=light;其余不猜。 */
+/** 行为形态 → 弱标签。委托 tierTruth.labelFromCounts(2026-11-10 二次审计 P1-10.4:
+ *  与 profileCalibrate 同域同口径,单一真源防漂移;heavy 门槛 w≥3||c≥15 与 labelTurn 的
+ *  prompt 形态域阈值 2026-11-06 已刻意合一,详见 tierTruth 头注)。 */
 export function labelFromShape({ calls = 0, writes = 0, dispatches = 0 } = {}) {
-  const c = Number(calls) || 0;
-  const w = Number(writes) || 0;
-  const d = Number(dispatches) || 0;
-  if (w === 0 && d === 0 && c === 0) return 'light';
-  if (w >= 3 || c >= 15) return 'multi';
-  if (w >= 1) return 'routine';
-  return null;
+  return labelFromCounts({ writes, dispatches, calls });
 }
 
 /** ①+②:过滤、唯一化,保序。返回 [{ts,promptHead,type}]。 */
@@ -131,7 +128,14 @@ function textOf(data) {
 export async function buildCandidates({ logFile = DEFAULT_LOG, dbPath = DEFAULT_DB, out = DEFAULT_OUT } = {}) {
   const raw = fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   const candidates = pickCandidates(raw);
-  const { rows, missed } = await alignAndLabel(candidates, { dbPath });
+  const { rows, missed, error } = await alignAndLabel(candidates, { dbPath });
+  // S5-F4(2026-11-10 夜审):db 瞬断/打不开时旧逻辑拿空 rows 无条件截断写盘,清空 routinglog-labels.jsonl;
+  // S5-F1(2026-11-11 夜审):同守卫扩到**对齐全 miss**——db 正常但候选全部对不上(窗口/前缀口径漂移、
+  // db 被清理)时 rows 为空,旧逻辑照样截断清池。两类"空 rows"都拒绝写盘,下次对齐自愈。
+  if (error || (candidates.length > 0 && rows.length === 0)) {
+    const why = error ? `db 不可用:${error}` : `对齐全 miss(${candidates.length} 候选 0 命中),疑口径漂移或 db 被清理`;
+    return { total: raw.length, candidates: candidates.length, aligned: 0, missed, labeled: 0, error: `${why};拒绝写盘防清空` };
+  }
   if (out) {
     fs.mkdirSync(path.dirname(out), { recursive: true });
     fs.writeFileSync(out, rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : ''));

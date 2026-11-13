@@ -5,12 +5,14 @@ TokenSaver 部署使用说明
 ======================================================================
 
 1. Node.js ≥ 18 与 git。
-2. 嵌入/精排模型二选一(默认 local):
-   - local(推荐,无需外部服务):模型权重缓存在 code-index/hf-cache(约 439MB,
-     复制部署需整目录带走;npm 安装缓存在 ~/.tokensaver/hf-cache),缺失时首次使用自动下载;
+2. 嵌入/精排/决策模型二选一(决策判定跟嵌入同路径;默认 local):
+   - local(推荐,无需外部服务):模型权重缓存在 code-index/hf-cache(嵌入+精排+决策
+     约 1.5GB(q4f16 决策 1.0GB+嵌入+精排;q8 权重已删,切回需重新获取——指标备档在 data/routing/profile-calibration-strands-q8.md),复制部署需整目录带走;npm 安装缓存在 ~/.tokensaver/hf-cache),
+     缺失时首次使用自动下载;
    - ollama:本机自行安装并启动 Ollama,再手工 pull(本工具不代拉、不自动启动):
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16
+       ollama pull tev1:0.8b(决策判定)
 3. 动态模型路由(可选功能)仅 ZCode 与 Qoder 两个客户端支持,且要求自定义模型
    以 Anthropic Messages 协议接入(见三、配置说明)。
 
@@ -40,7 +42,7 @@ TokenSaver 部署使用说明
   node init.mjs [--roots "路径1[,路径2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
 
   --roots     要索引的目录,逗号分隔;再次运行会合并新增目录;要删除目录,改 JSON 后重跑。
-  --model-in  嵌入模型来源:ollama 或 local(默认)。
+  --model-in  嵌入/决策判定模型来源:ollama 或 local(默认)。
   --hooks     只装指定客户端的钩子。省耗记账功能三端都装;动态模型路由只装 ZCode 与 Qoder。
 
 验证安装:node status.mjs(或 npx tokensaver status)
@@ -59,8 +61,12 @@ TokenSaver 部署使用说明
   models.embedding / models.reranker              ollama 模型名(默认 qwen3-embedding:0.6b、
                                                   sam860/qwen3-reranker:0.6b-F16)
   models.localEmbedding / models.localReranker    local 模型名
+  models.decision / models.localDecision          本地决策判定模型(默认 tev1:0.8b /
+                                                  strands:strands-decider-2B-hobson-v19:q4f16)
   ollamaBase                                      Ollama 地址(默认 http://localhost:11434)
-  gpu                                             auto / cpu / gpu
+  gpu                                             auto / cpu / gpu(注意:num_gpu 只对嵌入/精排
+                                                  生效;ollama 路径的决策判定由 Ollama 自动放置、
+                                                  local 路径为常驻 ONNX 进程,均忽略该选项)
   OLLAMA_KEEP_ALIVE / OLLAMA_NUM_CTX              Ollama 保活时长 / 上下文长度
 
 项目级字段(data/code-index.config.json):
@@ -111,7 +117,25 @@ TokenSaver 部署使用说明
                                (0.55/0.6) / live:{enabled,minConf} 线上路由救回(默认
                                关)}——shadow 关则两条支路都拿不到嵌入器;旧顶层
                                l2Shadow/l2Live/旧 l2.minSim 兼容读一个版本期
-    decisionModel              自动打标签用的判定模型(enabled/model/providers/chunkSize)
+    r3Lexical                  R3 词法通道总闸(2026-11-08 v2 重建;enabled=顶格词+
+                               独立印证同击的词法 R3,eagerEscalate=P2 提前一拍:               
+                               R2 难度任务第 1 次报错即上 R3;缺省双开,任一显式
+                               false 关对应通道;kill-switch 语义,进程每请求现读)
+    decisionModel              四票合议代签的判定模型(2026-11-09 v4 本地化收口:判定
+                               恒本地、零远程调用——ollama=models.decision
+                               (tev1:0.8b) / local=models.localDecision(Strands
+                               ONNX q4f16),跟 modelIn 同路径;旧键 enabled/model/
+                               providers/chunkSize/rRef 已废弃不读)。定档双臂与
+                               代签门槛全部走模型判定档案 profiles(默认表:
+                               tev1→arm1 0.6/all-r1、strands→0.5/ambiguous,
+                               代签均 0.4/0.85,arm2 r3MinConf 0.85;未建档模型
+                               回退 FALLBACK(0.75/ambiguous/0.6/0.9;arm1 恒影子 live=false)):臂1 按档案窗口
+                               咨询词法 R1 轮(tev1=全部 R1、strands=置信≤0.5),
+                               法官投到 R1 以上只按 R2 救回(一步一档,R3 留给臂2、
+                               R4 恒不救);臂2 词法定档 R2 时现查,法官投 R3 过
+                               r3MinConf 才救回 R3;判定失败维持原档(fail-open),
+                               影子留痕 data/usage/r-ref-shadow.jsonl;判定模型
+                               拉不起=决策票弃权)
     tierOptimize               自进化:自动学习定档参数(enabled 默认 false)
     blendNotice                auto 综合费率行注入开关(enabled 默认 true;关=只停
                                注入行,记账照常;仅路由宿主生效)
@@ -123,6 +147,31 @@ TokenSaver 部署使用说明
   tiers 段(每档 input/cacheRead/output 单价,元/M tokens;cacheWrite 可选,缺省按
   input 计;轮的档位由代理定档决定)。改价格直接编辑该 JSON,即时生效。
 
+======================================================================
+四、本地模型清理策略
+======================================================================
+
+本工具会拉起三类本地模型:嵌入、精排、决策判定(ollama 路径走 Ollama,local 路径走
+transformers.js 常驻进程)。清理有两条触发线:
+
+1) 切换模型后发起会话 → 卸掉"切换前拉起"的那几个
+   会话开始时(auto.mjs)先算一次:当前配置不再需要的驻留模型一律卸掉(ollama 走
+   keep_alive:0;local 路径则停掉装着旧模型的常驻进程,由预热按新配置重拉)。
+   认的是"本工具拉起过的"——登记表 data/.warmed-registry.json(只增不减),用户自己
+   pull 的聊天模型不碰。
+
+2) 宿主关闭后 → 全部及时清理
+   ZCode 的钩子只有七个事件、没有 SessionEnd,拿不到"宿主要走"的信号,因此会话开始
+   时会拉一个脱离父进程的看护(cleanup-watch.mjs):祖先链上的进程全死、且本会话所属的
+   宿主应用(ZCode/Cursor/Qoder)一个都不在了,就卸掉全部驻留模型并停常驻进程。
+   多开窗口时模型是共享的:还有别的会话在用就不卸,等最后一个会话结束才统一清。
+
+   看护日志:data/cleanup-watch.log;手动全清:node cleanup.mjs --all;
+   只清"切换前拉起的":node cleanup.mjs --stale;查现状:node cleanup.mjs --status。
+
+   看护按**进程表**去重(同一宿主只留一个还在值班的看护,失效的当场清退),不靠状态文件——
+   状态文件在并发写时会丢条目,丢了就会每个会话再拉一个,实测堆积过 63 个看护/2.8GB 内存。
+
 English
 
 TokenSaver deployment guide
@@ -132,14 +181,17 @@ TokenSaver deployment guide
 ======================================================================
 
 1. Node.js >= 18 and git.
-2. Embedding/reranker models, pick one (local by default):
+2. Embedding/reranker/decision models, pick one (decision judges on the same path;
+   local by default):
    - local (recommended, no external service): weights cached in code-index/hf-cache
-     (~439MB — copy the whole directory when copy-deploying; npm installs cache to
-     ~/.tokensaver/hf-cache). Missing models download automatically on first use.
+     (embedding + reranker + decision ≈1.5GB with q4f16; q8 weights removed — re-fetch if switching back, metrics archived in data/routing/profile-calibration-strands-q8.md — copy the whole directory when
+     copy-deploying; npm installs cache to ~/.tokensaver/hf-cache). Missing models
+     download automatically on first use.
    - ollama: install and start Ollama yourself, then pull by hand (this tool never
      starts Ollama or pulls for you):
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16
+       ollama pull tev1:0.8b (decision judge)
 3. Dynamic model routing (optional) supports ZCode and Qoder only, and requires
    custom models wired in via the Anthropic Messages protocol (see 3. Configuration).
 
@@ -171,7 +223,7 @@ init options:
 
   --roots     Directories to index, comma-separated; re-running merges new ones; to
               remove a directory, edit the JSON and re-run.
-  --model-in  Embedding source: ollama or local (default).
+  --model-in  Embedding / decision-judge model source: ollama or local (default).
   --hooks     Install hooks for the selected client only. The Token Ledger installs on
               all three clients; dynamic model routing on ZCode and Qoder only.
 
@@ -192,8 +244,15 @@ Two config files:
 Model deployment fields (edit config.mjs):
   models.embedding / models.reranker              ollama model names
   models.localEmbedding / models.localReranker    local model names
+  models.decision / models.localDecision          local decision-judge model names
+                                                  (default tev1:0.8b /
+                                                  strands:strands-decider-2B-hobson-v19:q4f16)
   ollamaBase                                      Ollama URL (default http://localhost:11434)
-  gpu                                             auto / cpu / gpu
+  gpu                                             auto / cpu / gpu (note: num_gpu only applies
+                                                  to embedding/reranker; on the ollama path the
+                                                  decision judge is placed automatically by
+                                                  Ollama, and the local path runs a resident
+                                                  ONNX process — both ignore this option)
   OLLAMA_KEEP_ALIVE / OLLAMA_NUM_CTX              Ollama keep-alive / context size
 
 Project-level fields (data/code-index.config.json):
@@ -253,7 +312,33 @@ existing config is never overwritten):
                                off)} — with shadow off neither branch gets the
                                embedder; legacy l2Shadow/l2Live/old l2.minSim stay
                                readable for one version window
-    decisionModel              judge model for auto-labeling (enabled/model/providers/chunkSize)
+    r3Lexical                  R3 lexical-channel master switch (v2, 2026-11-08;
+                               enabled = lexical R3 requiring a top-risk word plus
+                               independent corroboration; eagerEscalate = P2 one-
+                               strike speedup — an R2-difficulty task escalates to R3
+                               on its first error; both on by default; setting either
+                               to false closes that channel; the proxy re-reads it
+                               every request)
+    decisionModel              judge model for the four-vote consensus (localized v4,
+                               2026-11-09: judging is always local, zero remote
+                               calls — ollama = models.decision (tev1:0.8b) / local =
+                               models.localDecision (resident Strands ONNX q4f16),
+                               same path as modelIn; legacy keys enabled/model/
+                               providers/chunkSize/rRef are no longer read). Both
+                               routing arms and signing thresholds follow the
+                               per-model decision profiles (defaults: tev1 arm1
+                               0.6/all-r1, strands 0.5/ambiguous, signing 0.4/0.85,
+                               arm2 r3MinConf 0.85; unmatched models fall back to
+                               0.75/ambiguous/0.6/0.9; arm1 shadow-only live=false): arm 1 consults lexical-R1
+                               turns per the profile window (tev1 = all R1, strands
+                               = confidence ≤0.5) — any judge vote above R1 is
+                               capped at an R2 rescue (one step; R3 belongs to
+                               arm 2, R4 never); arm 2 consults on lexical R2 and
+                               rescues to R3 when the judge votes R3 above
+                               r3MinConf; judge failure keeps the original tier
+                               (fail-open), shadow-logged to
+                               data/usage/r-ref-shadow.jsonl; a judge that cannot
+                               start means decision votes abstain)
     tierOptimize               self-evolution: learns tiering parameters automatically
                                (enabled default false)
     blendNotice                switch for the auto blended-rate line (enabled default
@@ -266,6 +351,39 @@ existing config is never overwritten):
   the 2026-11-06 rebase; each high-tier turn bumps it up; the switch only stops the
   line, accounting continues). Prices are per difficulty tier (not per real model),
   from the tiers section of data/routing/model-prices.json (input/cacheRead/output per
-  tier, CNY per M tokens; cacheWrite optional, defaults to input; a turn's tier comes
+  tier, CNY per M tokens;cacheWrite optional, defaults to input; a turn's tier comes
   from the
   proxy's tiering decision). Edit the JSON to change prices — effective immediately.
+
+======================================================================
+4. Local model cleanup
+======================================================================
+
+This tool pulls up three kinds of local models: embedding, reranker, and the decision
+judge (the ollama path runs them in Ollama; the local path runs them in a transformers.js
+resident process). Cleanup has two triggers:
+
+1) Starting a session after switching models — unload what the previous models pulled up
+   At session start (auto.mjs) the tool recomputes what should stay resident and unloads
+   the rest (ollama: keep_alive:0; local path: stop the resident process that still holds
+   the old models, then warm again with the new config). Only models this tool pulled up
+   are considered — tracked in data/.warmed-registry.json (append-only); your own chat
+   models are never touched.
+
+2) After the host closes — everything is released promptly
+   ZCode's hooks expose seven events and no SessionEnd, so no callback can announce "the
+   host is going away". Instead, a detached watcher (cleanup-watch.mjs) is started with
+   the session: once every process on the ancestor chain is gone and the session's own
+   host application (ZCode/Cursor/Qoder) is no longer running, it unloads every resident
+   model and stops the resident process. With several windows open the models are
+   shared, so nothing is unloaded while another session still needs them; the last
+   session to end clears them all.
+
+   Watcher log: data/cleanup-watch.log. Manual full cleanup: node cleanup.mjs --all;
+   only the pre-switch leftovers: node cleanup.mjs --stale; current state:
+   node cleanup.mjs --status.
+
+   Watchers are deduplicated against the **process table** (one on-duty watcher per host;
+   stale ones are cleared on sight) rather than against a state file — concurrent writes can
+   drop state-file entries, and a dropped entry means one more watcher per session (63
+   watchers / 2.8 GB were observed in practice).

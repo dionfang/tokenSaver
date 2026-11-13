@@ -54,7 +54,9 @@ export async function freshStatusLine({ stateDir = path.join(DATA_DIR, 'read-gua
     if (turn && st.prevTurnId != null && turn.turnId === st.prevTurnId) return null;
     // 非 zcode(无 db)先用便宜路径取当前模型:模型没变且窗口内直接退出,不渲染、不结算
     const quick = deps.currentModel(sid) || null;
-    if (!turn && st.remoteModel === quick && now - (st.at || 0) < minIntervalMs) return null;
+    const qAge = now - (st.at || 0);
+    // 负龄(at 在未来 = 时钟回拨)不节流,放行自愈(2026-11-10 夜审 S5-F3)
+    if (!turn && st.remoteModel === quick && qAge >= 0 && qAge < minIntervalMs) return null;
     const relay = await deps.relayFor(sid);
     if (!relay) return null;
     const remote = quick || deps.currentModel(sid) || null;

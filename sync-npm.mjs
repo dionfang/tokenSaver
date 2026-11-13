@@ -47,7 +47,7 @@ write(
   `npm 安装(@dionfang/tokensaver)
 
   npm i -D @dionfang/tokensaver
-  npx tokensaver init [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local]
+  npx tokensaver init [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
   npx tokensaver status
 
 以下与 code-index 目录同源:
@@ -64,9 +64,9 @@ write(
   `#!/usr/bin/env node
 /**
  * npm bin 入口。子命令对应同目录 *.mjs,参数原样转发。
- *   npx tokensaver init [--roots ...] [--model-in ollama|local]
+ *   npx tokensaver init [--roots ...] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
  *   npx tokensaver search 关键词 --rerank --k 5
- *   npx tokensaver status | build | embed | auto | warm | details | sync
+ *   npx tokensaver status | build | embed | auto | warm | details | sync | annotationCheck
  */
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -83,6 +83,7 @@ const COMMANDS = {
   warm: 'warm.mjs',
   details: 'details.mjs',
   sync: 'deploySync.mjs',
+  annotationCheck: 'annotationCheck.mjs',
 };
 
 const argv = process.argv.slice(2);

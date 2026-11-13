@@ -44,10 +44,13 @@ export function respawnGuardPath(dataDir = DATA_DIR) { return path.join(dataDir,
 
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
 
-/** 代理 pid 文件在且进程活着 → 确定在跑(最快的判定,零网络)。 */
+/** 代理 pid 文件在且进程活着 → 确定在跑(最快的判定,零网络)。
+ *  pid+ts 双条件(2026-11-10 二次审计 P2-13):防 pid 复用把已死的旧代理误判为存活;无 ts 的旧格式按存活兼容。 */
 export function proxyPidAlive(dataDir = DATA_DIR) {
   const rec = readJson(proxyPidPath(dataDir));
-  return !!(rec && pidAlive(Number(rec.pid)));
+  if (!rec || !pidAlive(Number(rec.pid))) return false;
+  if (Number.isFinite(Number(rec.ts)) && Date.now() - Number(rec.ts) > 24 * 3600 * 1000) return false;
+  return true;
 }
 
 /** 端口探测:本地环回,连上/被拒都是毫秒级。 */

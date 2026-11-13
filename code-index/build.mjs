@@ -16,13 +16,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, DATA_DIR, gitHeadOf, findGitRoot, MODULE_DIR } from './config.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 
-/** 工具目录是否是宿主仓的直接子目录(hub 部署)。 */
+/** 工具目录是否是宿主仓的直接子目录(hub 部署)。路径不存在返回 false(判定函数不抛)。 */
 export function isHubDir(moduleDir) {
   const root = findGitRoot(moduleDir);
   if (!root) return false;
   // findGitRoot 返回 realpath;moduleDir 侧也要 realpath,否则 tmp 的 8.3 短路径(ADMINI~1)对比失败
-  const dir = fs.realpathSync.native(path.resolve(moduleDir));
+  let dir;
+  try { dir = fs.realpathSync.native(path.resolve(moduleDir)); } catch { return false; } // 不存在/不可达 → 非hub
   return path.dirname(dir) === root;
 }
 // hub:宿主代码也纳入索引(用户可能自行改造工具);复制部署时仍排除工具自身
@@ -193,7 +195,7 @@ for (const f of files) {
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.writeFileSync(path.join(DATA_DIR, 'chunks.jsonl'), chunks.map(c => JSON.stringify(c)).join('\n'), 'utf8');
+atomicWriteFileSync(path.join(DATA_DIR, 'chunks.jsonl'), chunks.map(c => JSON.stringify(c)).join('\n'), 'utf8');
 const manifest = {
   builtAt: new Date().toISOString(),
   roots: ROOTS,
@@ -213,7 +215,7 @@ for (const f of files) {
   if (lines < 200 && avgLen > 250) continue;
   manifest.files.push({ p: f.display, lines });
 }
-fs.writeFileSync(path.join(DATA_DIR, 'index.json'), JSON.stringify(manifest, null, 2), 'utf8');
+atomicWriteFileSync(path.join(DATA_DIR, 'index.json'), JSON.stringify(manifest, null, 2), 'utf8');
 
 console.log(`[ok] 文件 ${manifest.files.length} 个 / 共 ${totalLines.toLocaleString()} 行 / 切块 ${chunks.length} 个`);
 console.log(`[ok] 输出 ${path.join(DATA_DIR, 'chunks.jsonl')} (${(fs.statSync(path.join(DATA_DIR, 'chunks.jsonl')).size / 1048576).toFixed(1)}MB)`);

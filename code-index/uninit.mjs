@@ -29,6 +29,7 @@ import {
   cleanCursorWorkspaceHooks,
   cleanQoderWorkspaceHooks,
   cleanZcodeWorkspaceHooks,
+  USER_FORWARDER_FILES,
 } from './init.mjs';
 import { resolveZcodeV2Dir } from './virtualProvider.mjs';
 
@@ -54,8 +55,10 @@ function rmdirIfEmpty(dir) {
 
 // ---------- 步骤 2:用户级钩子 ----------
 
-const CURSOR_FORWARDERS = ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'agent-usage.mjs', 'output-savings.mjs'];
-const QODER_FORWARDERS = ['session-start.mjs', 'snapshot-refresh.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'agent-usage-scan.mjs', 'turn-close.mjs', 'output-savings.mjs'];
+/** 用户级转发器清理清单:自 init.mjs 的 USER_FORWARDER_FILES 单源派生(2026-11-10 纪律段第 10 条),
+ *  禁止手抄——deploySync 门禁校验「安装⊆登记、卸载≡登记」,两边漂移都会被拦。 */
+export const CURSOR_FORWARDERS = [...USER_FORWARDER_FILES.cursor.current, ...USER_FORWARDER_FILES.cursor.legacy];
+export const QODER_FORWARDERS = [...USER_FORWARDER_FILES.qoder.current, ...USER_FORWARDER_FILES.qoder.legacy];
 
 export function uninstallZcodeUserHooks({ home = os.homedir() } = {}) {
   const file = path.join(home, '.zcode', 'cli', 'config.json');
@@ -136,15 +139,19 @@ export function uninstallQoderUserHooks({ home = os.homedir() } = {}) {
 
 // ---------- 步骤 4:AGENTS.md ----------
 
-/** 剥掉纪律段:<!-- code-index --> 标记起,至下一个注入段标记或任意层级标题。 */
+/** 剥掉纪律段:<!-- code-index --> 标记锚(与 init wireAgents 同构:标题文字可变——
+ *  旧版锚定固定标题「## 代码检索纪律」,用户改过标题且未被新版 init 重写的旧部署会剥不掉残留),
+ *  至下一个注入段标记或任意层级标题。 */
 export function stripDisciplineSection(content) {
-  const sectionRe = /<!-- code-index[^>]*-->\s*## 代码检索纪律[\s\S]*?(?=\r?\n<!-- (?:ponytail|output-diet)[^>]* -->|\r?\n#{2,6} |$)/;
+  const sectionRe = /<!-- code-index[^>]*-->[^\r\n]*\r?\n[^\r\n]*[\s\S]*?(?=\r?\n<!-- (?:code-index|ponytail|output-diet)[^>]* -->|\r?\n#{2,6} |$)/;
   if (!sectionRe.test(content)) return null;
   return content.replace(sectionRe, '');
 }
 
 /** 剥掉输出纪律段:优先按 init 写入的精确模板块移除(段后用户内容保留);
- *  模板被改过无法识别时退化为从标记切到文末(与 ponytail 剥离同语义)。 */
+ *  模板被改过无法识别时,退化路径切到段后的下一个二级标题(段后用户内容保留),
+ *  仅当段后无任何二级标题才切到文末(2026-11-10 二次审计 P2-15:旧退化路径 slice(0,idx) 会
+ *  连纪律段之后的用户内容一起删掉,与 stripPonytailSection 同类问题同修)。 */
 export function stripDietSection(content) {
   const m = content.match(/<!-- output-diet[^>]* -->/);
   if (!m) return { content, changed: false };
@@ -152,13 +159,15 @@ export function stripDietSection(content) {
   let body = '';
   try {
     body = fs.readFileSync(path.join(here, 'output-diet.md'), 'utf8').trim();
-  } catch { /* 模板不在,退化为切到文末 */ }
+  } catch { /* 模板不在,走退化路径 */ }
   if (body) {
     const block = `${m[0]}\n${body}\n`;
     const bIdx = content.indexOf(block);
     if (bIdx >= 0) return { content: content.slice(0, bIdx) + content.slice(bIdx + block.length), changed: true };
   }
-  return { content: content.slice(0, idx), changed: true };
+  const nextHeading = content.indexOf('\n## ', idx + m[0].length);
+  const end = nextHeading >= 0 ? nextHeading + 1 : content.length;
+  return { content: content.slice(0, idx) + content.slice(end), changed: true };
 }
 
 /** 剥掉 ponytail 段(2026-11-03:模板文件已删,不再按精确块匹配):

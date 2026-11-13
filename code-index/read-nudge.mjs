@@ -16,6 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR, MODULE_DIR, PACKED_INSTALL } from './config.mjs';
 import { addReadInputTokens, appendReadEvent, findSearchEventRef, readReadEvents } from './modelStatus.mjs';
+import { resolveGuardExts } from './read-guard.mjs'; // S3-F1:与其共用的文本类型白名单——图片/二进制按 bytes/4 折账会记成天量虚账
 
 const HUGE_BYTES = 8 * 1024 * 1024;
 const READ_WINDOW_MS = 10 * 60 * 1000;
@@ -72,6 +73,12 @@ export function evaluateNudge({ hookEventName, toolName, toolInput, toolResponse
       || (typeof resp.content === 'string' ? Buffer.byteLength(resp.content) : 0)
       || (typeof resp.file?.content === 'string' ? Buffer.byteLength(resp.file.content) : 0); // Qoder:tool_response.file.content
     const key = path.isAbsolute(rawPath) ? rawPath : path.resolve(process.cwd(), rawPath);
+    // S3-F1(2026-11-10 夜审):readInputTokens 记账必须先过文本类型白名单——图片走宿主视觉通道(真实成本千级)
+    // 按文本 bytes/4 折算曾记出两个数量级的虚账(3MB jpg = 78.6 万 token)。白名单与 read-guard 同一份口径。
+    // S3-F1(2026-11-11 夜审):再补 NUL 嗅探——名义文本扩展名实为二进制的结果按 bytes/4 折账同样虚高
+    // (read-guard 有同款嗅探;此处只看结果头部 8KB,NUL=二进制不记账)。
+    const extsOk = resolveGuardExts().has(path.extname(key).toLowerCase().replace(/^\./, ''))
+      && !(typeof resp.stdout === 'string' && resp.stdout.slice(0, 8192).includes('\u0000'));
     const st = h.reads && typeof h.reads[key] === 'object' ? { ...h.reads[key] } : { ranges: 0, bytes: 0, lastAt: 0, nudgedAt: 0 };
     let context;
     if (ranged) {
@@ -83,7 +90,7 @@ export function evaluateNudge({ hookEventName, toolName, toolInput, toolResponse
           // 字节照常记账(内容实际进入了上下文)。
           st.lastAt = now;
           h.reads = { ...(h.reads || {}), [key]: st };
-          return { history: h, accountTokens: Math.ceil(bytes / 4) };
+          return { history: h, accountTokens: extsOk ? Math.ceil(bytes / 4) : 0 };
         }
       }
       st.ranges += 1;
@@ -108,7 +115,7 @@ export function evaluateNudge({ hookEventName, toolName, toolInput, toolResponse
       st.nudgedAt = 0;
     }
     h.reads = { ...(h.reads || {}), [key]: st };
-    return { history: h, context, accountTokens: Math.ceil(bytes / 4) };
+    return { history: h, context, accountTokens: extsOk ? Math.ceil(bytes / 4) : 0 };
   }
 
   // Bash:大输出提示

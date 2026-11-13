@@ -13,7 +13,7 @@
  * ollama 与 local 的向量分目录存放(data/vectors/ollama|local),切换时只增量更新当前目录。
  * 所选路径拉起失败则本进程退出,检索降级 bm25,不自动改换另一条路径。
  *
- * 用法: node embed.mjs [--batch 32] [--force]
+ * 用法: node embed.mjs [--batch 8] [--pace 500] [--force]
  *   Ollama 地址只认 config.mjs 的 ollamaBase,命令行不填
  *   --force  忽略新鲜度短路与向量复用,全量重嵌入
  */
@@ -22,10 +22,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, releaseReplacedOllamaModels } from './ollamaGuard.mjs';
-import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
+import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, OLLAMA_EMBED_PACE_MS, decisionLocalWanted } from './config.mjs';
 import { vectorPaths, readVectorMeta, writeVectorMeta, wantEmbedModel } from './vectorStore.mjs';
 import { ensureLocalResident, residentEmbed } from './localResident.mjs';
-import { pidAlive, LOCK_TTL_MS } from './proc.mjs';
+import { takeJsonLock, releaseJsonLock } from './proc.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
@@ -46,9 +46,11 @@ const { backend } = wantEmbedModel();
 const store = vectorPaths(backend);
 const PAIRED_PATH = store.paired;
 const EMB_PATH = store.emb;
-const BATCH_OPT = Number(getOpt('--batch', backend === 'ollama' ? 32 : 16));
-const BATCH = Number.isFinite(BATCH_OPT) ? Math.max(1, Math.floor(BATCH_OPT)) : (backend === 'ollama' ? 32 : 16);
+const BATCH_OPT = Number(getOpt('--batch', backend === 'ollama' ? 8 : 16)); // ollama 32→8(2026-11-10):大批次在显存紧张时会 >5 分钟无响应,触发 undici 300s headers 超时崩溃
+const BATCH = Number.isFinite(BATCH_OPT) ? Math.max(1, Math.floor(BATCH_OPT)) : (backend === 'ollama' ? 8 : 16);
 const FORCE = args.includes('--force');
+// 批间节流(2026-11-11 WHEA 缓解):默认 ollama 500ms(config.OLLAMA_EMBED_PACE_MS)、local 0;--pace 单次覆盖,0=关。
+const PACE_MS = Math.max(0, Number(getOpt('--pace', backend === 'ollama' ? OLLAMA_EMBED_PACE_MS : 0)) || 0);
 
 if (!fs.existsSync(CHUNKS_PATH)) {
   console.error('未找到 data/chunks.jsonl,请先运行 node build.mjs');
@@ -93,18 +95,17 @@ if (!FORCE && meta.signature === curSig && fs.existsSync(EMB_PATH) && meta.model
 }
 
 // ---------- 单实例守卫:已有嵌入进程在跑则直接退出(auto 后台分离场景防重) ----------
-// PID 重用防护:pidfile 记 {pid,ts},超过 6 小时视为陈旧(全量嵌入远用不了 6 小时)
+// S4-F1(2026-11-11 夜审):旧"读-查-直写"两步非原子,与 --build-vectors 的 wx 锁交叉互拆 → 双嵌入竞跑。
+// 统一走 takeJsonLock(wx-first + 陈旧接管,2026-11-10 修的原语;写 {pid,ts} 与 embedBusy 读形一致),持有至退出。
 {
-  let prev = { pid: NaN, ts: 0 };
-  try { prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8')); } catch { /* 无 pidfile */ }
-  const alive = pidAlive(prev.pid) && Number.isFinite(prev.ts) && Date.now() - prev.ts < LOCK_TTL_MS;
-  if (alive) {
-    console.log(`[warn] 已有嵌入进程在运行(pid ${prev.pid}),本次退出`);
+  if (!takeJsonLock(PIDFILE)) {
+    let prev = { pid: NaN, ts: 0 };
+    try { prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8')); } catch { /* 锁主读不出 */ }
+    console.log(`[warn] 已有嵌入进程在运行(pid ${Number(prev.pid) || '?'},ts ${Number(prev.ts) || '?'}),本次退出`);
     process.exit(0);
   }
+  process.on('exit', () => { releaseJsonLock(PIDFILE); });
 }
-fs.writeFileSync(PIDFILE, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-process.on('exit', () => { try { fs.unlinkSync(PIDFILE); } catch { /* 已清理 */ } });
 
 // ---------- 复用表:旧配对快照 × 旧向量,md5(块文本) → 向量 ----------
 function buildReuse() {
@@ -127,18 +128,27 @@ const OLLAMA_MODEL = loadConfig().models.embedding;
 
 async function ollamaEmbed(texts) {
   let lastErr;
-  for (let retry = 0; retry < 3; retry++) {
+  // 韧性(2026-11-10):显式 180s 请求超时(替代 undici 300s 默认,且失败可重试而非整进程崩溃);
+  // 5 次重试、指数回退——显存挤占/队列卡顿的瞬时 stall 不再打断整轮嵌入。
+  for (let retry = 0; retry < 5; retry++) {
     try {
       const resp = await fetch(`${OLLAMA_BASE}/api/embed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: OLLAMA_MODEL, input: texts, options: { num_ctx: OLLAMA_NUM_CTX, ...gpuOptions() }, keep_alive: OLLAMA_KEEP_ALIVE }),
+        signal: AbortSignal.timeout(180_000),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
       const j = await resp.json();
       if (!j.embeddings?.length) throw new Error('响应缺少 embeddings 字段');
       return j.embeddings;
-    } catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 1500 * (retry + 1))); }
+    } catch (e) {
+      lastErr = e;
+      if (retry === 4) break;
+      const wait = [5_000, 15_000, 45_000, 90_000][retry];
+      console.log(`[warn] ollama embed 失败(${String(e && e.cause && e.cause.code || e.message).slice(0, 80)}),${wait / 1000}s 后重试 ${retry + 1}/4(批次 ${texts.length} 条)`);
+      await new Promise(r => setTimeout(r, wait));
+    }
   }
   throw lastErr;
 }
@@ -150,11 +160,13 @@ async function makeEmbedder() {
       console.error(`[err] Ollama 嵌入路径不可用(${OLLAMA_BASE},不自动拉起服务,也不改换 local)。本次嵌入失败,检索降级 bm25。切换路径请运行: node init.mjs --model-in local`);
       process.exit(1);
     }
-    await releaseReplacedOllamaModels([OLLAMA_MODEL, loadConfig().models.reranker], console.log);
+    // keep 名单含决策模型:re-embed 期间不卸它(否则每次重建向量都把判定模型踢出显存,下一轮判定重载 ~1s)
+    const decModel = decisionLocalWanted() ? loadConfig().models.decision : null;
+    await releaseReplacedOllamaModels([OLLAMA_MODEL, loadConfig().models.reranker, decModel], console.log);
     await ensureModelPlacement([OLLAMA_MODEL], console.log); // 先同步驻留位置,探测请求才会按目标模式加载
     const probe = await ollamaEmbed(['dimension probe']);
     const dim = probe[0].length;
-    console.log(`[info] Ollama ${OLLAMA_MODEL} @ ${OLLAMA_BASE},dim=${dim},batch=${BATCH} | [gpu] ${resolveGpuMode().reason}`);
+    console.log(`[info] Ollama ${OLLAMA_MODEL} @ ${OLLAMA_BASE},dim=${dim},batch=${BATCH},pace=${PACE_MS}ms | [gpu] ${resolveGpuMode().reason}`);
     return {
       model: OLLAMA_MODEL, dim,
       async embed(texts) {
@@ -251,16 +263,40 @@ chunks.forEach((c, i) => {
 console.log(`[info] 增量:复用 ${hit} / 待嵌入 ${misses.length}(共 ${chunks.length})`);
 
 if (misses.length) {
-  const rows = await emb.embed(misses.map(i => chunks[i].t));
-  if (rows.length !== misses.length) { console.error(`[err] 嵌入返回 ${rows.length} 行,期望 ${misses.length}`); process.exit(1); }
-  rows.forEach((row, k) => vec.set(row, misses[k] * emb.dim));
+  // 分批 + 部分落盘(2026-11-10):每 8 批把已嵌入行写到正式路径(paired 只含已完成块)。
+  // 崩溃后 rerun 的复用表(md5(块文本)→向量)会跳过已完成块,只补剩余——不再从 0 重来。
+  // 完成后的全量写仍在下方(全量 vec + 全量 chunks 配对),部分文件只存在于中途。
+  const doneRows = []; const doneIdx = [];
+  const flushPartial = () => {
+    fs.mkdirSync(store.dir, { recursive: true });
+    const parts = doneRows.map((row) => Buffer.from(Float32Array.from(row).buffer, Float32Array.from(row).byteOffset, Float32Array.from(row).byteLength));
+    fs.writeFileSync(EMB_PATH + '.' + process.pid + '.tmp', Buffer.concat(parts));
+    fs.renameSync(EMB_PATH + '.' + process.pid + '.tmp', EMB_PATH);
+    const pairedTxt = doneIdx.map((i) => JSON.stringify(chunks[i])).join('\n') + '\n';
+    fs.writeFileSync(PAIRED_PATH + '.' + process.pid + '.tmp', pairedTxt);
+    fs.renameSync(PAIRED_PATH + '.' + process.pid + '.tmp', PAIRED_PATH);
+    console.log(`[info] 部分进度已落盘(${doneRows.length}/${misses.length},崩溃可续)`);
+  };
+  for (let b = 0; b * BATCH < misses.length; b++) {
+    const idxs = misses.slice(b * BATCH, (b + 1) * BATCH);
+    const rowsPart = await emb.embed(idxs.map(i => chunks[i].t));
+    if (rowsPart.length !== idxs.length) { console.error(`[err] 嵌入返回 ${rowsPart.length} 行,期望 ${idxs.length}`); process.exit(1); }
+    rowsPart.forEach((row, k) => { vec.set(row, idxs[k] * emb.dim); doneRows.push(row); });
+    doneIdx.push(...idxs);
+    console.log(`[progress] 嵌入 ${doneRows.length}/${misses.length}`);
+    if ((b + 1) % 8 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
+    if (PACE_MS && (b + 1) * BATCH < misses.length) await new Promise(r => setTimeout(r, PACE_MS)); // 批间喘息(WHEA 缓解)
+  }
 }
 
 fs.mkdirSync(store.dir, { recursive: true });
 // tmp + 同盘 rename:嵌入动辄几分钟,中途被 Ctrl+C 不能留下半截向量文件(下次读就是脏数据)
-fs.writeFileSync(EMB_PATH + '.tmp', Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
-fs.renameSync(EMB_PATH + '.tmp', EMB_PATH);
-fs.copyFileSync(CHUNKS_PATH, PAIRED_PATH); // 更新配对快照(与刚写入的向量逐位置对应)
+fs.writeFileSync(EMB_PATH + '.' + process.pid + '.tmp', Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+fs.renameSync(EMB_PATH + '.' + process.pid + '.tmp', EMB_PATH);
+// 配对快照用**内存中的 chunks**(2026-11-11 修竞态):旧实现重读 CHUNKS_PATH 文件,若 chunks 在
+// 嵌入期间被 build.mjs 重新生成(行数变化),EMB 行数与 PAIRED 行数错位 → 下次 buildReuse 判 null,复用全失效
+fs.writeFileSync(PAIRED_PATH + '.' + process.pid + '.tmp', chunks.map((c) => JSON.stringify(c)).join('\n') + '\n');
+fs.renameSync(PAIRED_PATH + '.' + process.pid + '.tmp', PAIRED_PATH); // 配对快照原子替换(2026-11-10 二次审计 P1-3+M2 漏列):copyFileSync 中途断电=向量与快照错位,下次重嵌被固化
 writeVectorMeta(backend, { model: emb.model, dim: emb.dim, backend, chunks: chunks.length, signature: curSig, builtAt: new Date().toISOString() });
 console.log(`[ok] 完成:复用 ${hit} + 新嵌入 ${misses.length} = ${chunks.length} × ${emb.dim} 维,耗时 ${((Date.now() - t0) / 1000).toFixed(0)}s(模型仅处理 ${misses.length} 块)`);
 if (backend === 'local') {

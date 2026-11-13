@@ -40,3 +40,5 @@ init 参数 / init options:
 动态模型路由启用:init 自动播种 `auto` 虚拟模型 → 会话选择 `auto` → 建议 `modelRouting.enabled=true`(可选)。自定义模型须以 Anthropic Messages 协议接入。
 
 完整说明见包内 [`部署使用说明.txt`](./部署使用说明.txt) / Full guide: [`部署使用说明.txt`](./部署使用说明.txt).
+
+> 本 npm 包**不含测试**:`npm test` 仅在 TokenSaver 仓库内可用(门禁链引用仓库的 `../test/`)。This package ships **without tests**; `npm test` only works inside the TokenSaver repo.

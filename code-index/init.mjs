@@ -6,9 +6,11 @@
  * --roots 纳入扫描目录(与已有 roots 合并,不覆盖)。以后改 data/code-index.config.json 的 roots,
  * 再跑一次不带参数的 node init.mjs 即可:自愈仍存在的路径、给新 git 仓挂钩子、后台按配置重建索引。
  *
- * --model-in 决定嵌入路径,写入 data/code-index.config.json 的 modelIn:
- *   local(新建配置时的默认) —— 常驻进程加载 models.localEmbedding 与 models.localReranker;常驻不在时当次进程内加载。不依赖 Ollama
- *   ollama —— 通过已运行的 Ollama 加载 models.embedding 与 models.reranker
+ * --model-in 决定嵌入路径,写入 data/code-index.config.json 的 modelIn;本地决策判定(2026-11-08 本地化)
+ * 跟随同一路径,不再依赖任何远程网关:
+ *   local(新建配置时的默认) —— 常驻进程加载 models.localEmbedding、models.localReranker 与
+ *     models.localDecision(strands:strands-decider-2B-hobson-v19,权重在 code-index/hf-cache/,纯 Node 指针头);常驻不在时嵌入当次进程内加载,决策票弃权。不依赖 Ollama
+ *   ollama —— 通过已运行的 Ollama 加载 models.embedding、models.reranker 与 models.decision(tev1:0.8b)
  * 不传 --model-in 不改已有 modelIn。参数名写错、缺少取值、取值非法,或 --roots 为空:报错退出且不改配置。
  * 两条路径拉起失败时检索都降级 bm25,运行时不改换另一条路径。
  *
@@ -239,6 +241,7 @@ function wireAgents(root) {
   const dataRel = path.relative(root, DATA_DIR).split(path.sep).join('/');
   const content = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : null;
   const eol = content && content.includes('\r\n') ? '\r\n' : '\n';
+  const nItems = disciplineItems({ rel, dataRel, packed: PACKED_INSTALL }).length; // 条数从清单推导,不再硬编码
   const block = withEol(disciplineBlock({ rel, dataRel, packed: PACKED_INSTALL }), eol);
   const snippet = eol + block;
   // 标记与标题之间允许空行(如 prettier 会插入),否则匹配失败会再追加一段
@@ -257,14 +260,14 @@ function wireAgents(root) {
     if (next === content) ok(`[${path.basename(root)}] AGENTS.md 纪律段已与当前模板一致,跳过`);
     else {
       fs.writeFileSync(agentsPath, next.endsWith('\n') ? next : next + eol);
-      ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(11 条)`);
+      ok(`[${path.basename(root)}] AGENTS.md 纪律段已按当前模板更新(${nItems} 条)`);
     }
   } else if (content) {
     fs.appendFileSync(agentsPath, snippet);
-    ok(`[${path.basename(root)}] AGENTS.md 已追加检索纪律段(11 条)`);
+    ok(`[${path.basename(root)}] AGENTS.md 已追加检索纪律段(${nItems} 条)`);
   } else {
     fs.writeFileSync(agentsPath, block);
-    ok(`[${path.basename(root)}] AGENTS.md 已写入检索纪律段(11 条)`);
+    ok(`[${path.basename(root)}] AGENTS.md 已写入检索纪律段(${nItems} 条)`);
   }
   upsertDiet(agentsPath);
 }
@@ -294,15 +297,26 @@ export function modelRoutingScaffold() {
     // L2 配置(2026-11-07 嵌套收口):shadow=嵌入器资源总闸(原顶层 l2Shadow);vote=代签投票阈值(原 l2.minSim/minConf);
     // live=线上路由救回(原顶层 l2Live)——总闸关则两条支路都拿不到嵌入器、静默零影响。旧键双读兼容一个版本期。
     l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } },
-    // 决策模型开关(2026-11-03 用户定档:三投票+一加权):默认 false——生效时按置信加权参与代签计票
-    // (可影响代签结果),断网/失败自动跳闸零网关重试(恢复=人工 --probe 探活,或下次会话开始
-    // 自动探活成功);复核 CLI 同受此开关约束。
-    // model=判定模型名(空=内置 decision-model-preview);providers=[{baseUrl,apiKey,path?}]
-    // 显式供应商与 key(path=专属端点路径,空=内置 /compatible-mode/v1/systemone),配了就只走这些;
-    // 空数组/全空模板条目(占位示例)/未配=自动收集客户端带 key 的供应商;
-    // 填了一半(baseUrl/key 缺一)=配置错误会显式报错。换判定模型/换网关只改 data/code-index.config.json 这里。
-    // chunkSize(2026-11-03 实测定档):判定分片 1..16,默认 1——16 题批量稀释置信(97% 弃权),1 题/请求最佳。
-    decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }], chunkSize: 1 },
+    // R3 词法通道总闸(2026-11-08 v2 重建裁定):enabled=词法 R3(顶格词+独立印证同击)总闸;eagerEscalate=
+    // P2 提前一拍(R2 难度任务第 1 次报错即上 R3,不等第 2 连败)。缺省双开(直接实弹用户裁定),
+    // 代码 fail-open 同价语义;任一显式 false 即关对应通道。词表本体在 tierClassify.mjs,不进优化器网格。
+    r3Lexical: { enabled: true, eagerEscalate: true },
+    // 决策模型判定(v4 2026-11-09 本地化收口,2026-11-03 三投票定档已正式化为四票合议):
+    // 判定**恒本地**(modelIn=ollama 打 models.decision tev1:0.8b / local 打常驻 models.localDecision
+    // Strands q8),零远程调用;整段旧键 model/providers/chunkSize/rRef 已废弃不读——实弹 arm1/arm2
+    // 参数与代签门槛全走模型判定档案(modelRouting.decisionModel.profiles 可覆盖,未建档回退代码默认)。
+    // 失败自动跳闸(恢复=人工 --probe 探活或下次会话启动自动探活);复核 CLI 只出报告不改量尺。
+    // model=判定模型名(仅显式远程用,空=内置 decision-model-preview);providers=[{baseUrl,apiKey,path?}]
+    // 配了真条目才走远程;空数组/全空模板条目(占位示例)/未配=本地判定(默认启用)。
+    // 判定恒 1 题一判(2026-11-08 v2.7:chunkSize 不再支持配置——16 题批量稀释置信 97% 弃权,1 题/请求最佳)。
+    decisionModel: {
+      enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }],
+      // R-ref 预兜底票(2026-11-08 v2.1→v2.6):前置到路由侧,两臂——arm1 只补"词法最瞎区"(歧义 R1,置信≤0.5
+      // 的 default 兜底前一段);arm2(R2→R3 判定救回)在词法定档 R2 时现查判定模型,法官投 R3 且过 r3MinConf ⇒
+      // 救回 R3 执行,判定失败/投他档维持 R2(fail-open)。本段参数与总闸一样只对显式远程生效:
+      // 本地判定时恒 live=true / r3Rescue=true(参数走代码默认);远程才按本配置读写。
+      rRef: { live: true, minConf: 0.75, maxChars: 1200, r3Rescue: true, r3MinConf: 0.85 },
+    },
     // auto 综合费率行开关(2026-11-06):prompt-guard 每轮注入"最近会话实际费 ÷ R3 基准费"倍率行的总开关
     // (仅路由宿主);enabled=false 只停注入,记账照常。价格表=data/routing/model-prices.json。
     blendNotice: { enabled: true },
@@ -317,7 +331,7 @@ export function modelRoutingScaffold() {
     // 品牌调用优先序(2026-11-03 用户需求):自定义品牌顺序,只决定"四档链同一档位内谁先被调",
     // **不影响档位归属**(tierOfModel/classifyDifficulty/resolveTier 级联照旧)= 不影响动态路由的调用档位。
     // 未列出的品牌排到所有已列品牌之后;改这里即可覆盖默认序。tier 模式(或四档影子)消费。
-    brandPriority: ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini'],
+    brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'],
     // 品牌三档默认表(2026-11-06 v4 用户定档;v4.1 grok/gemini 移入 mid):模型名 → 档位的品牌面。
     // normal=deepseek/glm/qwen/minimax(默认 R2),mid=kimi/grok/gemini(默认 R3),high=claude/gpt(默认 R4);未识别品牌按 normal 兜底。
     // 轻量后缀(lightSuffixes)把默认档降一档(flash 恒 R1)。pro/max 不特殊:档位语义与品牌等级一一对应。改这里即重排全链。
@@ -365,6 +379,8 @@ export function ensureModelRoutingSection(cfg) {
     if (!Array.isArray(mr.lightSuffixes)) add.lightSuffixes = scaffold.lightSuffixes;
     // l2 嵌套骨架缺失补默认关(2026-11-07 收口):旧配置有 l2Shadow/l2Live/旧 l2 任一键时不补(由 resolveL2Config 双读兼容接管,人工配置原样保留)
     if ((!mr.l2 || typeof mr.l2 !== 'object' || Array.isArray(mr.l2)) && mr.l2Shadow === undefined && mr.l2Live === undefined) add.l2 = scaffold.l2;
+    // r3Lexical 缺失补默认开骨架(2026-11-08 v2):词法 R3 同击制 kill-switch(缺省双开=代码 fail-open 同价语义),人工改过则原样保留
+    if (!mr.r3Lexical || typeof mr.r3Lexical !== 'object' || Array.isArray(mr.r3Lexical)) add.r3Lexical = scaffold.r3Lexical;
     if (Object.keys(add).length) {
       return { cfg: { ...cfg, modelRouting: { ...mr, ...add } }, seeded: false, patched: true };
     }
@@ -513,19 +529,22 @@ if (!configExisted || modelInArg) {
   if (chosenBackend === 'local') {
     const embId = DEFAULT_CONFIG.models.localEmbedding;
     const rrId = DEFAULT_CONFIG.models.localReranker;
-    const bundled = localOnnxCached(embId) && localOnnxCached(rrId);
+    const decId = DEFAULT_CONFIG.models.localDecision;
+    const bundled = localOnnxCached(embId) && localOnnxCached(rrId) && localOnnxCached(decId);
     console.error(`  [注意] 嵌入路径为 local:transformers.js 由常驻进程加载,不依赖 Ollama。常驻不在时当次进程内加载。`);
     console.error(bundled
-      ? '        本目录 hf-cache 已含两个模型权重,无需下载。'
+      ? '        本目录 hf-cache 已含嵌入/精排/决策三个模型权重,无需下载。'
       : '        hf-cache 缺权重,首次使用会下载。');
     console.error(`        嵌入 ${embId}`);
     console.error(`        精排 ${rrId}(q8)`);
+    console.error(`        决策 ${decId}(本地判定,替代远程 decision-model-preview)`);
   } else {
     console.error('  [注意] 嵌入路径为 ollama。目标电脑需已安装 Ollama 客户端,并**手工** pull(本模块不自动拉取):');
     console.error(`        ollama pull ${DEFAULT_CONFIG.models.embedding}`);
     console.error(`        ollama pull ${DEFAULT_CONFIG.models.reranker}`);
+    console.error(`        ollama pull ${DEFAULT_CONFIG.models.decision}(本地决策判定,替代远程 decision-model-preview)`);
   }
-  console.error('        该路径拉起失败时检索降级 bm25,不自动改换另一条路径。');
+  console.error('        该路径拉起失败时检索降级 bm25,不自动改换另一条路径;决策模型拉起失败则决策票弃权(fail-open)。');
 }
 
 log(`\n[2/5] 安装依赖`);
@@ -916,7 +935,7 @@ export function rewriteZcodeUserHooks({ home = os.homedir() } = {}) {
   }
   const push = (name, group) => { events[name] = [...(Array.isArray(events[name]) ? events[name] : []), group]; };
   const readNudge = path.join(here, 'read-nudge.mjs');
-  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'auto.mjs'), 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地检索模型')] });
+  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'auto.mjs'), 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地嵌入/精排/决策模型')] });
   push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'snapshot-refresh.mjs'), 10000, '上游快照保鲜(provider_config 变更时重抓)')] });
   push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(path.join(here, 'commit-refresh.mjs'), 10000, '提交后索引保鲜')] });
   push('PostToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '连续读导航+工具结果记账')] });
@@ -935,6 +954,21 @@ export function rewriteZcodeUserHooks({ home = os.homedir() } = {}) {
 // 虚拟供应商清单逻辑已抽到 virtualProvider.mjs(与 snapshot-refresh 的自动同步共用同一实现)
 import { mirroredModelUnion, virtualProviderStaleness, ensureVirtualProviderEntry } from './virtualProvider.mjs';
 export { mirroredModelUnion, virtualProviderStaleness, ensureVirtualProviderEntry };
+
+/** 用户级转发器文件名单一来源(2026-11-10 纪律段第 10 条):uninit 的清理清单与 deploySync 的
+ *  hooks 同步门禁都从这里取,禁止在 uninit 手抄。增删/改名 rewrite*UserHooks 里的转发器时,
+ *  先来这里登记再写安装——漏登记会被 deploySync 拦下(安装⊆登记、卸载≡登记)。
+ *  CURRENT=现装文件名;LEGACY=历史版本装过、卸载/清理仍要扫的文件名。 */
+export const USER_FORWARDER_FILES = {
+  cursor: {
+    current: ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'agent-usage.mjs'],
+    legacy: ['output-savings.mjs'],
+  },
+  qoder: {
+    current: ['session-start.mjs', 'snapshot-refresh.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'agent-usage-scan.mjs', 'turn-close.mjs'],
+    legacy: ['output-savings.mjs'],
+  },
+};
 
 /**
  * Cursor 用户级接线:~/.cursor/hooks.json + ~/.cursor/hooks/ 转发器(Cursor 自己的用户级初始化也用这个目录)。
@@ -1028,7 +1062,7 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   }
   const prepend = (name, group) => { hooks[name] = [group, ...(Array.isArray(hooks[name]) ? hooks[name] : [])]; };
   const fwd = f => path.join(hooksDir, f).split(path.sep).join('/');
-  prepend('SessionStart', { hooks: [qoderCmd(fwd('session-start.mjs'), 420, '索引保鲜检查+预热本地检索模型')] });
+  prepend('SessionStart', { hooks: [qoderCmd(fwd('session-start.mjs'), 420, '索引保鲜检查+预热本地嵌入/精排/决策模型')] });
   prepend('SessionStart', { hooks: [qoderCmd(fwd('agent-usage-scan.mjs'), 10, 'Qoder 日志增量记账')] });
   // 快照保鲜独立挂 Qoder 端(2026-11-05 修):此前只挂 ZCode,Qoder 里改自定义模型清单要等 ZCode 会话才同步
   prepend('SessionStart', { hooks: [qoderCmd(fwd('snapshot-refresh.mjs'), 10, '上游快照保鲜(mtime 快路径)')] });
@@ -1044,10 +1078,9 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   ok(`[user] Qoder 用户级钩子已写入 ${settingsPath}`);
 }
 
-/** AGENTS.md 检索纪律段(纯函数,供 init 与 deploySync 共用;内容即部署产物的事实来源)。
+/** AGENTS.md 检索纪律条目(纪律段的事实来源;init 与 deploySync 共用)。
  *  rel=本模块相对目标仓的路径;dataRel=data 相对路径;packed=npx 安装模式。 */
-export function disciplineBlock({ rel, dataRel, packed = false }) {
-  const MARK_V2 = '<!-- code-index:v2 -->';
+export function disciplineItems({ rel, dataRel, packed = false }) {
   const searchCmd = packed
     ? 'npx tokensaver search <中英文关键词> --k 5'
     : 'cd ' + rel + ' && node search.mjs <中英文关键词> --k 5';
@@ -1057,6 +1090,7 @@ export function disciplineBlock({ rel, dataRel, packed = false }) {
     ? 'npx tokensaver build && npx tokensaver embed'
     : 'cd ' + rel + ' && node build.mjs && node embed.mjs';
   const embedCmd = packed ? 'npx tokensaver embed' : 'node embed.mjs';
+  const annotationCmd = packed ? 'npx tokensaver annotationCheck' : 'cd ' + rel + ' && node annotationCheck.mjs';
   const pathHint = packed
     ? '命令在仓库根执行(`npx tokensaver ...`),不要 cd 进 node_modules'
     : '派单/命令里的路径必须用正斜杠+引号(`cd "' + rel + '"`):git bash 下不带引号的反斜杠路径会被转义吞掉';
@@ -1067,14 +1101,26 @@ export function disciplineBlock({ rel, dataRel, packed = false }) {
     P(2, '**无条件先走索引**:定位/阅读/修改代码前先执行至少一次 `' + searchCmd + '`(默认混合检索,**不要加 --rerank**,精排要加载 reranker 会拖慢会话)。即使已有 file:行号也先检索核对;Grep 作补充。确需精排时再手动加 `--rerank`'),
     P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 与 Bash 里 cat 整读大文件都会被钩子拦下:三端的全量 Read 都默认改写为语义最相关区间(按提问选段),选不出区间才拒绝(拒绝信息自带检索/区间读/grep 替代方案);改走检索+区间读;同一目标 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
     P(4, pathHint),
-    P(5, '**模型状态提示(整句照抄,禁止截短)**:每轮 UserPromptSubmit 会注入一句 `[code-index] 状态(本轮实时值,回复末尾原样附上):⚙ …`;轮内工具执行后可能再用同一句式注入更新的一条(此时句首已是本轮实际调用的模型,数字也已结算)。把其中 ⚙ 开头的**整句**原样附在每次回复末尾——从 ⚙ 一直到句末,包括句首的"【当前远程模型名】"段(该会话最近一轮实际服务的远程模型;查无记录时该段省略)与"今日累计节约 … tokens，总计节约 … tokens"两段,一个字都不能省;只抄前半句、截掉数字段、或沿用前几轮数字都算违规。**以最新注入的那一条为准**,会话开始时注入的那句仅作首轮兜底。该句只含:句首【当前远程模型名】、是否启动成功、嵌入模型名与精排模型名、失败时的最可能原因,或成功时今日累计/总计两个 tokens 数(总计为全历史日求和)。不要加长、不要改写、不要拼接不同轮次的片段;没有这句输出时不得虚构'),
-    P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/known-annotations.json` 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后校验 JSON 合法'),
+    P(5, '**模型状态提示(整句照抄,禁止截短)**:每轮 UserPromptSubmit 会注入一句 `[code-index] 状态(本轮实时值,回复末尾原样附上):⚙ …`;轮内工具执行后可能再用同一句式注入更新的一条(此时句首已是本轮实际调用的模型,数字也已结算)。把其中 ⚙ 开头的**整句**原样附在每次回复末尾——从 ⚙ 一直到句末,包括句首的"【当前远程模型名】"段(该会话最近一轮实际服务的远程模型;查无记录时该段省略)与"今日累计节约 … tokens，总计节约 … tokens"两段,一个字都不能省;只抄前半句、截掉数字段、或沿用前几轮数字都算违规。**以最新注入的那一条为准**,会话开始时注入的那句仅作首轮兜底。该句只含:句首【当前远程模型名】、是否启动成功、嵌入/精排/决策模型名、失败时的最可能原因,或成功时今日累计/总计两个 tokens 数(总计为全历史日求和)。不要加长、不要改写、不要拼接不同轮次的片段;没有这句输出时不得虚构'),
+    P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/known-annotations.json` 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后必跑 `' + annotationCmd + '` 体检——键必须命中索引路径(死链在 details.mjs 里永不显示,先改键名或删条),文本 ≤50 字,JSON 保持合法'),
     P(7, '**提交后保鲜**:执行 `git commit` 后,运行 `' + autoCmd + '`(HEAD 没变秒级跳过;有变更时 build 内联约 10s+嵌入转后台)——有 PostToolUse hook 的环境已自动做,重复触发零成本'),
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
     P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
-    P(10, '**部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `' + (packed ? 'npx tokensaver sync' : 'cd ' + rel + ' && node deploySync.mjs') + '` 校验一致性;不一致就重新运行 `' + (packed ? 'npx tokensaver init' : 'node init.mjs') + '` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致'),
-    P(11, '**实验数据保护**:`test/ab/result`(A/B 实验结果,2026-11-07 自 data/ab 迁入)等实验目录里是唯一的原始证据,删了不可再生(已入版本控制受 git 保护,但 `test/` 其余部分仍是本地沙盒):禁止 `git clean -x/-X`、`rm -rf test/ab` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
+    P(10, '**部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `' + (packed ? 'npx tokensaver sync' : 'cd ' + rel + ' && node deploySync.mjs') + '` 校验一致性;不一致就重新运行 `' + (packed ? 'npx tokensaver init' : 'node init.mjs') + '` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致。**增删/改名用户级 hooks 转发器时,必须同步 `init.mjs` 与 `uninit.mjs` 两处部署/清理逻辑**:先登记 `init.mjs` 的 `USER_FORWARDER_FILES` 单源清单(uninit 清理与 deploySync 门禁都从这里取),漏登记会被 deploySync 拦下(安装⊆登记、卸载≡登记,卸载残留/手抄漂移都算不过)'),
+    P(11, '**实验数据保护**:`agent_reports/ab-logs/`(A/B 实验结果,2026-11-07 自 data/ab 迁入、2026-11-11 自 test/ab/result 迁入)等实验目录里是唯一的原始证据,删了不可再生(已入版本控制受 git 保护,但 `test/` 其余部分仍是本地沙盒):禁止 `git clean -x/-X`、`rm -rf agent_reports/ab-logs` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
+    P(12, '**缺陷文档回写**:按缺陷文档(如 `agent_reports/failures.md`)修完 bug 后,必须回写该文档——逐条标注已修/未修与修复位置,并把该文档标记为「已处理」;同一份文档不得再作为待修清单二次下发,重复下发时先核对文档内的已修标记,只处理仍未修的条目'),
+    P(13, '**修复复盘自更新**:按缺陷文档修完 bug 后,除回写缺陷文档(第 12 条)与归档修复日志(第 14 条)外,还须复盘本轮踩到的问题(缺陷可能已在工作区修过/断言空跑/守卫没进门禁链/文档行号漂移/范围外的坑等),把可互鉴的教训写成「触发条件→下次先做什么」追加进本仓 `bugfix-sop.md` 的「注意事项」(定位顺序:仓根目录,无则 `tools/`;只增不删,失效条目标【已废】),并在同文件「复盘流水」追加本轮小结——小结必须写「本轮用上了哪几条既有 N」,至少一条真实复用。开工前先读该文件,避免重复犯同样的错;两处均无该文件时,首次修复时按「作业规程 / 注意事项 / 复盘流水」三段骨架创建(铺在仓根目录)。`bugfix-sop.md` 是可演进的作业细则,本纪律段是它的索引与强制入口'),
+    P(14, '**修复日志归档**:每次 bug 修复**轮次**收尾时,在本仓 `agent_reports/fix-logs/`(无则创建)落一份当轮修复日志,文件名 `fix-<YYYYMMDD>-<主题>.md`,内容至少五段:①输入文档与条目数 ②已修清单(file:行 + 验证方式) ③留待清单与理由 ④门禁/回归结果 ⑤关联指针(台账 id、缺陷文档回执位置、`bugfix-sop.md` 复盘条目)。复盘流水的当轮条目回链该日志;日志属本地资产(`agent_reports/` 已 ignore),不 commit。跨会话追溯路径:缺陷文档回执(第 12 条)→ 修复日志(本条)→ SOP 复盘(第 13 条)三层互链'),
+    P(15, '**测试脚本组织**:test/ 按被测域分目录——`routing/`(模型路由与成本)/`decision/`(判定与代签)/`hooks/`(钩子与端上守卫);全局基建套件放 test/ 根,实弹评测工具进 `test/scripts/`,历史 work 档案进 `test/archive/`;新增测试脚本必须落在对应域目录,并同步 `test/readme.md` 登记与 code-index/package.json 门禁链——链外测试等于没有守卫'),
   ];
+  return items;
+}
+
+/** AGENTS.md 检索纪律段(纯函数,供 init 与 deploySync 共用;内容即部署产物的事实来源)。 */
+export function disciplineBlock({ rel, dataRel, packed = false }) {
+  const MARK_V2 = '<!-- code-index:v2 -->';
+  const toolLabel = packed ? 'npx tokensaver' : rel;
+  const items = disciplineItems({ rel, dataRel, packed });
   const snippet = `\n${MARK_V2}\n## 代码检索纪律(节约 token)\n\n本项目已部署本地语义索引(工具在 \`${toolLabel}\`,项目资产在 \`${dataRel}\`):\n\n${items.join('\n\n')}\n`;
   return snippet.trim() + '\n';
 }
@@ -1098,6 +1144,43 @@ function wireRepo(root) {
   if (hookTools.includes('cursor')) cleanCursorWorkspaceHooks(root);
   if (hookTools.includes('qoder')) cleanQoderWorkspaceHooks(root);
   wireAgents(root);
+  ensureBugfixSop(root);
+}
+
+/** 缺陷修复作业规程(bugfix-sop.md):纪律段第 13 条指定的复盘落点。
+ *  只在缺失时铺骨架骨架(三段:作业规程/注意事项/复盘流水),**已存在绝不覆盖**——里面是各仓自己累积的经验。 */
+function ensureBugfixSop(root) {
+  const p = path.join(root, 'bugfix-sop.md');
+  if (fs.existsSync(p)) return;
+  // 2026-11-11:允许收进 tools/(本工具仓即此布局);tools/ 已有就绝不重铺,防根目录出现第二份骨架
+  if (fs.existsSync(path.join(root, 'tools', 'bugfix-sop.md'))) return;
+  fs.writeFileSync(p, `# 缺陷文档修复 · 作业规程与复盘
+
+> 本文件由 code-index init 铺骨架(纪律段第 13 条指定);内容由 agent 在每次「按缺陷文档修完 bug」后复盘追加。
+> 三段结构:一、作业规程(固定步骤) 二、注意事项(累积,每条写成「触发条件 → 下次先做什么」) 三、复盘流水(按日期追加)。
+> 分工:缺陷文档**本身**由纪律段第 12 条负责回写;本文件只管「我该怎么干」。
+
+## 一、作业规程
+
+0. 划范围:只做文档里的 Bug;文档没提的问题即使是真 bug 也不擅自修,发现了只报告。
+1. 定位:先走 code-index 检索核对文档给的 file:行号(行号会漂移,以检索结果为准)。
+2. 判状态:先 git diff 看工作区(缺陷可能已修过只是没提交),再在 HEAD 版本上复现确认缺陷真的存在;已修则转为「补回归守卫 + 回写文档」。
+3. 改:按根因改,不顺手改坏别处;范围外的坑记录不改。
+4. 验:断言在缺陷代码上确实失败、在修复代码上确实通过(防空跑);全量门禁绿;校验类逻辑另扫假阴性。
+5. 守卫入链:回归断言必须挂在 npm test 门禁链上,链外的测试等于没有守卫。
+6. 回写缺陷文档:逐条标状态 + 顶部标「已处理」+ 配套台账置 fixed。
+7. 复盘回写本文件:新教训进「注意事项」,本轮小结进「复盘流水」;小结必须写「本轮用上了哪几条既有 N」(至少一条真实复用)。
+8. 归档修复日志:当轮收尾在本仓 \`agent_reports/fix-logs/\` 落 \`fix-<YYYYMMDD>-<主题>.md\`(输入/已修/留待/门禁/关联指针五段),复盘条目回链它。
+
+## 二、注意事项
+
+(暂无。每轮修复后按「触发条件 → 下次先做什么」追加。只增不删:失效条目标题改 \`**Nn【已废】原标题**\`,正文与原因保留供考古。)
+
+## 三、复盘流水
+
+(暂无。每轮修复后追加一条:本轮范围 / 新踩的坑 / 更新到第几条注意事项 / 本轮用上了哪几条既有 N。)
+`, 'utf8');
+  ok(`[${path.basename(root)}] bugfix-sop.md 作业规程骨架已铺(纪律段第 13 条的复盘落点)`);
 }
 
 // 宿主仓库 + config 实际生效的每个 root(去重);root 不是 git 仓库(纯目录)则只索引不接线

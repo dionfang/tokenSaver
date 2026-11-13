@@ -1,5 +1,5 @@
 /**
- * 本地模型部署状态(status.mjs 现场判定,auto.mjs 写入会话注入)。
+ *本地模型部署状态(status.mjs 现场判定,auto.mjs 写入会话注入)。
  * 只探测:不拉起 Ollama、不 pull、不建索引。
  * 「运行正常」:modelIn=ollama 时要 Ollama 在听、两个 Ollama 模型已下载且正在驻留(/api/ps)、
  * 索引后端与模型名一致,且向量签名与当前块清单一致。已下载但 ollama ps 里没有,不算启动成功。本模块不拉起模型。
@@ -12,12 +12,12 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { DATA_DIR, loadConfig } from './config.mjs';
+import { DATA_DIR, loadConfig, decisionLocalWanted } from './config.mjs';
 import { ollamaProcessesRunning, resolveBase } from './ollamaGuard.mjs';
 import { localOnnxCached } from './localRerank.mjs';
-import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from './vectorStore.mjs';
+import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale, pairedSnapshotUsable } from './vectorStore.mjs';
 import { residentHealth } from './localResident.mjs';
-import { pidAlive, LOCK_TTL_MS } from './proc.mjs';
+import { pidAlive, LOCK_TTL_MS, atomicWriteFileSync, takeJsonLock, releaseJsonLock } from './proc.mjs';
 import { isAutoModelName } from './virtualProvider.mjs';
 import { loadTokenizer, lookupModel } from 'tokenizer-core';
 
@@ -77,6 +77,8 @@ export function normalizeSavings(j, now = Date.now()) {
     const days = {};
     for (const [k, v] of Object.entries(j.days)) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(k)) continue;
+      const [y, mo, da] = k.split('-').map(Number);
+      if (dayKey(new Date(y, mo - 1, da).getTime()) !== k) continue; // 历法校验:'2026-13-99' 这类格式合法但日历不存在的键剔除
       days[k] = bucketOf(v);
     }
     return { updatedAt, days };
@@ -102,21 +104,127 @@ export function normalizeSavings(j, now = Date.now()) {
   };
 }
 
+let savingsUnreadable = false; // 本进程内发现账本"在但读不了/解析不了"→ 拒绝写回,防止把整本历史当空账抹掉(2026-11-10 清账事故)
+
 function readDoc() {
   let j = null;
-  try { j = JSON.parse(fs.readFileSync(SAVINGS_PATH, 'utf8')); } catch { /* 尚无账 */ }
+  savingsUnreadable = false;
+  try {
+    j = JSON.parse(fs.readFileSync(SAVINGS_PATH, 'utf8'));
+  } catch (e) {
+    if (e && e.code !== 'ENOENT') {
+      // 文件存在却读不出/是坏的(如掉电留下的 NUL 空账,2026-11-11 0:20 实证):绝不当"尚无账"覆盖。
+      // 先把坏件改名留证;留证成功即可视为无账,走流水对账自愈;留证失败才禁写。
+      let moved = false;
+      try { fs.renameSync(SAVINGS_PATH, `${SAVINGS_PATH}.corrupt-${Date.now()}`); moved = true; } catch { /* 留证失败 */ }
+      if (!moved) { savingsUnreadable = true; return normalizeSavings({}, Date.now()); }
+      return healDoc(normalizeSavings({}, Date.now()));
+    }
+    /* ENOENT=尚无账 → 照样对账一次,断电清账后第一个读账进程即可自动回补 */
+  }
   const doc = normalizeSavings(j || {}, Date.now());
   if (j && !j.days) {
     try { writeDoc(doc); } catch { /* 迁移失败不影响读取 */ }
   }
-  return doc;
+  return healDoc(doc);
 }
 
 function writeDoc(doc) {
+  if (savingsUnreadable) throw new Error('session-savings.json 读不出/解析不了,拒绝覆盖防清账');
+  maybeBackupSavings(); // 每日首写前先快照"昨天最后状态"(2026-11-11 加固)
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const days = {};
   for (const k of Object.keys(doc.days || {}).sort()) days[k] = bucketOf(doc.days[k]);
-  fs.writeFileSync(SAVINGS_PATH, JSON.stringify({ updatedAt: Date.now(), days }));
+  atomicWriteFileSync(SAVINGS_PATH, JSON.stringify({ updatedAt: Date.now(), days })); // 原子写+fsync:崩溃/掉电不留半截账
+}
+
+// ---------- 账本自愈与每日备份(2026-11-11 加固:两次清账事故的纵深防御) ----------
+
+/** 从 turns 流水取最后一条有效对账记录(total 明显大于 today 的才算历史仍可信;total==today 是清账后的重建流水,跳过)。 */
+export function readTurnsLastGood(turnsPath = path.join(DATA_DIR, 'usage', 'turns.jsonl')) {
+  try {
+    const lines = fs.readFileSync(turnsPath, 'utf8').trim().split('\n');
+    let lastGood = null;
+    for (const l of lines) {
+      let j; try { j = JSON.parse(l); } catch { continue; }
+      const today = Math.max(0, Math.round(Number(j?.today) || 0));
+      const total = Math.max(0, Math.round(Number(j?.total) || 0));
+      if (total > today + 1000) lastGood = { ts: Math.round(Number(j?.ts) || 0), today, total };
+    }
+    return lastGood;
+  } catch { return null; } // 无流水/读不了 → 对不出账,不动
+}
+
+/** 对账自愈(纯函数):days 现值合计低于流水最后有效 total → 把缺的历史(total−当日)补进记录日的前一天桶;
+ *  完好则原样返回同一对象。当日部分不补——由水位机制自愈,避免与重新入账双计。 */
+export function healSavingsFromTurns(days, lastGood) {
+  if (!lastGood) return days;
+  const norm = (v) => Math.max(0, Math.round(Number(v) || 0));
+  let cur = 0;
+  for (const d of Object.values(days || {})) cur += norm(d?.savedTokens);
+  if (cur >= lastGood.total) return days;
+  const hist = Math.max(0, lastGood.total - lastGood.today);
+  const d = new Date(lastGood.ts || Date.now());
+  const key = dayKey(new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1).getTime());
+  const out = { ...(days || {}) };
+  const old = out[key] || {};
+  out[key] = {
+    originalTokens: Math.max(norm(old.originalTokens), hist),
+    compressedTokens: norm(old.compressedTokens),
+    savedTokens: Math.max(norm(old.savedTokens), hist),
+    readInputTokens: norm(old.readInputTokens),
+  };
+  return out;
+}
+
+let healChecked = false; // 每进程只对账一次(兜底逻辑,不进热路径)
+let healLastResult = { changed: false };
+function healDoc(doc) {
+  if (healChecked) return doc;
+  healChecked = true;
+  try {
+    const healed = healSavingsFromTurns(doc.days, readTurnsLastGood());
+    const changed = healed !== doc.days;
+    healLastResult = { changed };
+    if (changed) { try { writeDoc({ updatedAt: Date.now(), days: healed }); } catch { /* 写失败不影响读 */ } }
+    return { ...doc, days: healed };
+  } catch { healLastResult = { changed: false }; return doc; }
+}
+
+const SAVINGS_BACKUP_DIR = path.join(DATA_DIR, 'backups', 'session-savings');
+
+/** 备份轮转:按文件名(YYYY-MM-DD.json,dayKey 口径)升序只保留最近 keep 份,其余删除。 */
+export function pruneSavingsBackups(dir = SAVINGS_BACKUP_DIR, keep = 14) {
+  let files;
+  try { files = fs.readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort(); } catch { return; }
+  for (const f of files.slice(0, Math.max(0, files.length - keep))) {
+    try { fs.unlinkSync(path.join(dir, f)); } catch { /* 删不掉就算了 */ }
+  }
+}
+
+let lastBackupDay = null;
+/** 每日懒备份:当天首次写账前把磁盘上现有账本拷一份(= 昨天最后状态),保留 14 天。 */
+function maybeBackupSavings() {
+  try {
+    const day = dayKey(Date.now());
+    if (lastBackupDay === day) return;
+    lastBackupDay = day; // 无论成败当天只试一次
+    if (!fs.existsSync(SAVINGS_PATH)) return; // 尚无账可备
+    fs.mkdirSync(SAVINGS_BACKUP_DIR, { recursive: true });
+    const dest = path.join(SAVINGS_BACKUP_DIR, `${day}.json`);
+    if (!fs.existsSync(dest)) fs.copyFileSync(SAVINGS_PATH, dest);
+    pruneSavingsBackups();
+  } catch { /* 备份失败不影响记账 */ }
+}
+
+/** 手动修复入口(CLI:rebuild-savings.mjs):强制对账自愈一次→写回→返回摘要。留证失败的禁写态会如实抛错。 */
+export function repairSavingsLedger() {
+  healChecked = false;
+  const doc = readDoc();
+  let total = 0;
+  for (const d of Object.values(doc.days || {})) total += Math.max(0, Math.round(Number(d?.savedTokens) || 0));
+  try { writeDoc({ updatedAt: Date.now(), days: doc.days }); } catch { /* 禁写态抛给 CLI */ }
+  return { total, dayCount: Object.keys(doc.days || {}).length, changed: healLastResult.changed === true };
 }
 
 function readSavingsState() {
@@ -157,24 +265,35 @@ export function accumulateSavings(state, originalTokens, compressedTokens) {
 }
 
 export function addInputSavings(originalTokens, compressedTokens) {
-  const state = readSavingsState();
-  const next = accumulateSavings(state, originalTokens, compressedTokens);
-  if (next === state) return state.savedTokens;
-  try { writeDoc(next); } catch { /* 记账失败不影响检索 */ }
-  return next.savedTokens;
+  // 锁内读改写(2026-11-10 二次审计 P1-4):session-savings.json 跨进程共享,双钩子并发时互相覆盖丢账;
+  // 锁忙时跳过本笔返回现值(单笔量级小,下笔自愈),与 warmedRegistry 同模式。
+  const lockPath = SAVINGS_PATH + '.lock';
+  if (!takeJsonLock(lockPath)) return readSavingsState().savedTokens;
+  try {
+    const state = readSavingsState();
+    const next = accumulateSavings(state, originalTokens, compressedTokens);
+    if (next === state) return state.savedTokens;
+    try { writeDoc(next); } catch { /* 记账失败不影响检索 */ }
+    return next.savedTokens;
+  } finally { releaseJsonLock(lockPath); }
 }
 
-/** 工具结果实际进入上下文的量(Read/Bash,bytes/4 折算)。信息字段,不影响 savedTokens。 */
+/** 工具结果实际进入上下文的量(Read/Bash,bytes/4 折算)。信息字段,不影响 savedTokens。
+ *  锁内读改写(2026-11-10):与 addInputSavings/addAccumulatedSavings 共账本,裸写并发会互相覆盖丢账;信息字段锁忙直接跳过。 */
 export function addReadInputTokens(tokens) {
   const n = Math.max(0, Math.round(Number(tokens) || 0));
   if (n <= 0) return;
-  const state = readSavingsState();
-  const date = state.date || dayKey(Date.now());
-  const days = { ...(state.days || {}) };
-  const bucket = bucketOf(days[date]);
-  bucket.readInputTokens += n;
-  days[date] = bucket;
-  try { writeDoc({ updatedAt: Date.now(), days }); } catch { /* 记账失败不影响调用方 */ }
+  const lockPath = SAVINGS_PATH + '.lock';
+  if (!takeJsonLock(lockPath)) return;
+  try {
+    const state = readSavingsState();
+    const date = state.date || dayKey(Date.now());
+    const days = { ...(state.days || {}) };
+    const bucket = bucketOf(days[date]);
+    bucket.readInputTokens += n;
+    days[date] = bucket;
+    try { writeDoc({ updatedAt: Date.now(), days }); } catch { /* 记账失败不影响调用方 */ }
+  } finally { releaseJsonLock(lockPath); }
 }
 
 /** 当日实际读入的 token(信息口径)。 */
@@ -685,18 +804,28 @@ export function computeAccumulation(events, watermarks = {}, opts = {}) {
   return { total, refund, detail };
 }
 
-/** 把增量记进当日桶(originalTokens 与 savedTokens 同增,compressedTokens 不动)。 */
+/** 把增量记进当日桶(originalTokens 与 savedTokens 同增,compressedTokens 不动)。锁内读改写:
+ * 金额大(会话累计差额),与入口一次/addReadInputTokens 并发时互相覆盖丢账不可接受;短重试拿锁,拿不到就放弃本笔(下轮 applySessionAccumulation 按水位差自愈)。 */
 export function addAccumulatedSavings(extra) {
   const delta = Math.round(Number(extra) || 0);
   if (!delta) return;
-  const state = readSavingsState();
-  const date = state.date || dayKey(Date.now());
-  const days = { ...(state.days || {}) };
-  const bucket = bucketOf(days[date]);
-  bucket.originalTokens = Math.max(0, bucket.originalTokens + delta);
-  bucket.savedTokens = Math.max(0, bucket.savedTokens + delta);
-  days[date] = bucket;
-  try { writeDoc({ updatedAt: Date.now(), days }); } catch { /* 写失败不影响本次 */ }
+  const lockPath = SAVINGS_PATH + '.lock';
+  let locked = false;
+  for (let i = 0; i < 5 && !locked; i++) {
+    locked = takeJsonLock(lockPath);
+    if (!locked) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  if (!locked) return;
+  try {
+    const state = readSavingsState();
+    const date = state.date || dayKey(Date.now());
+    const days = { ...(state.days || {}) };
+    const bucket = bucketOf(days[date]);
+    bucket.originalTokens = Math.max(0, bucket.originalTokens + delta);
+    bucket.savedTokens = Math.max(0, bucket.savedTokens + delta);
+    days[date] = bucket;
+    try { writeDoc({ updatedAt: Date.now(), days }); } catch { /* 写失败不影响本次 */ }
+  } finally { releaseJsonLock(lockPath); }
 }
 
 /**
@@ -778,7 +907,7 @@ async function cacheTokenizer(model) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         JSON.parse(text);
-        fs.writeFileSync(dest, text);
+        atomicWriteFileSync(dest, text); // 原子写(2026-11-10 二次审计 P1-3+M2 漏列)
         err = null;
         break;
       } catch (e) { err = e; }
@@ -830,12 +959,13 @@ function likelyReason(p, emb, rr) {
     if (p.indexError) return 'index.json 无法解析';
     if (!p.indexOk) return 'local 向量索引未建立,检索降级 bm25';
     if (p.backend !== 'local' || p.indexModel !== p.models.localEmbedding) return `索引仍是 ${p.indexModel || p.backend || '旧路径'},尚未切换到 local`;
-    if (p.signatureStale && p.embedPid) return '代码块已变更,向量正在重嵌';
-    if (p.signatureStale) return '代码块已变更,向量尚未重嵌';
+    // 签名过期 ≠ 检索失败(2026-11-11):快照自洽时 search 用嵌入快照继续向量检索;
+    // 只有快照也坏了(向量与块清单错位且无法切快照)才是真降级。嵌入进行中同理(部分快照自洽可用)。
+    if (p.signatureStale && p.snapshotOk === false) return '向量与嵌入快照不一致,检索已降级 bm25';
     if (!p.localEmbeddingReady) return `嵌入模型 ${p.models.localEmbedding} 的权重不在 hf-cache`;
     if (!p.localRerankerReady) return `精排模型 ${p.models.localReranker} 的权重不在 hf-cache`;
-    if (p.embedPid) return '嵌入进程仍在运行,索引可能不是最新';
     if (!p.residentReady) return 'local 常驻进程未拉起';
+    if (p.decisionWanted === true && p.decisionOk !== true) return `决策模型 ${p.models.localDecision} 拉起失败(判定弃权 fail-open)`;
     return 'local 嵌入模型未就绪';
   }
   if (p.ollama === 'down') return 'Ollama 未启动';
@@ -849,13 +979,15 @@ function likelyReason(p, emb, rr) {
   if (!p.indexOk) return '向量索引未建立';
   if (p.backend === 'local') return `当前索引是 ${p.indexModel},与配置的 ollama 嵌入路径不一致`;
   if (p.indexModel !== emb) return `索引模型 ${p.indexModel} 与配置的嵌入模型不一致`;
-  if (p.signatureStale && p.embedPid) return '代码块已变更,向量正在重嵌';
-  if (p.signatureStale) return '代码块已变更,向量尚未重嵌';
-  if (p.embedPid) return '嵌入进程仍在运行,索引可能不是最新';
+  if (p.signatureStale && p.snapshotOk === false) return '向量与嵌入快照不一致,检索已降级 bm25';
   if (p.embedRunning == null || p.rerankRunning == null) return '无法确认模型是否已拉起';
   if (!p.embedRunning && !p.rerankRunning) return `嵌入模型 ${emb} 与精排模型 ${rr} 都未拉起`;
   if (!p.embedRunning) return `嵌入模型 ${emb} 未拉起`;
   if (!p.rerankRunning) return `精排模型 ${rr} 未拉起`;
+  if (p.decisionWanted === true) {
+    if (p.decisionInstalled !== true) return `决策模型 ${p.models.decision} 未下载`;
+    if (p.decisionRunning !== true) return `决策模型 ${p.models.decision} 未拉起`;
+  }
   return '模型未就绪';
 }
 
@@ -886,19 +1018,24 @@ export function renderModelStatus(p) {
   const wantLocal = p.modelIn === 'local';
   const emb = wantLocal ? p.models.localEmbedding : p.models.embedding;
   const rr = wantLocal ? p.models.localReranker : p.models.reranker;
-  const names = `嵌入模型 ${emb},精排模型 ${rr}`;
+  // 决策模型显示名(2026-11-08):显式远程时显示远程配置的模型名并标注(远程),否则显示模型 id
+  const decId = wantLocal ? p.models.localDecision : p.models.decision;
+  const dec = String(p.decisionModelLabel || '').trim() || decId;
+  const names = `嵌入模型 ${emb},精排模型 ${rr},决策模型:${dec || '未配置'}`;
+  // 过期/嵌入中不判失败(2026-11-11):快照自洽时检索照常工作,只有快照损坏(snapshotOk=false)才算降级
   const healthy = wantLocal
-    ? (p.chunks && p.indexOk && p.backend === 'local' && p.indexModel === p.models.localEmbedding && p.localEmbeddingReady && p.localRerankerReady && p.residentReady && !p.signatureStale && !p.embedPid && !p.indexError)
+    ? (p.chunks && p.indexOk && p.backend === 'local' && p.indexModel === p.models.localEmbedding && p.localEmbeddingReady && p.localRerankerReady && p.residentReady && p.snapshotOk !== false && !p.indexError
+      && (p.decisionWanted !== true || p.decisionOk === true))
     : (p.ollama === 'up'
       && p.embedInstalled === true
       && p.rerankInstalled === true
       && p.chunks && p.indexOk
       && p.backend !== 'local'
       && p.indexModel === emb
-      && !p.signatureStale
+      && p.snapshotOk !== false
       && p.embedRunning === true
       && p.rerankRunning === true
-      && !p.embedPid
+      && (p.decisionWanted !== true || (p.decisionInstalled === true && p.decisionRunning === true))
       && !p.indexError);
   // 节约数字:今日/总计两段(2026-11-04 用户定稿:"本会话累计"段撤下,句首加【当前远程模型】)。
   const today = Math.max(0, Math.round(Number(p.savedTokens) || 0));
@@ -919,13 +1056,20 @@ export async function assessModelStatus({ sessionId = null } = {}) {
   let rerankInstalled = null;
   let embedRunning = null;
   let rerankRunning = null;
+  let decisionInstalled = null;
+  let decisionRunning = null;
+  let decisionOk = null;
   let residentReady = false;
   if (modelIn === 'local') {
     const health = await residentHealth();
     residentReady = !!(health?.embedOk && health?.rerankOk);
+    decisionOk = decisionLocalWanted() ? (health?.decisionOk === true) : null;
     // local 常驻自愈(2026-11-03):常驻进程 2h 空闲自退或崩溃后,原设计靠下次检索懒拉起(冷启动数秒);
     // 这里借每轮健康评估判定,缺位即 detached 后台跑 warm.mjs(其 local 分支=ensureLocalResident);fail-open。
-    try { maybeWarmReranker({ health: { modelIn, embedOk: health?.embedOk === true, rerankOk: health?.rerankOk === true } }); } catch { /* 拉起失败不影响状态句 */ }
+    // 2026-11-08:decisionOk 并入判定——嵌入/精排就绪但决策模型未拉起时周期补预热;
+    // decisionWanted=false(开关关/显式远程)时不传决策字段 → 决策闸整体失效,不因"预期无决策"反复补拉。
+    const decisionWanted = decisionLocalWanted();
+    try { maybeWarmReranker({ health: { modelIn, embedOk: health?.embedOk === true, rerankOk: health?.rerankOk === true, decisionWanted, decisionOk: decisionWanted ? (health?.decisionOk == null ? undefined : health.decisionOk === true) : undefined, localDecisionReady: decisionWanted ? localOnnxCached(models.localDecision) : undefined } }); } catch { /* 拉起失败不影响状态句 */ }
   } else {
     const [tagsRes, versionUp, psRes] = await Promise.all([
       getJson(`${base}/api/tags`, 2000).then(j => ({ ok: true, j })).catch(() => ({ ok: false })),
@@ -938,15 +1082,19 @@ export async function assessModelStatus({ sessionId = null } = {}) {
       const names = installedSet(tagsRes.j);
       embedInstalled = modelListed(names, models.embedding);
       rerankInstalled = modelListed(names, models.reranker);
+      if (decisionLocalWanted()) decisionInstalled = modelListed(names, models.decision);
+      else decisionInstalled = null;
     }
     if (psRes.ok) {
       const running = installedSet(psRes.j);
       embedRunning = modelListed(running, models.embedding);
       rerankRunning = modelListed(running, models.reranker);
+      decisionRunning = decisionLocalWanted() ? modelListed(running, models.decision) : null;
       // 精排自愈(2026-11-03):精排只有会话启动预热与显式 --rerank 两个加载点,会话中段被驱逐
       // (显存挤占/服务重启/keep_alive 到期)后无人再拉——嵌入有检索持续保活而精排没有。
       // 这里借每轮健康评估(缓存 5 分钟)轻量判定,缺位即 detached 后台补预热(warm.mjs 幂等,双模型对齐);fail-open。
-      try { maybeWarmReranker({ health: { modelIn, ollama, rerankInstalled, rerankRunning } }); } catch { /* 拉起失败不影响状态句 */ }
+      // 2026-11-08:决策模型(tev1)同轨并入——已下载未驻留时同样补预热;显式远程/开关关时不带决策字段,不加决策闸。
+      try { maybeWarmReranker({ health: decisionLocalWanted() ? { modelIn, ollama, rerankInstalled, rerankRunning, decisionInstalled, decisionRunning } : { modelIn, ollama, rerankInstalled, rerankRunning } }); } catch { /* 拉起失败不影响状态句 */ }
     }
   }
 
@@ -970,12 +1118,18 @@ export async function assessModelStatus({ sessionId = null } = {}) {
     indexModel: meta?.model || null,
     backend: meta?.backend || null,
     signatureStale: vectorSignatureStale(meta),
+    snapshotOk: pairedSnapshotUsable(modelIn),
     residentReady,
     embedPid: readEmbedPid(),
     models,
     modelIn,
     localEmbeddingReady: localOnnxCached(models.localEmbedding),
     localRerankerReady: localOnnxCached(models.localReranker),
+    decisionWanted: decisionLocalWanted(),
+    decisionOk,
+    decisionInstalled,
+    decisionRunning,
+    decisionModelLabel: null, // v4:远程链已删,恒 null(状态句决策模型名走本地后端名)
   };
   writeHealthCache(health);
   return renderStatusWith(health, sessionId);
@@ -993,7 +1147,7 @@ function readHealthCache() {
 function writeHealthCache(health) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(HEALTH_CACHE_PATH, JSON.stringify({ at: Date.now(), health }));
+    atomicWriteFileSync(HEALTH_CACHE_PATH, JSON.stringify({ at: Date.now(), health })); // 原子写(2026-11-10 二次审计 P1-3)
   } catch { /* 缓存失败不影响 */ }
 }
 
@@ -1013,21 +1167,36 @@ export function renderStatusWith(health, sessionId = null) {
 /** 每轮实时状态句:健康走缓存(默认 5 分钟),节约现算。供 UserPromptSubmit 注入。 */
 // ---------- 精排自愈(2026-11-03):缺位即后台补预热 ----------
 
-/** 预热补拉判定(纯函数,测试密闭)。ollama:网关可达 ∧ 精排已下载 ∧ 未驻留;local:常驻缺位/未就绪。距上次拉起 ≥ minInterval 才补。 */
+/** 预热补拉判定(纯函数,测试密闭)。ollama:网关可达 ∧ 模型已下载 ∧ 未驻留;local:常驻缺位/未就绪。
+ * 决策模型(2026-11-08)并入同一自愈判定:仅当健康数据带 decision 字段时才加闸(旧状态/测试夹具缺字段走原逻辑)。距上次拉起 ≥ minInterval 才补。 */
 export function rerankerWarmDue(health, lastAt, now = Date.now(), minIntervalMs = 10 * 60 * 1000) {
   if (!health || typeof health !== 'object') return { due: false, reason: '无健康数据' };
   if (health.modelIn === 'local') {
     // local 常驻进程 2h 空闲自退/崩溃后,原设计靠下次检索懒拉起(冷启动数秒)——这里主动补,免掉那笔冷启动
-    if (health.embedOk === true && health.rerankOk === true) return { due: false, reason: '常驻双模型就绪' };
-    if (Number(lastAt) > now - minIntervalMs) return { due: false, reason: '节流窗口内' };
+    if (health.embedOk === true && health.rerankOk === true) {
+      // 决策模型闸只在 decisionWanted=true(本地判定通电)时生效;开关关/显式远程 = 决策缺席属预期,不补
+      if (health.decisionWanted === true) {
+        if (health.decisionOk !== false) return { due: false, reason: '常驻双模型就绪' };
+        if (health.localDecisionReady !== true) return { due: false, reason: '决策模型权重未下载,不重复补拉' };
+        if (Number(lastAt) <= now && Number(lastAt) > now - minIntervalMs) return { due: false, reason: '节流窗口内' }; // 负龄(时钟回拨)放行补拉自愈(2026-11-10 夜审 S5-F3)
+        return { due: true, reason: '常驻决策模型未就绪,补预热' };
+      }
+      return { due: false, reason: '常驻双模型就绪' };
+    }
+    // 常驻缺位(嵌入/精排没起来)= 检索直接降级 bm25 的空窗,补拉节流放宽到 60s(warm 幂等且起得快,
+    // 原 10 分钟节流会让缺位状态挂整整一轮节流窗,2026-11-08 修);决策类补拉(要重启常驻)仍用原节流
+    if (Number(lastAt) <= now && Number(lastAt) > now - Math.min(minIntervalMs, 60000)) return { due: false, reason: '节流窗口内' }; // 负龄放行(2026-11-10 夜审 S5-F3)
     return { due: true, reason: '常驻缺位/未就绪,补预热' };
   }
   if (health.modelIn !== 'ollama') return { due: false, reason: '非 ollama 模式' };
   if (health.ollama !== 'up') return { due: false, reason: 'ollama 不可达' };
-  if (health.rerankInstalled !== true) return { due: false, reason: '精排模型未下载' };
-  if (health.rerankRunning === true) return { due: false, reason: '精排已驻留' };
-  if (Number(lastAt) > now - minIntervalMs) return { due: false, reason: '节流窗口内' };
-  return { due: true, reason: '已下载未驻留,补预热' };
+  const hasDecision = Object.prototype.hasOwnProperty.call(health, 'decisionInstalled');
+  const decisionNeeded = hasDecision && health.decisionInstalled === true && health.decisionRunning !== true;
+  if (health.decisionInstalled === false) return { due: false, reason: '决策模型未下载,不补(避免无效拉起)' };
+  if (health.rerankInstalled !== true && !decisionNeeded) return { due: false, reason: '精排模型未下载' };
+  if (health.rerankRunning === true && !decisionNeeded) return { due: false, reason: '精排已驻留' };
+  if (Number(lastAt) <= now && Number(lastAt) > now - minIntervalMs) return { due: false, reason: '节流窗口内' }; // 负龄放行(2026-11-10 夜审 S5-F3)
+  return { due: true, reason: decisionNeeded ? '决策模型已下载未驻留,补预热' : '已下载未驻留,补预热' };
 }
 
 /**
@@ -1053,7 +1222,11 @@ export function maybeWarmReranker({ health = null, dataDir = DATA_DIR, now = Dat
 
 export async function assessModelStatusCached(sessionId = null, { healthMaxAgeMs = 300000 } = {}) {
   const cached = readHealthCache();
-  if (cached && Date.now() - cached.at < healthMaxAgeMs) {
+  // 模型后端缺位时不吃缓存:每轮现算(本地=轻量常驻 /health 探测),让自愈补拉与状态句即时反映,不留空窗(2026-11-08 修)
+  const backendDown = cached?.health && (cached.health.modelIn === 'local'
+    ? cached.health.residentReady !== true
+    : cached.health.ollama !== 'up');
+  if (cached && Date.now() - cached.at < healthMaxAgeMs && !backendDown) {
     return renderStatusWith(cached.health, sessionId);
   }
   return assessModelStatus({ sessionId });

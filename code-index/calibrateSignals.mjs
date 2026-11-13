@@ -256,7 +256,9 @@ export function maybeRecalibrate({ dbPath = DEFAULT_DB, out = DEFAULT_OUT, minIn
   try {
     let calibMtime = 0;
     try { calibMtime = fs.statSync(out).mtimeMs; } catch { /* 无档案 */ }
-    if (calibMtime && now - calibMtime < minIntervalMs) return { state: 'skipped', reason: '档案比阈值新' };
+    const cAge = now - calibMtime;
+    // 负龄(mtime 在未来 = 时钟回拨)不节流,放行自愈(2026-11-10 夜审 S5-F3)
+    if (calibMtime && cAge >= 0 && cAge < minIntervalMs) return { state: 'skipped', reason: '档案比阈值新' };
     let dbMtime = 0;
     try { dbMtime = fs.statSync(dbPath).mtimeMs; } catch { return { state: 'skipped', reason: '无本机会话库' }; }
     if (calibMtime && dbMtime <= calibMtime) return { state: 'skipped', reason: 'DB 无新数据' };

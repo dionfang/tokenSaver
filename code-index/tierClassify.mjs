@@ -4,8 +4,12 @@
  * R2→R3 仅 ~2 倍,词法门槛据此设计:
  *   - R1:问答/杂务/单点例行编辑——单个编辑动词不构成升档理由(例行小改不值 8 倍);
  *   - R2:**慎重修改**才升——关键性/疑难信号命中,或编辑动词多重印证(≥2 处独立改动),或全局范围改动;
- *   - R3:词法永不可达。只有 P2 证据升级(当前服务档连续 2 轮修复失败)逐级上梯 R1→R2→R3——
- *     "R2 明确无法解决"是行为证据,prompt 词法无法预知;
+ *   - R3:2026-11-08 重建裁定改为**词法可达·顶格词+独立印证同击制**(推翻 2026-11-04"词法永不可达"):
+ *     R3_SIGNS(事故/资损/底层疑难顶格词)命中且另有一池(CRITICAL/EDIT/SCOPE)在**非重叠跨度**上印证才判 R3;
+ *     单顶格词命中维持 R2。实测依据:全期 R3 仅 16/2149 轮(0.7%),关键时刻强模型未被启用;
+ *     成本口径已换挡(R3 倍率 1 vs R2 0.5,误升一轮仅 2 倍 R2 价),严格同击下试错成本可控。
+ *     该池**不进优化器网格、不学权重**(黄金集 R3 正样本近乎为 0,优化器量尺看不见 R3 收益会压平通道;
+ *     自进化 v2 重建(区间真值)落地后由有下界行赋予收益)。kill-switch:代理侧 modelRouting.r3Lexical.enabled。
  *   - R4:仅显式点名旗舰(FLAGSHIP_DEMAND,高置信,不受疑问/低置信影响)。
  * 旧 R3/R4 词表(重构/死锁/从零设计…)整体降为 R2 的**关键性证据池**:这类任务从 R2 起步,解决不了由 P2 上梯。
  * 裸"优化/算法/排查/规划"等泛词不入池(常规小优化与排期问答不值 8 倍档;强形态"性能优化/动态规划"保留)。
@@ -40,6 +44,12 @@ const SCOPE_WORDS = ['所有', '全部', '每个', '统一', '整体', '批量',
 
 // 显式点名旗舰模型 → R4(高置信,用户明确要求最好的;这是 R4 的唯一词法入口)
 const FLAGSHIP_DEMAND = ['用最强', '最强的模型', '最好的模型', '用最好', '旗舰模型', '顶配', '最强模型', '用最贵', '上最好的', '用教授', '教授档', 'best model', 'strongest model'];
+// R3 顶格词池(2026-11-08 重建裁定):事故/资损/底层疑难——词法可达 R3 的**必要不充分**条件。
+// 判定口径(见 classifyDifficulty):单池命中只算证据,须另有一池(CRITICAL/EDIT/SCOPE)在**非重叠跨度**
+// 上印证才判 R3;单顶格词命中维持 R2。与 CRITICAL 的重复词(死锁/内存泄漏/deadlock/memory leak)是有意的:
+// 同词命中只算一次,印证必须来自别的词。本池不进 TIER_LEXICON(不学权重、不进优化器网格,#14 红线)。
+const R3_SIGNS = ['生产事故', '线上事故', '线上故障', '服务不可用', '宕机', '资损', '资金损失', '数据丢失', '数据损坏', '误删',
+  '死锁', '内存泄漏', '内核', '编译器', 'kernel panic', 'core dump', '竞态', 'race condition', 'heisenbug', '无法复现', 'paxos', 'raft'];
 // R2 关键性证据池:命中即"慎重工作"(原 R3/R4 词表整体降档并入)——疑难调试/架构重构/全局影响/深权衡
 const CRITICAL_SIGNS = ['慎重', '谨慎', '关键', '核心', '主流程', '线上', '生产', '高危', '不能出错', '资金', '支付', '安全', '敏感',
   '重构', '迁移', '改造', '抽离', '拆分', '架构', '系统设计', '技术方案', '方案', '选型', '性能优化', '优化性能',
@@ -71,8 +81,9 @@ export function termPresent(low, word) {
 
 /**
  * 否定感知 + 整词边界 + 跨度合并的命中统计。
- * 返回 { words, count, score }:count 是合并重叠命中后的独立命中数("修改成"只算 1 次编辑动词);
- * score 是同跨度按权重(默认 1)取最大后的加权和 ⇒ 权重全为 1 时 score === count(旧行为逐位复现)。
+ * 返回 { words, count, score, spans }:count 是合并重叠命中后的独立命中数("修改成"只算 1 次编辑动词);
+ * score 是同跨度按权重(默认 1)取最大后的加权和 ⇒ 权重全为 1 时 score === count(旧行为逐位复现);
+ * spans 是 [start,end,word] 排序跨度表(2026-11-08 R3 同击:独立印证要用它判"非重叠跨度")。
  */
 function collect(low, words, weightOf = () => 1) {
   const accepted = [];
@@ -96,7 +107,20 @@ function collect(low, words, weightOf = () => 1) {
     if (e > end) end = e;
   }
   if (count) score += best;
-  return { words: accepted, count, score };
+  return { words: accepted, count, score, spans };
+}
+
+/**
+ * 独立印证数(R3 同击制):poolSpans 中与 baseSpans 任一跨度均不重叠的命中数([s,e) 半开区间互斥)。
+ * "死锁"同时入 R3_SIGNS 与 CRITICAL 时,两池命中是同一跨度 ⇒ 不算印证,必须再来一个别的词。
+ */
+export function spansBeyond(poolSpans, baseSpans) {
+  const bases = Array.isArray(baseSpans) ? baseSpans : [];
+  let n = 0;
+  for (const [s, e] of (Array.isArray(poolSpans) ? poolSpans : [])) {
+    if (!bases.some(([bs, be]) => s < be && bs < e)) n += 1;
+  }
+  return n;
 }
 
 /** 逐词权重倍数档案 → weightOf 函数(clamp 到 [0.4,2.0];active===false 或非法值 → 1)。 */
@@ -140,8 +164,8 @@ export function resetTierCalibrationCache() { _calibCache.clear(); }
 
 /**
  * prompt → 难度档。返回 {tier, confidence, signals, reason, scores?}。
- * 定档优先级:显式旗舰(R4)> 纯提问(R1)> 关键性信号(R2)> 编辑印证/范围(R2)> 杂务(R1)> 默认 R1。
- * 档位上限 R2:R3 只能由 P2 行为证据上梯、R4 只能显式点名(资费语义,见文件头)。
+ * 定档优先级:显式旗舰(R4)> 纯提问(R1)> 顶格词+独立印证(R3)> 关键性信号(R2)> 编辑印证/范围(R2)> 杂务(R1)> 默认 R1。
+ * 档位上限 R3(顶格词+印证同击可达;P2 行为证据亦可逐级上梯)、R4 只能显式点名(2026-11-08 重建裁定,见文件头)。
  * scores 仅在传入 calibration 时附带(审计用:优化器要看加分来自哪些信号)。
  */
 export function classifyDifficulty(text, { calibration = null } = {}) {
@@ -171,7 +195,22 @@ export function classifyDifficulty(text, { calibration = null } = {}) {
   const strongReview = collect(low, ['review', '审查', '评审', '代码检查', '找问题', 'code review']).count > 0;
   if (verifyFires && !hasImperative && !strongReview && !(TH.verifyOverride > 0 && critical.score >= TH.verifyOverride)) {
     const q = r1;
-    return { tier: 'R1', confidence: q.length ? 0.85 : 0.6, signals: q.length ? q : [t.slice(0, 20)], reason: '纯提问/征询 → 日常主力档' };
+    return { tier: 'R1', confidence: q.length ? 0.85 : 0.6, signals: q.length ? q : [t.slice(0, 20)], flags: { verifyBlocked: true }, reason: '纯提问/征询 → 日常主力档' };
+  }
+
+  // R3 词法可达·顶格词+独立印证同击(2026-11-08 重建裁定,见文件头):
+  // 顶格词命中(≥1)且 CRITICAL/EDIT/SCOPE 在非重叠跨度上另有印证才判 R3;否则落回下文的 R2/R1 常规池。
+  // 疑问拦截(上方)已把"为什么死锁"类返 R1;旗舰点名(函数头部)已把"用最强的模型排查线上故障"返 R4。
+  const r3hits = collect(low, R3_SIGNS);
+  if (r3hits.count >= 1) {
+    const beyond = spansBeyond([...critical.spans, ...edit.spans, ...scopeW.spans], r3hits.spans);
+    if (beyond >= 1) {
+      return {
+        tier: 'R3', confidence: 0.8, signals: r3hits.words,
+        scores: calibration ? { critical: Number(critical.score.toFixed(3)), edit: Number(edit.score.toFixed(3)), scope: Number(scopeW.score.toFixed(3)), corroborate: beyond } : undefined,
+        reason: `顶格词+独立印证同击(R3_${r3hits.words.join('+')},非重叠印证 ${beyond} 处)→ R3(词法可达上限;误升面由影子审计观察)`,
+      };
+    }
   }
 
   const scores = { critical: Number(critical.score.toFixed(3)), edit: Number(edit.score.toFixed(3)), scope: Number(scopeW.score.toFixed(3)) };
@@ -179,7 +218,9 @@ export function classifyDifficulty(text, { calibration = null } = {}) {
     return {
       tier: 'R2', confidence: critical.count >= 2 ? 0.85 : 0.8, signals: critical.words,
       scores: calibration ? scores : undefined,
-      reason: '关键性/慎重信号 → 增强档(R2 起步;仍解决不了由 P2 证据升级逐级上梯,词法不直达 R3)',
+      // D4 临界 flags(2026-11-09):r3NearMiss=顶格词命中但独立印证不足(差一步到 R3);marginalR2=单信号边际置信
+      flags: (r3hits.count >= 1 || critical.count < 2) ? { ...(r3hits.count >= 1 ? { r3NearMiss: true } : {}), ...(critical.count < 2 ? { marginalR2: true } : {}) } : undefined,
+      reason: '关键性/慎重信号 → 增强档(R2 起步;仍解决不了由 P2 证据升级逐级上梯;直达 R3 需顶格词同击)',
     };
   }
   const editSum = edit.score + (scopeW.score > 0 ? scopeW.score : 0);
@@ -187,6 +228,7 @@ export function classifyDifficulty(text, { calibration = null } = {}) {
     return {
       tier: 'R2', confidence: 0.75, signals: edit.words,
       scores: calibration ? scores : undefined,
+      flags: { marginalR2: true }, // D4:编辑印证型 R2 属边际置信,供临界仲裁票影子对账
       reason: scopeW.score > 0 ? '编辑改动 + 全局范围 → 增强档' : '多处独立编辑改动 → 增强档',
     };
   }
@@ -199,8 +241,9 @@ export function classifyDifficulty(text, { calibration = null } = {}) {
  * 任务型 → R1-R2 难度档的**设计映射**(黄金集 R 真值来源,scoreGoldenTier 用)。
  * 2026-11-06 三档定稿:multi(多点改组,旧 T4/T5)= 慎重工作起步 R2;routine(例行,旧 T2/T3/T6/T7)
  * 与 light(询问杂务,旧 T1/T8)= R1(解决不了由 P2 逐级上梯)。
- * R3 仅 P2 行为证据可达、R4 仅显式点名可达——prompt 词法无法预知,故真值不含 R3/R4
- * (scoreGoldenTier 的 R3/R4 覆盖恒 0,R3 路由质量由 P2 探针与实弹账本观察)。
+ * R3 **真值**仍仅 P2 行为证据可达、R4 真值仅显式点名可达(词法 R3 是预测侧通道,#14 预测不回灌,
+ * 故真值表仍不含 R3/R4;scoreGoldenTier 的 R3/R4 覆盖续为 0,词法 R3 质量由影子审计+实弹账本观察,
+ * 自进化 v2 区间真值落地后有下界行才进量尺)。
  * 该槽位由四票代签写入(L1 词法/L2 向量/行为形态各 1 票 + 决策模型加权,见 autoLabel.mjs);
  * 四票里没有 classifyDifficulty(被评者),行为票是结果侧证据 ⇒ 非预测回灌。
  * 兼容键:旧 T1-T8 值保留(历史黄金集/日志的 R 真值派生),映射与三档定稿同口径。

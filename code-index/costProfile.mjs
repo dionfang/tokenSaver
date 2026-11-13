@@ -48,7 +48,18 @@ const num = (v, def) => (Number.isFinite(Number(v)) ? Number(v) : def);
 /** 合并画像:部分传入即可,缺字段回落默认;非法值一律丢弃(纯函数)。 */
 export function resolveCostProfile(p) {
   const d = DEFAULT_COST_PROFILE;
-  if (!p || typeof p !== 'object') return { ...d };
+  if (!p || typeof p !== 'object') {
+    // 无入参也必须返回**独立副本**:嵌套对象(tierMultiplier/implicit/explicit/requestMix/underTier)
+    // 若与 DEFAULT_COST_PROFILE 共享引用,调用方变异返回值会污染模块级默认档案(费率全局漂移)。
+    return {
+      ...d,
+      requestMix: { ...d.requestMix },
+      tierMultiplier: { ...d.tierMultiplier },
+      implicit: { ...d.implicit },
+      explicit: { ...d.explicit },
+      underTier: { ...d.underTier },
+    };
+  }
   const merge = (base, over) => {
     const out = { ...base };
     if (over && typeof over === 'object') for (const k of Object.keys(base)) {
@@ -155,6 +166,117 @@ export const decisionCost = (profile, { trueTier, predTier } = {}) => {
   const { nextTier, ...rest } = turnCost(profile, { trueTier, predTier });
   return rest;
 };
+
+/**
+ * **区间真值版一轮代价**(自进化 v2,2026-11-08 重建裁定;真值从点值改 [min,max] 区间)。
+ * 任务所需档 N ∈ [L,U];预测 p 的计价:
+ *   - p < L:漏升 —— 弱档空转 failTurns 轮 + 上梯冷读到 L + 每档差质量损失(与 v1 under 同公式,trueTier 换 L);
+ *   - L ≤ p ≤ U:最优带,零罚(同/跨档吃热/冷缓存,与 v1 correct 同公式);
+ *   - p > U:误升 —— 当轮在高档付费(换档即冷读),阶段驻留 ⇒ nextTier 停在 p(v1 over 同公式,trueTier 换 U)。
+ * 兼容性:单点区间 [t,t] 与 v1 turnCost 三分支**逐位相等**(历史量尺数字可比);入参 interval 优先,
+ * 缺 interval 或非法时回落 trueTier 单点(旧调用零改动)。
+ */
+export function intervalCost(profile, { prevTier = null, interval = null, predTier = null, trueTier = null } = {}) {
+  const p = resolveCostProfile(profile);
+  let L = null;
+  let U = null;
+  if (interval && TIERS.includes(interval.min) && TIERS.includes(interval.max)) { L = interval.min; U = interval.max; }
+  else { const t = TIERS.includes(trueTier) ? trueTier : 'R1'; L = t; U = t; }
+  if (tierRank(U) < tierRank(L)) return intervalCost(p, { prevTier, interval: { min: U, max: L }, predTier }); // 防御:倒置区间交换后重算
+  const hot = baseTurn(p, { state: 'hot' });
+  const cold = baseTurn(p, { state: 'cold' });
+  const q = TIERS.includes(predTier) ? predTier : 'R1';
+  const pv = TIERS.includes(prevTier) ? prevTier : 'R1';
+  const mq = tierMultiplier(p, q);
+  const sameAsPrev = q === pv;
+  let kind = 'correct';
+  let steps = 0;
+  let tokenCost;
+  let nextTier = q;
+  if (tierRank(q) < tierRank(L)) {
+    kind = 'under';
+    steps = tierRank(L) - tierRank(q);
+    const fail = Math.max(1, num(p.underTier.failTurns, 2));
+    tokenCost = (sameAsPrev ? fail * hot : cold + (fail - 1) * hot) * mq + cold * tierMultiplier(p, L);
+    nextTier = L;
+  } else if (tierRank(q) > tierRank(U)) {
+    kind = 'over';
+    steps = tierRank(q) - tierRank(U);
+    tokenCost = (sameAsPrev ? hot : cold) * mq;
+  } else {
+    tokenCost = (sameAsPrev ? hot : cold) * mq;
+  }
+  const qualityPenalty = kind === 'under' ? steps * num(p.qualityPenaltyPerStepM, 0) : 0;
+  return {
+    kind,
+    steps,
+    tokenCost: Number(tokenCost.toFixed(4)),
+    qualityPenalty: Number(qualityPenalty.toFixed(4)),
+    total: Number((tokenCost + qualityPenalty).toFixed(4)),
+    nextTier,
+  };
+}
+
+/** 行 → 区间 [min,max](点值即单点);缺省恒 R1。 */
+function rowIntervalOf(r = {}) {
+  if (r.interval && TIERS.includes(r.interval.min) && TIERS.includes(r.interval.max)) return { min: r.interval.min, max: r.interval.max };
+  const t = TIERS.includes(r.trueTier) ? r.trueTier : 'R1';
+  return { min: t, max: t };
+}
+
+/**
+ * **区间真值策略总代价**(自进化 v2):与 policyCost 同构(序列折叠、双基线),行序=会话时序。
+ * 基线:alwaysR1=恒判 R1;oracle=状态感知最优——当前档已在带内就不换(吃热缓存),否则跳到下界 L
+ * (带内任意档零罚,最优策略=尽量少换档、被迫才换到最便宜的带内档)。
+ */
+export function intervalPolicyCost(profile, rows = []) {
+  const p = resolveCostProfile(profile);
+  const fold = (predOf) => {
+    let prev = null;
+    let token = 0;
+    let penalty = 0;
+    let switches = 0;
+    for (const r of rows) {
+      const iv = rowIntervalOf(r);
+      const c = intervalCost(p, { prevTier: prev, interval: iv, predTier: predOf(r, prev, iv) });
+      token += c.tokenCost;
+      penalty += c.qualityPenalty;
+      if ((prev || 'R1') !== c.nextTier) switches += 1;
+      prev = c.nextTier;
+    }
+    return { token: Number(token.toFixed(3)), penalty: Number(penalty.toFixed(3)), total: Number((token + penalty).toFixed(3)), switches };
+  };
+  const actual = fold((r) => r.predTier || 'R1');
+  let hit = 0;
+  let over = 0;
+  let under = 0;
+  for (const r of rows) {
+    const iv = rowIntervalOf(r);
+    const k = intervalCost(p, { interval: iv, predTier: r.predTier }).kind;
+    if (k === 'over') over += 1;
+    else if (k === 'under') under += 1;
+    else hit += 1;
+  }
+  const n = rows.length;
+  const alwaysR1 = fold(() => 'R1');
+  const oracle = fold((_r, prev, iv) => {
+    if (prev && tierRank(prev) >= tierRank(iv.min) && tierRank(prev) <= tierRank(iv.max)) return prev; // 已在带内:不换档
+    return iv.min;
+  });
+  return {
+    n,
+    hit,
+    over,
+    under,
+    accuracy: n ? Number((hit / n).toFixed(3)) : null,
+    tokenCost: actual.token,
+    qualityPenalty: actual.penalty,
+    total: actual.total,
+    switches: actual.switches,
+    perRowMean: n ? Number((actual.total / n).toFixed(4)) : null,
+    baselines: { alwaysR1: alwaysR1.total, alwaysR1Token: alwaysR1.token, oracle: oracle.total, oracleToken: oracle.token },
+  };
+}
 
 /**
  * 一个策略在**按时间顺序**排列的真值行上的总代价(逐行折叠档位状态 ⇒ 行序=会话时序,黄金集 id 序即是)。

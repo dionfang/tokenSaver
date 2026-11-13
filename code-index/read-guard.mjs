@@ -126,10 +126,12 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
   );
 }
 
-/** 实验数据保护(2026-10-31 用户要求):test/ab/result 是 A/B 实验唯一的原始证据(2026-11-07 自 data/ab 迁入并已入版本控制),
- *  删了只能从本地会话库重建(见 test/scripts/ab/recover-db.mjs)。禁止顺手清理。
- *  命中两类:①git clean 带 -x/-X(会连带删掉被 gitignore 的 data/ab);②递归删除命中 data/ab 或其父目录 data。 */
-const PROTECTED_DATA = /(^|[\\/])test([\\/])ab([\\/]|$)/i;
+/** 实验数据保护(2026-10-31 用户要求):A/B 实验唯一的原始证据,现行落位 agent_reports/ab-logs/
+ *  (2026-11-11 自 test/ab/result 迁入;更早为 data/ab,2026-11-07 迁出),
+ *  删了只能从本地会话库重建(见 tools/ab/recover-db.mjs)。禁止顺手清理。
+ *  命中两类:①git clean 带 -x/-X(会连带删掉被 gitignore 的 data/ab);②递归删除命中数据目录或其保护祖先。
+ *  旧路径 test/ab 仍在正则内(防历史脚本/文档引用期残留)。 */
+const PROTECTED_DATA = /(^|[\\/])(?:test[\\/]ab|agent_reports[\\/]ab-logs)([\\/]|$)/i;
 const RM_CMDS = /^(?:rm|rmdir|del|erase|remove-item)$/i;
 /** 宿主工具输出截断阈值(ZCode persisted-output >32KB 存盘只给 2KB 预览;Qoder/Cursor 近似同量级):
  *  Bash 拦截记账的节约上限——放行时宿主也会截断,超过它的部分不算"省下的"。 */
@@ -142,7 +144,7 @@ function expandTarget(t, cwd) {
   try { return path.resolve(cwd, s); } catch { return null; }
 }
 
-/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 test/ab/result 传入。 */
+/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 agent_reports/ab-logs(或旧 test/ab/result)传入。 */
 export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected = false } = {}) {
   const cmd = String(command ?? '');
   if (!cmd.trim()) return { permission: 'allow' };
@@ -173,6 +175,12 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
     if (!recursive) continue;
     for (const t of rest) {
       if (t.startsWith('-')) continue;
+      // S3-F1(2026-11-11 夜审):目标整体是变量引用($D/"${D}"/%D%)时静态解析不出真实路径——
+      // 变量可整体承载受保护段(实测绕过形态),无法证明安全即按危险处理,提示改字面量路径。
+      const bare = t.replace(/^["']|["']$/g, '');
+      if (hasProtected && (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(bare) || /^%[A-Za-z0-9_]+%$/.test(bare))) {
+        return { permission: 'deny', kind: 'Clean', reason: `递归删除目标是变量引用(${t}),无法静态验证——请改用字面量路径` };
+      }
       const abs = expandTarget(t, cwd);
       if (!abs) continue;
       if (PROTECTED_DATA.test(abs)) return { permission: 'deny', kind: 'Clean', reason: `递归删除命中 ${abs}` };
@@ -181,6 +189,14 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
       if (norm === path.resolve(cwd) || /(^|[\\/])\*$/.test(norm)) {
         return { permission: 'deny', kind: 'Clean', reason: `递归删除命中工作区根 ${norm}` };
       }
+      // S3-F1(2026-11-11 夜审):目标覆盖保护目录或 cwd 即拦——`rm -rf ..`/`../..`/`test/ab/result/../..`
+      // 解析后落在保护目录的祖先(旧四条规则按"目标是保护路径后缀"判,祖先全不命中)。
+      if (hasProtected) {
+        const covers = (from, to) => { const rel = path.relative(from, to); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+        if (covers(abs, path.resolve(cwd, 'agent_reports', 'ab-logs')) || covers(abs, path.resolve(cwd, 'test', 'ab')) || covers(abs, path.resolve(cwd))) {
+          return { permission: 'deny', kind: 'Clean', reason: `递归删除命中保护目录祖先/工作区自身 ${abs}` };
+        }
+      }
     }
   }
   return { permission: 'allow' };
@@ -188,11 +204,11 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
 
 export function cleanGuardMessage() {
   return (
-    'code-index: 已阻止清理 A/B 实验数据(test/ab/result)。那里是这批实验唯一的原始证据,' +
+    'code-index: 已阻止清理 A/B 实验数据(agent_reports/ab-logs)。那里是这批实验唯一的原始证据,' +
     '不在版本控制内,删掉只能从本地会话库重建。要重跑实验请直接覆盖写' +
-    '(prepare 只清 data/ab/work 下的任务目录),不要先删整个目录;确需清理请先征得用户同意,' +
-    '或改成只删具体文件(路径里不要出现 test/ab/result)。' +
-    '若已经误删,可用 `node test/scripts/ab/recover-db.mjs` 从 ~/.zcode/cli/db/db.sqlite 重建。'
+    '(prepare 只清 agent_reports/ab-logs/work 下的任务目录),不要先删整个目录;确需清理请先征得用户同意,' +
+    '或改成只删具体文件(路径里不要出现 agent_reports/ab-logs)。' +
+    '若已经误删,可用 `node tools/ab/recover-db.mjs` 从 ~/.zcode/cli/db/db.sqlite 重建。'
   );
 }
 
@@ -417,7 +433,7 @@ async function bashGuard(input, dialect) {
   const now = Date.now();
   const cwd = input.cwd || process.cwd();
   // 实验数据保护:先于整读拦截,命中就拒(不做 5 分钟放行,不可撤销)。
-  const hasProtectedData = fs.existsSync(path.join(cwd, 'test', 'ab', 'result'));
+  const hasProtectedData = fs.existsSync(path.join(cwd, 'agent_reports', 'ab-logs')) || fs.existsSync(path.join(cwd, 'test', 'ab', 'result'));
   const clean = evaluateCleanGuard({ command: cmd, cwd, hasProtected: hasProtectedData });
   if (clean.permission === 'deny') {
     const body = formatDecision(dialect, 'deny', cleanGuardMessage());

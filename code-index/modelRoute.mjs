@@ -17,19 +17,22 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR } from './config.mjs';
+import { DATA_DIR, loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
+import { atomicWriteFileSync, takeJsonLock as procTakeJsonLock, releaseJsonLock as procReleaseJsonLock } from './proc.mjs';
 import { normalizeType, L1_TYPES, classifyPrompt } from './classify.mjs';
-import { SEMANTIC_AXIS, INTENSITY_AXIS } from './autoLabel.mjs';
 import { classifyDifficulty, loadTierCalibration, TIER_FROM_TYPE } from './tierClassify.mjs';
 import { tierTruthFromAxes } from './tierTruth.mjs';
-import { promptKey } from './buildExemplars.mjs';
+import { promptKey, SEMANTIC_AXIS, INTENSITY_AXIS } from './buildExemplars.mjs'; // 双轴常量已下沉至 buildExemplars(不再反向依赖 autoLabel)
 import { resolveZcodeV2Dir } from './virtualProvider.mjs'; // doctor 库存走 v2Dir 配置制(与快照同源,无循环)
 
 const HOME = os.homedir();
-const VECTORS_PATH = path.join(DATA_DIR, 'routing', 'exemplars-vectors.json');
+// 向量库分层(2026-11-10 分发架构):base=服务器下发整包(客户端**只读**),local=本地增量层。
+// 路径/slug 共享逻辑已抽到 vectorLayers.mjs(modelRoute 与 decisionModel 共用);此处只保留读写。
+import { currentEmbedModel, vectorsSlug, vectorsLayerPaths } from './vectorLayers.mjs';
+export { vectorsSlug, vectorsLayerPaths } from './vectorLayers.mjs';
 const HEALTH_PATH = path.join(DATA_DIR, 'model-health.json');
-const SHADOW_LOG = path.join(DATA_DIR, 'usage', 'routing-shadow.jsonl');
 const L2_MIN_SIM = 0.55;
 const L2_MIN_CONF = 0.6; // 2026-11-02:与 init 骨架/本机配置对齐(黄金集扫描定档:0.6 覆盖 15/50 准确 93%;0.75 只覆盖 6/50)
 const TYPES = ['multi', 'routine', 'light'];
@@ -52,40 +55,213 @@ export function cosine(a, b) {
   return d ? dot / d : 0;
 }
 
-/** 用 embedFn 对样本库逐条嵌入,写 data/routing/exemplars-vectors.json。embedFn 可注入测试。 */
-export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = false } = {}) {
+const normPromptForKey = (p) => String(p || '').replace(/\s+/g, ' ').trim().toLowerCase();
+/** 跨端内容键:sha256(model|完整归一 prompt) 前 24 hex。
+ *  不用 promptKey(32 位 + 截 400 字,长 prompt 会碰键);base 包只带 key,不需原文(隐私)。 */
+export function vectorKeyOf(prompt, model = null) {
+  return crypto.createHash('sha256').update(`${model || currentEmbedModel()}|${normPromptForKey(prompt)}`).digest('hex').slice(0, 24);
+}
+
+// ---------- 向量编码(2026-11-10 省体积):Float32 + base64,约比十进制文本小 4 倍 ----------
+/** 数组 → base64(Float32LE)。 */
+export function encodeVector(arr) {
+  const f = Float32Array.from(arr);
+  const buf = Buffer.allocUnsafe(f.length * 4);
+  for (let i = 0; i < f.length; i += 1) buf.writeFloatLE(f[i], i * 4);
+  return buf.toString('base64');
+}
+/** base64 → Float32Array(长度按字节数整除 4)。 */
+export function decodeVector(b64) {
+  const buf = Buffer.from(String(b64 || ''), 'base64');
+  const len = Math.floor(buf.byteLength / 4);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i += 1) out[i] = buf.readFloatLE(i * 4);
+  return out;
+}
+/** 条目取向量:兼容 v(旧明文数组/f32 数组)与 v_b64(base64)。 */
+function entryVector(e) {
+  if (!e || typeof e !== 'object') return null;
+  if (Array.isArray(e.v) && e.v.length) return e.v;
+  if (e.v_b64) { const v = decodeVector(e.v_b64); return v.length ? v : null; }
+  return null;
+}
+/** 整层解码:把 v_b64 统一成 v(Float32Array),丢弃 b64 串以省内存;consumer 无需感知格式。 */
+function decodeLayer(doc) {
+  if (!doc || !doc.vectors) return doc;
+  const vectors = {};
+  for (const [k, e] of Object.entries(doc.vectors)) {
+    const v = entryVector(e);
+    vectors[k] = v ? { label: e.label, rule: e.rule || '', pkey: e.pkey || null, v } : { ...e };
+  }
+  return { ...doc, vectors };
+}
+let _vectorsCache = { key: '', data: null };
+function readFirstExisting(paths = []) {
+  for (const p of paths) { if (!p) continue; const d = readLayerPath(p); if (d) return d; }
+  return null;
+}
+function readLayerPath(file) {
+  const d = readJson(file);
+  return d && d.vectors && typeof d.vectors === 'object' ? d : null;
+}
+
+/**
+ * 向量库构建(2026-11-10 分层改造):只写 local 增量层,**永不覆盖 base**。
+ *   - base 层 key 命中 → 复用向量(不嵌入);authority='local'(默认,= 项目当前自签模式)时,
+ *     同键本地标签以 overrides 记录,加载时覆盖 base 标签;authority='base' 则保留服务器清洗结果。
+ *   - 未命中 → 先复用本地上次向量(同模型),再嵌入 miss;已不在样本集的 local 条目自动裁剪。
+ *   - 模型不一致:base/旧 local 均不复用,按当前模型重建 local(防 768/1024 混维)。
+ * 返回 {ok(本地条目数), embedded, reusedBase, reusedLocal, fail, dim, model, out}。
+ */
+export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = false, authority = null, model = null } = {}) {
   const exPath = path.join(dataDir, 'routing', 'exemplars.json');
   const ex = readJson(exPath);
   if (!ex || !Array.isArray(ex.exemplars) || !ex.exemplars.length) throw new Error(`样本库缺失或为空: ${exPath}`);
+  const want = model || currentEmbedModel(); // 可显式指定(测试/服务器离线构建);缺省跟运行配置
+  const cfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
+  const auth = authority || cfg.authority || 'local';
+  const paths = vectorsLayerPaths(dataDir, want);
+  const base = readFirstExisting([paths.base.slugFile, paths.base.fixedFile]);
+  const baseOk = base && base.model === want ? base : null;
+  const localOld = readFirstExisting([paths.local.slugFile, paths.local.fixedFile]);
+  const legacyOld = base || localOld ? null : readLayerPath(paths.local.legacyFile); // 仅迁移期复用
+  const oldOk = [localOld, legacyOld].find((d) => d && d.model === want) || null;
+
   const vectors = {};
-  let ok = 0, fail = 0;
+  const overrides = {};
+  const seen = new Set();
+  let embedded = 0, reusedBase = 0, reusedLocal = 0, fail = 0, dim = 0;
+  const put = (key, meta, v) => {
+    if (!dim && v && v.length) dim = v.length;
+    vectors[key] = { ...meta, v_b64: encodeVector(v) }; // 统一存 base64 Float32(省体积 ~4x)
+  };
+  // 嵌入函数与**目标模型**绑定(2026-11-10 修污染):不再经 embedIntent(它跟 config 后端走)——
+  // 目标是 ollama/* 就直打 /api/embed,目标是 local/jina 才走常驻+进程内兜底。
+  // 否则"config=local、构建目标=ollama"时会把 jina 768 向量冒充 ollama 库(实测污染事件)。
+  const cfgAll = (() => { try { return loadConfig(); } catch { return {}; } })();
+  const ollamaBase = cfgAll.ollamaBase || 'http://localhost:11434';
+  const ollamaName = want.startsWith('ollama/') ? want.slice('ollama/'.length) : null;
+  const embedForWant = ollamaName
+    ? async (t) => {
+        try {
+          const r = await fetch(`${ollamaBase}/api/embed`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: ollamaName, input: [t], keep_alive: OLLAMA_KEEP_ALIVE }), // S1-F4 家族(2026-11-13):原写死 '2h',调周期会漏这处——统一走 config 单源
+            signal: AbortSignal.timeout(120_000),
+          });
+          if (!r.ok) return null;
+          const j = await r.json();
+          const v = j.embeddings && j.embeddings[0];
+          return Array.isArray(v) && v.length ? v : null;
+        } catch { return null; }
+      }
+    : async (t) => (await import('./rangePick.mjs')).embedIntentResilient(t, want);
+  const embedForWantFinal = embedFn || embedForWant; // 显式注入(测试密闭)优先
   for (const e of ex.exemplars) {
+    if (!e || !e.prompt) continue;
+    const key = vectorKeyOf(e.prompt, want);
+    if (seen.has(key)) continue; // 同内容去重(跨来源同 prompt 只留一条)
+    seen.add(key);
+    const meta = { label: e.label, rule: e.labelRule || '', pkey: e.pkey || promptKey(e.prompt) };
+    const b = baseOk && baseOk.vectors[key] ? baseOk.vectors[key] : null;
+    if (b && entryVector(b)) {
+      reusedBase += 1;
+      if (auth === 'local' && (b.label !== meta.label || b.rule !== meta.rule || b.pkey !== meta.pkey)) overrides[key] = meta;
+      continue; // 向量留在 base,本地不重复存
+    }
+    const old = oldOk && oldOk.vectors[key] ? oldOk.vectors[key] : null;
+    const oldV = entryVector(old);
+    if (oldV) { put(key, meta, oldV); reusedLocal += 1; continue; }
     try {
-      const v = await embedFn(e.prompt);
-      if (Array.isArray(v) && v.length) { vectors[e.id] = { label: e.label, rule: e.labelRule || '', v }; ok += 1; continue; }
+      const v = await embedForWantFinal(e.prompt);
+      if (Array.isArray(v) && v.length) { put(key, meta, v); embedded += 1; continue; }
     } catch (err) { if (failFast) throw err; }
     fail += 1;
   }
-  const doc = { version: 1, builtAt: new Date().toISOString(), dim: ok ? vectors[Object.keys(vectors)[0]].v.length : 0, ok, fail, vectors };
-  const out = path.join(dataDir, 'routing', 'exemplars-vectors.json');
+  // 守卫:base 一条都没有、local 也零产出 ⇒ 拒绝覆盖(沿用 2026-11-09 空库守卫)
+  if (!reusedBase && !Object.keys(vectors).length) throw new Error(`buildVectors 全部失败(embedded=0/fail=${fail}),拒绝覆盖现有向量库`);
+  if (!dim) {
+    const anyOld = baseOk && Object.values(baseOk.vectors).map(entryVector).find(Boolean);
+    dim = (anyOld && anyOld.length) || (localOld && localOld.dim) || 0;
+  }
+  const doc = {
+    version: 1, builtAt: new Date().toISOString(), model: want, dim,
+    vecEncoding: 'f32b64', // 向量条目格式:`v_b64`=base64 Float32LE;加载端兼容旧 `v` 明文数组
+    embedded, reusedBase, reusedLocal, fail, ok: Object.keys(vectors).length,
+    authority: auth, vectors, overrides,
+  };
+  const out = paths.local.slugFile; // 只写当前模型 slug 的 local 层;base 与旧固定名永不写
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, JSON.stringify(doc));
-  return { ok, fail, out, dim: doc.dim };
+  atomicWriteFileSync(out, JSON.stringify(doc));
+  return { ok: doc.ok, embedded, reusedBase, reusedLocal, fail, out, dim, model: want, authority: auth, slug: paths.slug };
 }
 
-export function loadVectors(dataDir = DATA_DIR) {
-  const d = readJson(path.join(dataDir, 'routing', 'exemplars-vectors.json'));
-  if (!d || !d.vectors) return null;
-  return d;
+/** 向量库与当前嵌入模型是否同源(2026-11-08 修):旧档无 model 字段=不匹配(宁可弃权不出错票)。 */
+export function vectorsMatchModel(vectorsDoc) {
+  if (!vectorsDoc?.vectors) return false;
+  return vectorsDoc.model === currentEmbedModel();
+}
+
+/**
+ * 加载并合并 base + local(2026-11-10):
+ *   - 两层各自校验 model 指纹(与当前嵌入模型不同源则该层不参与);
+ *   - 同 key 时 local 向量优先(内容相同,值应一致,仅防异常);标签按 authority:
+ *     'local' 用 local.overrides 覆盖 base,否则保留 base(服务器清洗权威);
+ *   - 迁移:无 local 文件时把旧单文件 exemplars-vectors.json 当 local 层读。
+ */
+export function loadVectors(dataDir = DATA_DIR, { model = null } = {}) {
+  const paths = vectorsLayerPaths(dataDir, model);
+  // 加载缓存(2026-11-10):按文件 mtime+size 判失效,避免每轮判定重复 parse+base64 解码。
+  const statKey = (f) => { try { const st = fs.statSync(f); return `${st.mtimeMs}:${st.size}`; } catch { return '0:0'; } };
+  const cacheKey = `${dataDir}|${paths.slug}|${[paths.base.slugFile, paths.base.fixedFile, paths.local.slugFile, paths.local.fixedFile, paths.local.legacyFile].map(statKey).join(',')}`;
+  if (_vectorsCache.key === cacheKey) return _vectorsCache.data;
+  const base = decodeLayer(readFirstExisting([paths.base.slugFile, paths.base.fixedFile]));
+  const local = decodeLayer(readFirstExisting([paths.local.slugFile, paths.local.fixedFile]));
+  const legacy = local ? null : decodeLayer(readLayerPath(paths.local.legacyFile));
+  const want = model || currentEmbedModel();
+  const baseOk = base && base.model === want ? base : null;
+  const localDoc = local || legacy;
+  const localOk = localDoc && localDoc.model === want ? localDoc : null;
+  if (!baseOk && !localOk) {
+    const raw = localDoc || base || legacy || null;
+    _vectorsCache = { key: cacheKey, data: raw };
+    return raw; // 交给 vectorsMatchModel 统一拒绝
+  }
+  const cfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
+  const authority = localOk && localOk.authority ? localOk.authority : (cfg.authority || 'local');
+  const vectors = { ...(baseOk ? baseOk.vectors : {}), ...(localOk ? localOk.vectors : {}) };
+  if (authority === 'local' && localOk && localOk.overrides) {
+    for (const [k, meta] of Object.entries(localOk.overrides)) {
+      if (vectors[k]) vectors[k] = { ...vectors[k], ...meta };
+    }
+  }
+  const dim = (localOk && localOk.dim) || (baseOk && baseOk.dim) || 0;
+  const data = {
+    version: 1,
+    builtAt: (localOk && localOk.builtAt) || (baseOk && baseOk.builtAt) || null,
+    model: (localOk || baseOk).model, dim,
+    ok: Object.keys(vectors).length, fail: (localOk && localOk.fail) || 0,
+    vectors,
+    layers: { base: !!baseOk, local: !!localOk, legacy: !local && !!legacy },
+  };
+  _vectorsCache = { key: cacheKey, data };
+  return data;
 }
 
 /** cosine kNN 加权投票:sim≥minSim 的 top-k 邻居按相似度加权,输出 type+confidence。
  *  自证降权(2026-11-04 用户定档):rule 含 l2 的近邻=其标签曾有 L2 票参与签出,相似度按
  *  taintFactor(默认 0.5)折算后再进标签权重/置信/top-k 排序——阻断"L2 签出的标教 L2"循环;
- *  旧向量文件无 rule 字段按未污染算,下次重建向量后自动生效。 */
-export function knnClassify(vector, vectorsDoc, { k = 5, minSim = L2_MIN_SIM, taintFactor = 0.5 } = {}) {
+ *  旧向量文件无 rule 字段按未污染算,下次重建向量后自动生效。
+ *  excludePkey / excludePkeys(2026-11-10):按 promptKey 排除指定条目,用于 LOO 评估
+ *  (参照集与黄金集同源,不排除自身会让指标虚高);向量条目自 2026-11-10 起带 pkey 字段。 */
+export function knnClassify(vector, vectorsDoc, { k = 5, minSim = L2_MIN_SIM, taintFactor = 0.5, excludePkey = null, excludePkeys = null } = {}) {
   if (!vector || !vectorsDoc?.vectors) return null;
+  // LOO(2026-11-10):按 pkey 排除"查询自身"的参照条目。签入行会回流样本库,
+  // 同一 prompt 的自邻居 cosine≈1,不排除会让 KNN 评测虚高(taintFactor 只降权不剔除)。
+  // 旧向量文件无 pkey 字段 ⇒ 无法排除(重建向量后自动生效),向后兼容。
+  const exSet = excludePkeys instanceof Set ? excludePkeys : (excludePkey ? new Set([String(excludePkey)]) : null);
   const sims = Object.entries(vectorsDoc.vectors)
+    .filter(([, e]) => { if (!exSet) return true; const pk = e && e.pkey; return !(pk && exSet.has(String(pk))); })
     .map(([id, e]) => {
       const sim = cosine(vector, e.v);
       const tainted = !!(e.rule && /l2/i.test(String(e.rule)));
@@ -187,7 +363,7 @@ export function tierOfModel(modelId, { modelTiers = DEFAULT_MODEL_TIERS, lightSu
 }
 
 // ---------- 品牌优先序(2026-11-03 用户需求:config 定义品牌调用顺序,只排"档内谁先被调",不改档位归属) ----------
-export const DEFAULT_BRAND_PRIORITY = ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini'];
+export const DEFAULT_BRAND_PRIORITY = ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'];
 // 品牌别名收敛:公司名/历史名 → 用户优先序里的规范品牌名(与 PREMIUM_BRAND_RE 同义)
 const BRAND_ALIAS = { moonshot: 'kimi', openai: 'gpt', chatgpt: 'gpt', anthropic: 'claude', xai: 'grok' };
 const BRAND_TOKENS = ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini', 'moonshot', 'openai', 'chatgpt', 'anthropic', 'xai'];
@@ -262,14 +438,16 @@ export async function classifyRoute(prompt, { dataDir = DATA_DIR, cfg = null, em
   const l2c = resolveL2Config(mr);
   const minSim = l2c.voteMinSim;
   const minConf = l2c.voteMinConf;
-  // 无 embedFn(影子 CLI)时跳过 3MB 向量表加载——L2 本就需要嵌入,不白读
-  const l2v = vectorsDoc || (embedFn ? loadVectors(dataDir) : null);
+  // 无 embedFn(影子 CLI)时跳过 3MB 向量表加载——L2 本就需要嵌入,不白读。
+  // vectorsDoc 显式注入(密闭测试/调用方自带)豁免指纹校验;仅磁盘库(loadVectors)按指纹把关。
+  const loaded = vectorsDoc || (embedFn ? loadVectors(dataDir) : null);
+  const l2v = (vectorsDoc || vectorsMatchModel(loaded)) ? loaded : null;
   if (l2v && embedFn) {
     try {
       const v = await embedFn(prompt);
       const l2 = knnClassify(v, l2v, { minSim });
       if (l2 && l2.confidence >= minConf) return l2;
-    } catch { /* L2 失败落 none */ }
+      } catch { /* L2 失败落 none */ }
   }
   return { source: 'none', type: l1?.type ?? null, confidence: l1?.confidence ?? 0 };
 }
@@ -279,25 +457,35 @@ export async function classifyRoute(prompt, { dataDir = DATA_DIR, cfg = null, em
  * 投 **multi**(样本库 120/类,含代签回流),把 R1 定档救回 R2——只救回不压制:
  *   ① 只在词法判 R1(不是 P2 上梯/降档/sticky 轮)时介入;② 只升到 R2(multi→R2 的设计映射),不碰 R3+;
  *   ③ 与 L1 相左时 L1 强信号(≥0.7)优先,kNN 只兜"词法拿不准"的轮——与代签"决策票只许救回"同哲学。
+ * v2 R3 救援(2026-11-08 重建裁定):词法判 R2 且 kNN 以更高置信(r3MinConf)投 **R3** ⇒ 救回 R3。
+ *   向量库当前无 R3 类嵌入(精确真值样本=上梯后干净完成,由 tier-evidence 积累,每类 ≥8 条后由向量构建方
+ *   补嵌)⇒ 样本不足时 kNN 投不出 R3,该分支自然不触发(fail-open,零影响);routine/light 票仍无救回意义。
  * 纯函数可测;代理侧由 modelRouting.l2Live.enabled(默认关)门控 + fail-open,向量库/embedFn 缺失=零影响。
  * 返回 {tier, confidence, rule} 或 null(不介入)。
  */
-export function l2TierRescue(diff, l2, { minConf = 0.8 } = {}) {
+export function l2TierRescue(diff, l2, { minConf = 0.8, r3MinConf = 0.85 } = {}) {
   try {
     if (!diff || !l2) return null;
-    if (diff.tier !== 'R1') return null; // 只救 R1 误判;R2+ 不加码
+    if (diff.tier !== 'R1' && diff.tier !== 'R2') return null; // 只救 R1/R2 误判;R3+ 不加码
     const t = normalizeType(l2.type);
-    if (t !== 'multi') return null; // 只认 multi;light/routine 本就该在 R1,无救回意义
     if (!(Number(l2.confidence) >= minConf)) return null; // 高门槛:kNN 置信须过 minConf(默认 0.8)
-    return { tier: 'R2', confidence: Number(l2.confidence), rule: `l2-rescue(${t}@${l2.confidence})` };
+    if (diff.tier === 'R1' && t === 'multi') {
+      return { tier: 'R2', confidence: Number(l2.confidence), rule: `l2-rescue(${t}@${l2.confidence})` };
+    }
+    // v2:R1 误判只认 multi(light/routine 本就该在 R1);R2 误判只认 R3(需过 r3MinConf 更硬门槛)
+    if (diff.tier === 'R2' && t === 'R3' && Number(l2.confidence) >= (Number.isFinite(Number(r3MinConf)) ? Number(r3MinConf) : 0.85)) {
+      return { tier: 'R3', confidence: Number(l2.confidence), rule: `l2-rescue(${t}@${l2.confidence})` };
+    }
+    return null;
   } catch { return null; }
 }
 
 /** 影子结果落 shadow 日志(与 L1 的 routing-log 分开,口径不同)。 */export function logShadow({ dataDir = DATA_DIR, prompt = '', result = null } = {}) {
   try {
     const rec = { ts: Date.now(), promptHead: String(prompt || '').slice(0, 200), source: result?.source ?? 'none', type: result?.type ?? null, confidence: result?.confidence ?? 0 };
-    fs.mkdirSync(path.dirname(SHADOW_LOG), { recursive: true });
-    fs.appendFileSync(SHADOW_LOG, JSON.stringify(rec) + '\n');
+    const file = path.join(dataDir, 'usage', 'routing-shadow.jsonl'); // 与 logTierShadow 同文件同口径(按注入 dataDir 算,可测;2026-11-10 审计 P0 修复)
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, JSON.stringify(rec) + '\n');
     return true;
   } catch { return false; }
 }
@@ -309,11 +497,14 @@ export function l2TierRescue(diff, l2, { minConf = 0.8 } = {}) {
  * 自进化证据回流(2026-11-04):新增 pkey/decisionTier/escalated/switched/servedTier/ambWouldTier——
  *   escalated(本轮 P2 上梯)+ servedTier(实弹服务档)是黄金集行为真值唯一可达的 R2/R3 硬证据;
  *   ambWouldTier = 歧义轮(置信≤0.5 的 R1)"改判 R2"的裸解析结果(影子 A/B 观察,不改实弹)。
+ * v2 上梯事件行(2026-11-08 重建):P2 上梯只发生在工具轮,代理侧在工具轮补写本行(tier=null 无定档,
+ *   escalated=true + escalationFrom/To),tierReason 前缀 'p2-escalation:' 可与人类轮定档行区分——
+ *   修"影子 escalated 通道事实性失效"(此前全史仅 1 行)。
  */
-export function logTierShadow({ dataDir = DATA_DIR, prompt = '', tier = null, tierConfidence = 0, tierReason = '', wouldTier = null, wouldModel = null, wouldProvider = null, downgraded = false, servedModel = null, decisionTier = null, escalated = false, switched = null, servedTier = null, ambWouldTier = null, ambWouldModel = null, host = null } = {}) {
+export function logTierShadow({ dataDir = DATA_DIR, prompt = '', tier = null, tierConfidence = 0, tierReason = '', wouldTier = null, wouldModel = null, wouldProvider = null, downgraded = false, servedModel = null, decisionTier = null, escalated = false, switched = null, servedTier = null, ambWouldTier = null, ambWouldModel = null, escalationFrom = null, escalationTo = null, host = null } = {}) {
   try {
     const head = String(prompt || '').slice(0, 200);
-    const rec = { ts: Date.now(), pkey: promptKey(head), promptHead: head, source: 'tier', tier, confidence: tierConfidence, tierReason, wouldTier, wouldModel, wouldProvider, downgraded, servedModel, decisionTier, escalated, switched, servedTier, ambWouldTier, ambWouldModel, host };
+    const rec = { ts: Date.now(), pkey: promptKey(head), promptHead: head, source: 'tier', tier, confidence: tierConfidence, tierReason, wouldTier, wouldModel, wouldProvider, downgraded, servedModel, decisionTier, escalated, switched, servedTier, ambWouldTier, ambWouldModel, escalationFrom, escalationTo, host };
     const file = path.join(dataDir, 'usage', 'routing-shadow.jsonl');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, JSON.stringify(rec) + '\n');
@@ -349,7 +540,7 @@ export function markHealth({ dataDir = DATA_DIR, modelKey, reason = '', ttlMs = 
     const base = until == null ? ttlMs : Math.max(0, until - now);
     const effTtl = until != null || capMs == null ? base : Math.min(base * 2 ** (failCount - 1), capMs);
     h.models[modelKey] = { cooldownUntil: now + effTtl, reason, failCount };
-    fs.writeFileSync(path.join(dataDir, 'model-health.json'), JSON.stringify(h, null, 2) + '\n');
+    atomicWriteFileSync(path.join(dataDir, 'model-health.json'), JSON.stringify(h, null, 2) + '\n');
     return true;
   } catch { return false; }
 }
@@ -360,7 +551,7 @@ export function clearHealth({ dataDir = DATA_DIR, modelKey } = {}) {
     // 无记录不写盘:成功清零在每请求热路径上调用,健康表通常为空,避免每请求一次磁盘写
     if (!h.models || !(modelKey in h.models)) return true;
     delete h.models[modelKey];
-    fs.writeFileSync(path.join(dataDir, 'model-health.json'), JSON.stringify(h, null, 2) + '\n');
+    atomicWriteFileSync(path.join(dataDir, 'model-health.json'), JSON.stringify(h, null, 2) + '\n');
     return true;
   } catch { return false; }
 }
@@ -894,9 +1085,29 @@ async function cli(argv) {
   const val = (f, def) => (argv.includes(f) ? argv[argv.indexOf(f) + 1] : def);
   const dataDir = val('--data-dir', DATA_DIR);
   if (has('--build-vectors')) {
-    const { embedIntent } = await import('./rangePick.mjs');
-    const r = await buildVectors({ dataDir, embedFn: (t) => embedIntent(t) });
-    console.log(JSON.stringify(r));
+    // 串行守卫(2026-11-10):与 embed.mjs(代码向量)共用 data/.embed.pid 锁——两者都打 ollama,
+    // 并发会互相把对方请求挤到超时(实测 embed 608/1643 崩溃即此因)。
+    const embedPid = path.join(dataDir, '.embed.pid');
+    if (!procTakeJsonLock(embedPid)) {
+      console.error('[err] 代码向量重嵌(embed.mjs)正在运行;为避免争抢 ollama,本次向量构建取消,稍后重试');
+      process.exit(1);
+    }
+    // 2026-11-10 根治:①常驻不可用时走进程内兜底嵌入(rangePick.embedIntentResilient),不再 ok=0 直接失败;
+    // ②结果由**子进程自己**落 build-vectors.log —— 父进程(prompt-guard --check)可能先退出,
+    //   旧的 child.on('exit') 留痕会永远不执行,失败被静默。
+    const logPath = path.join(dataDir, 'routing', 'build-vectors.log');
+    const logLine = (obj) => { try { fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.appendFileSync(logPath, JSON.stringify(obj) + '\n'); } catch { /* 日志失败不影响主流程 */ } };
+    try {
+      const { embedIntentResilient } = await import('./rangePick.mjs');
+      const r = await buildVectors({ dataDir, embedFn: (t) => embedIntentResilient(t) });
+      logLine({ at: new Date().toISOString(), source: 'child', ok: true, okCount: r.ok, fail: r.fail, dim: r.dim, model: r.model });
+      console.log(JSON.stringify(r));
+    } catch (e) {
+      logLine({ at: new Date().toISOString(), source: 'child', ok: false, error: String(e && e.message ? e.message : e) });
+      throw e;
+    } finally {
+      procReleaseJsonLock(embedPid);
+    }
     return;
   }
   if (has('--shadow-async')) {

@@ -1,8 +1,9 @@
 /**
  * 配置加载器。⚠️ 没有统一优先级链,不同键走不同的层:
- *   模型部署(models / ollamaBase / gpu / rerankBlend):只认本文件。不读环境变量,也不读 data/code-index.config.json。
- *     改完随 git 可见,协作排查时打开本文件即可。单次命令仍可用 CLI(--rr-model)。嵌入模型名与 ollamaBase 不接受命令行覆盖。
- *   modelIn:init.mjs --model-in > code-index.config.json > 内置默认 local
+ *   模型部署(models / ollamaBase / gpu):只认本文件。不读环境变量,也不读 data/code-index.config.json。
+ *   改完随 git 可见,协作排查时打开本文件即可。单次命令仍可用 CLI(--rr-model)。嵌入模型名与 ollamaBase 不接受命令行覆盖。
+ *   rerankBlend(精排混排权重,默认 0.275):data/code-index.config.json 顶层键可覆盖(loadConfig 的展开层直接接住;
+ *     night 点扫"blend 无配置通道"即此通道,2026-11-10 夜审 S8-F1 起此为准)。modelIn:init.mjs --model-in > code-index.config.json > 内置默认 local
  *   roots:init --roots 与已有合并(纳入);无参数重跑只读本文件并自愈。运行时 env(CODE_INDEX_ROOTS) 仍可临时盖掉。内置默认空。
  *   skipDirs/exts/chunk/staleNonGitMs/readMaxLines:code-index.config.json > 内置默认(无 env/CLI)
  *   knownAnnotations(2026-11-07 拆出):**独立文件 data/known-annotations.json**(不再存 config),
@@ -96,6 +97,9 @@ export function loadKnownAnnotations(file = KNOWN_ANNOTATIONS_PATH) {
  */
 export const OLLAMA_KEEP_ALIVE = '2h';
 export const OLLAMA_NUM_CTX = 4096;
+/** ollama 批量嵌入批间节流(毫秒,2026-11-11 WHEA 缓解):批与批之间给显存/供电留喘息,0=不限流。
+ *  5 次 MCE 全在加载 ramp(曲线平稳猝死),节流不针对根因(嫌疑供电瞬态),是"稳优先于快"的降压垫;embed.mjs --pace 可单次覆盖。 */
+export const OLLAMA_EMBED_PACE_MS = 500;
 
 /** 读取目录的 git HEAD;非 git 仓库/命令失败返回 null(保鲜判定与构建记录共用) */
 export function gitHeadOf(dir) {
@@ -115,6 +119,15 @@ export const DEFAULT_CONFIG = {
   // Cursor 全量 Read 行数上限。超过 ×1.25 由 preToolUse 拦截;带 offset/limit 的区间读不受限。
   readMaxLines: 500,
   chunk: { targetLines: 70, maxLines: 120, overlapLines: 10, minTail: 15 },
+  // L2 样本库配额(2026-11-10 配置化,原 120 硬编码在 autoExemplars/buildExemplars):
+  //   capPerLabel=单类硬上限(防单一类别垄断近邻票);dynamicQuota=true 时实际配额按各类供给的
+  //   sqrt 平滑分摊 totalCap 总预算,cap 只在某类占比过高时兜底(默认 200 ≈ 总预算一半);
+  //   totalCap=全库总预算(控 kNN 全库扫描/构建成本与内存);
+  //   dynamicQuota=false 退回旧行为(每类 cap、无全局预算分配)。
+  //   authority=同名内容键的标签权威层:'local'(默认,= 项目当前四票自签模式)用本地标签覆盖服务器;
+  //     'base' 保留服务器清洗结果(本地只补向量、不改标签)。
+  // data/code-index.config.json 的 exemplars 段可覆盖(深合并)。
+  exemplars: { capPerLabel: 200, totalCap: 400, dynamicQuota: true, authority: 'local' },
   // 非 git root 的保鲜回退阈值(git root 走 HEAD 比对,不用时间)
   staleNonGitMs: 24 * 60 * 60 * 1000,
   // 模型部署只写在本文件(入库)。不读 OLLAMA_EMBEDDING / OLLAMA_RERANKER / OLLAMA_BASE / OLLAMA_FORCE_*。
@@ -130,6 +143,12 @@ export const DEFAULT_CONFIG = {
     reranker: 'sam860/qwen3-reranker:0.6b-F16',
     localEmbedding: 'Xenova/jina-embeddings-v2-base-zh',
     localReranker: 'Xenova/bge-reranker-base',
+    // 本地决策模型双轨定档(2026-11-09):decision=ollama 路径(tev1:0.8b,systemone 协议),
+    // localDecision=纯 Node 常驻路径(Strands-Decider-2B ONNX q4f16 指针头,1.04GB;同批 60 条对照 73.3% vs q8 70.0% 且快 2.1 倍,实测取代 q8)。
+    // strands: 前缀指 code-index/hf-cache/<目录>;分词 offsets 走官方 tokenizers Rust binding(零 Python 运行时)。
+    // 旧 Decision-2.0-Eos 已废(16.9% 类别崩塌);远程 systemone 端点代码保留,仅显式注入 providers/fetchFn 时可用。
+    decision: 'tev1:0.8b',
+    localDecision: 'strands:strands-decider-2B-hobson-v19:q4f16',
   },
   modelIn: 'local', // ollama | local。data JSON 可覆盖;缺省或非法值按 local。
   ollamaBase: 'http://localhost:11434',
@@ -137,9 +156,11 @@ export const DEFAULT_CONFIG = {
   // 多模型路由门控(model-routing.md #11):默认全关。enabled=true 后 prompt-guard 才跑 L1 分类+路由日志;
   // 二次人工配置:改 data/code-index.config.json 的 modelRouting 段(2026-11-03 起 role 两档制已废:routeMode/roles/chains
   // 均不再被读取,四档链恒由快照派生;providerPriority/brandPriority 仍生效)。
-  // l2Shadow=true 才让影子级联加载嵌入模型(L2 kNN 通电);默认关——每轮影子起子进程加载模型会与主会话争资源。
-  // l2Live(2026-11-06 进化回路接通):{enabled=false, minConf=0.8}——代理实弹的 L2 融合票(词法判 R1 但 kNN 投 multi
-  //   且置信≥minConf ⇒ 救回 R2,只救回不压制),依赖嵌入模型与向量库,默认关;开了 l2Shadow 嵌入器才可用,两者需同开。
+  // l2(2026-11-07 收口为嵌套键;旧顶层 l2Shadow/l2Live/旧 l2.minSim 兼容读一个版本期,读法统一在 modelRoute.mjs mrL2Options):
+  //   {shadow=false 嵌入器总闸——L2 kNN/影子级联要 true 才加载嵌入模型(影子起子进程会与主会话争资源,默认关);
+  //    vote:{minSim 0.55, minConf 0.6} 代签投票阈值;
+  //    live:{enabled=false, minConf=0.3} 代理实弹 L2 融合票(词法判 R1 但 kNN 投 multi 且置信≥minConf ⇒ 救回 R2,
+  //    只救回不压制),依赖嵌入模型与向量库;shadow 关则两条支路都拿不到嵌入器。
   //   minConf 2026-11-06 实测定档 0.3(=旧口径 0.75 的同分位操作点;置信口径换边际差值后旧 0.6-0.8 几乎不触发)。
   // brandPriority(2026-11-03 用户需求):自定义品牌调用顺序,只决定"同一档位内谁先被调"(四档链档内排序主键),
   //   **不影响档位归属**(tierOfModel/classifyDifficulty/resolveTier 级联照旧)——即"不影响动态模型路由的调用档位"。
@@ -152,16 +173,13 @@ export const DEFAULT_CONFIG = {
   //   而是同轮冷却失败模型→重跑 resolveTier(档内滑下一个 / R4→R3→R2→R1 降档)→换模型重发;maxRetries=同轮最多重发次数
   //   (默认 2,硬上限 5)。只在 tier 模式且能重解析出新模型时才真的重发,否则等价旧的单次透传;设 false 整体关闭回到旧行为。
   // providerPriority(2026-11-03 恢复):同名模型挂多供应商(多 Token Plan)时的同名取序,空=按快照键序。
-  // decisionModel(2026-11-03 用户定档:三投票+一加权):决策模型(网关判定 API)开关,默认 false——
-  //   生效时按置信加权参与代签计票(可影响结果),断网/失败自动跳闸零网关重试
-  //   (恢复=人工 --probe 探活,或下次会话开始自动探活成功,2026-11-03);
-  //   独立复核 CLI(node decisionModel.mjs --review-golden)同样受此开关与断路器约束。
-  //   model(2026-11-03):判定模型名,空=内置 decision-model-preview;providers(2026-11-03):
-  //   [{baseUrl,apiKey,path?}] 显式供应商与 key(path=专属端点路径,空=内置 /compatible-mode/v1/systemone),
-  //   配了就只走这些;空数组/全空模板条目(占位示例)/未配=自动收集客户端带 key 的供应商(排除本地代理);
-  //   填了一半=配置错误会显式报错。换判定模型/换网关改 data/code-index.config.json 即可。
-  //   chunkSize(2026-11-03 实测定档):判定分片 1..16,默认 1——16 题批量稀释置信(97% 弃权),
-  //   1 题/请求覆盖与一致率最佳(74%);要省请求数可按量调大。
+  // decisionModel(v4 2026-11-09 本地化收口):决策票恒本地判定(modelIn=ollama 打 models.decision
+  //   tev1:0.8b / modelIn=local 打常驻 models.localDecision Strands q4f16),零远程调用、零 key 依赖;
+  //   旧键 model/providers/chunkSize/rRef 已废弃不读——实弹定档 arm1/arm2 参数与代签门槛全部走
+  //   模型判定档案(resolveDecisionProfile:默认表 tev1 0.4/strands 0.4+FALLBACK,data JSON
+  //   modelRouting.decisionModel.profiles 可覆盖)。四票合议口径见 autoLabel.mjs 头注;
+  //   失败自动跳闸(断路器),恢复=人工 --probe 探活或下次会话启动自动探活;
+  //   独立复核 CLI(node decisionModel.mjs --review-golden)只出报告不改量尺。
   // maxPhaseTurns(2026-11-04 自 switchGuard 迁出):升档阶段最多持续的人类轮数,到顶回主循环;
   //   恒生效、不受 switchGuard.enabled 控制(旧位置 switchGuard.maxPhaseTurns 仍兼容读取)。
   // switchGuard(切换税门控,2026-11-05 用户定档:默认开启):enabled=true 时极厚上下文(估算 tokens 超阈值)不升档,
@@ -175,10 +193,10 @@ export const DEFAULT_CONFIG = {
   //   minIntervalMs=节流间隔(默认 6h);folds/minN/priorN=折数/最小支持/平滑先验,量尺小时加大 priorN 更保守;
   //   grow=false 只评不扩样;fitCost=true 从 proxy-usage.jsonl 反标定冷热轮实测值(默认用人工画像);
   //   dry=true 只出报告不落档案;allowBoost=false 学到的高纯度信号也只降不升(升档代价 8 倍,升权是加杠杆)。
-  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }], chunkSize: 1 }, brandPriority: ['glm', 'minimax', 'deepseek', 'qwen', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: 4, switchGuard: { enabled: true, maxContextTokens: 200000 }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
+  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }] }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: 4, switchGuard: { enabled: true, maxContextTokens: 200000 }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
 };
 
-export function loadConfig() {
+export function loadConfig({ soft = false } = {}) {
   let fileCfg = {};
   if (fs.existsSync(CONFIG_PATH)) {
     try {
@@ -186,6 +204,7 @@ export function loadConfig() {
     } catch (e) {
       // 显式失败而非静默回退:config 含 roots/models/注解库,坏 JSON 会让 roots 丢失、行为回默认,必须让人看到
       console.error(`[err] ${CONFIG_PATH} 解析失败(${e.message})——请修复 JSON 后重试;拒绝以默认值静默运行`);
+      if (soft) return { ...DEFAULT_CONFIG, _configError: e.message }; // 热路径(判定层)soft 模式:带回错误让调用方 fail-open(夜审 S12-C13)
       process.exit(1);
     }
   }
@@ -193,6 +212,7 @@ export function loadConfig() {
     ...DEFAULT_CONFIG,
     ...fileCfg,
     chunk: { ...DEFAULT_CONFIG.chunk, ...(fileCfg.chunk || {}) },
+    exemplars: { ...DEFAULT_CONFIG.exemplars, ...(fileCfg.exemplars || {}) },
     // 模型部署以本文件为准,盖掉 data JSON 里的同名键(该 JSON 不入库,协作时看不见)
     models: { ...DEFAULT_CONFIG.models },
     ollamaBase: DEFAULT_CONFIG.ollamaBase,
@@ -211,3 +231,11 @@ export function loadConfig() {
   }
   return cfg;
 }
+
+/** 决策模型路由面判定(2026-11-08 用户定档)。providers 全空模板条目/缺键均不算远程。
+ *  - decisionActive=判定总闸:v4(2026-11-09)远程链删后恒 true——本地判定恒启用,断路器另有挡闸
+ *  - decisionLocalWanted=本次是否要加载/预热/自愈本地决策模型:恒 true(唯一判定路径)
+ *  arm1/arm2 的 live/rescue 闸走模型判定档案(resolveDecisionProfile),不再读 enabled */
+export function decisionRemoteConfigured(cfg = null) { return false; } // v4 兼容桩:远程已删,恒 false(仅防旧调用方炸)
+export function decisionActive(cfg = null) { return true; }
+export function decisionLocalWanted(cfg = null) { return true; }

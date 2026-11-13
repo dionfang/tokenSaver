@@ -15,7 +15,9 @@ import { spawnLogged } from './proc.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const autoAbs = path.resolve(here, 'auto.mjs');
 
-const COMMIT_RE = /(^|\s|["'])git(\.exe)?\s+(-[^-]+\s+)*commit\b/;
+// 带值旗标(如 -C <dir> / -c key=val)也放行(2026-11-10 二次审计 P2-26):旧式 (-[^-]+\s+)*
+// 遇 `git -C my-dir commit`(目录名含 dash,本仓路径即如此)匹配失败 → 保鲜钩子漏触发。
+const COMMIT_RE = /(^|\s|["'])git(\.exe)?\s+((-[^\s]+)\s+\S+\s+)*commit\b/;
 
 /** 解析钩子 stdin。不是 git commit 返回 false,不启动 auto。 */
 export function runCommitRefresh(raw) {

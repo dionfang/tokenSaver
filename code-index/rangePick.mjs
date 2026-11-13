@@ -7,10 +7,11 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { DATA_DIR, OLLAMA_KEEP_ALIVE } from './config.mjs';
+import { DATA_DIR, OLLAMA_KEEP_ALIVE, HF_CACHE_DIR, loadConfig } from './config.mjs';
 import { activeBackend, vectorPaths, readVectorMeta } from './vectorStore.mjs';
 import { resolveBase, gpuOptions } from './ollamaGuard.mjs';
 import { residentEmbed, residentScorePairs } from './localResident.mjs';
+import { embedBusy } from './embedGate.mjs';
 
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
 const INTENT_DIR = path.join(DATA_DIR, 'read-guard');
@@ -84,6 +85,8 @@ export async function embedIntent(text) {
   const q = String(text || '').slice(0, 1000);
   if (!q.trim()) return null;
   const backend = activeBackend();
+  // 批量嵌入让行(2026-11-10):ollama 单队列,重嵌期间意图嵌入直接弃权(调用方沿用词法/余弦降级)
+  if (backend === 'ollama' && embedBusy()) return null;
   try {
     if (backend === 'local') {
       const hosted = await residentEmbed([q]);
@@ -108,10 +111,44 @@ export async function embedIntent(text) {
   } catch { return null; }
 }
 
+/** 向量重建专用嵌入(2026-11-10):常驻可用 → 走常驻;**不可用 → 进程内兜底**——
+ *  兜底模型是本地 jina,**仅当目标模型就是本地 jina 时才允许**(wantModel 校验):
+ *  否则会在"目标=ollama、常驻挂了"时产出 jina 向量冒充 ollama 库(实测 228 条 768 维污染事件)。
+ *  与 embed.mjs 的 local 后端同参(dtype q8 / pooling mean / normalize / HF 缓存 + 镜像回退)。
+ *  热路径 embedIntent 不加兜底——否则每轮 prompt 在常驻重启窗口都会白加载一次模型。 */
+let _directPipe = null;
+export async function embedIntentResilient(text, wantModel = null) {
+  const hosted = await embedIntent(text);
+  if (hosted) return hosted;
+  const q = String(text || '').slice(0, 1000);
+  if (!q.trim()) return null;
+  const cfgL = (() => { try { return loadConfig(); } catch { return null; } })();
+  const localModel = cfgL ? `local/${cfgL.models.localEmbedding}` : null;
+  if (wantModel && localModel && wantModel !== localModel) return null; // 模型守卫:目标不是本地 jina → 拒绝兜底
+  try {
+    if (!_directPipe) {
+      const { env, pipeline } = await import('@huggingface/transformers');
+      env.cacheDir = HF_CACHE_DIR;
+      env.allowLocalModels = false;
+      const modelId = cfgL ? cfgL.models.localEmbedding : 'Xenova/jina-embeddings-v2-base-zh';
+      try { _directPipe = await pipeline('feature-extraction', modelId, { dtype: 'q8' }); }
+      catch {
+        env.remoteHost = 'https://hf-mirror.com';
+        _directPipe = await pipeline('feature-extraction', modelId, { dtype: 'q8' });
+      }
+    }
+    const out = await _directPipe([q], { pooling: 'mean', normalize: true });
+    const row = out.tolist()[0];
+    return Array.isArray(row) && row.length ? row : null;
+  } catch { return null; }
+}
+
 /** 精排:qwen3-reranker 对(意图,块正文)做 yes/no 判定,与 search.mjs 同款提示。
  *  返回与 docs 等长的分数数组;失败返回 null(调用方沿用余弦序)。 */
 export async function judgeIntentDocs(queryText, docs) {
   const backend = activeBackend();
+  // 批量嵌入让行(2026-11-10):ollama 精排也走同一队列,重嵌期间降级为余弦序
+  if (backend === 'ollama' && embedBusy()) return null;
   const judgePrompt = (q, doc) =>
     '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n' +
     `<|im_start|>user\n<Instruct>: Given a code search query, retrieve relevant code chunks from the codebase\n<Query>: ${q}\n<Document>: ${doc}<|im_end|>\n` +

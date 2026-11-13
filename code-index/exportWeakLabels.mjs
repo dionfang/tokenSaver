@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 
 const HOME = os.homedir();
 export const DEFAULT_DB = path.join(HOME, '.zcode', 'cli', 'db', 'db.sqlite');
@@ -42,6 +43,9 @@ export function labelTurn(prompt, total, we, rd, agent) {
   if (REVIEW_RE.test(p)) return ['routine', 0.85, 'review-signal'];
   if (TEST_RE.test(p) && we > 0) return ['routine', 0.8, 'test-prompt+writes'];
   if (we >= 3 || total >= 15) return ['multi', 0.85, 'heavy-writes'];
+  // routine 支加 total≥3 护栏是有意差异(2026-11-10 二次审计 P1-10.4):we 是从 prompt 文本
+  // 估的写数(有噪),无护栏会把噪声轮错标 routine;与行为计数域(tierTruth.labelFromCounts)
+  // 勿盲目合并,口径对照关系见 tierTruth 头注。
   if (we >= 1 && total >= 3) return ['routine', 0.8, 'light-writes'];
   if (we === 0 && PLAN_RE.test(p)) return ['multi', 0.7, 'plan-signal'];
   if (we === 0 && ERROR_RE.test(p)) return ['routine', 0.7, 'error-text'];
@@ -81,10 +85,11 @@ export function exportWeakLabels({ db: dbPath = DEFAULT_DB, out = DEFAULT_OUT, l
   let db;
   try { db = new DatabaseSync(dbPath, { readOnly: true }); }
   catch (e) { return { error: `db 打不开:${e.message}` }; }
-  const seenPrompt = new Map();
+  const best = new Map(); // 同 prompt 哈希 → 保留置信最高的一条(仅用于摘要与并集补写判定)
+  const oldPool = []; // 旧文件条目按原序暂存(E3 保护:db 清理后旧池条目要能原样回写)
   // 并集保护(2026-11-08):ZCode 会话库会被清理(旧 turn 从 db 消失),全量替换导出会让样本池缩水,
   // 连带 exemplars 重建截断(实弹:769→32 触发 332→26)。写前与既有 out 文件按同款 prompt 哈希并集:
-  // 旧条目保留,db 重导仅在置信更高时覆盖——池只增不缩;测试注入 out 亦可密闭。
+  // 旧条目保留,db 重导仅在置信更高时在摘要面覆盖;文件面保持 py 原语义(按序全量,含同话重复行)。
   try {
     for (const line of fs.readFileSync(out, 'utf8').split('\n')) {
       if (!line.trim()) continue;
@@ -92,12 +97,15 @@ export function exportWeakLabels({ db: dbPath = DEFAULT_DB, out = DEFAULT_OUT, l
         const o = JSON.parse(line);
         if (o && o.prompt) {
           const k = crypto.createHash('sha1').update(String(o.prompt).replace(/\s+/g, ' ').trim().toLowerCase(), 'utf8').digest('hex');
-          if (!seenPrompt.has(k)) seenPrompt.set(k, o);
+          if (!best.has(k)) best.set(k, o);
+          oldPool.push(o);
         }
       } catch { /* 坏行跳过 */ }
     }
   } catch { /* 首装无旧文件 */ }
   let n = 0;
+  const linesOut = [];
+  const dbKeys = new Set();
   try {
     const q = `
       SELECT tu.turn_id tid, tu.session_id sid, tu.tool_call_count tc,
@@ -107,10 +115,7 @@ export function exportWeakLabels({ db: dbPath = DEFAULT_DB, out = DEFAULT_OUT, l
       (limit > 0 ? ' LIMIT ?' : '');
     const stmt = db.prepare(q);
     const rows = limit > 0 ? stmt.all(limit) : stmt.all();
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    const f = fs.openSync(out, 'w');
-    try {
-      for (const r of rows) {
+    for (const r of rows) {
         const prompt = promptOfTurn(db, r.tid);
         if (!prompt || prompt.length < 4) continue;
         const tools = db.prepare('SELECT tool_name tn, status FROM tool_usage WHERE turn_id=?').all(r.tid);
@@ -121,23 +126,32 @@ export function exportWeakLabels({ db: dbPath = DEFAULT_DB, out = DEFAULT_OUT, l
         const [label, conf, rule] = labelTurn(prompt, total, we, rd, agent);
         const proj = path.basename(String(r.dir || '').replace(/[\\/]+$/, '')) || 'unknown';
         const key = crypto.createHash('sha1').update(prompt.replace(/\s+/g, ' ').trim().toLowerCase(), 'utf8').digest('hex');
-        const prev = seenPrompt.get(key);
-        if (prev && conf <= (Number(prev.confidence) || 0)) continue; // 同话重复 turn:保留标签置信更高的一条
+        const prev = best.get(key);
         const rec = {
           id: 'w-' + key.slice(0, 12), turnId: r.tid, project: proj,
           prompt: prompt.slice(0, 600), toolCalls: total, writeEdits: we, reads: rd,
           spawnedAgents: agent, label, confidence: conf,
           labelRule: rule, pool: 'weak-v1',
         };
-        seenPrompt.set(key, rec);
-        fs.writeSync(f, JSON.stringify(rec) + '\n');
+        // 文件面:每行都落(py 原语义,同话重复行保留,去重由消费方 buildExemplars 负责);
+        // 摘要面:同 key 只留置信最高的一条。
+        if (!prev || conf > (Number(prev.confidence) || 0)) best.set(key, rec);
+        dbKeys.add(key);
+        linesOut.push(JSON.stringify(rec));
         n += 1;
       }
-    } finally { fs.closeSync(f); }
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    // 并集池一次原子落盘(2026-11-10 审计修复 + 夜审 S5-F1 修复):本轮 db 行全文 + 旧文件里
+    // db 已不存在的条目原样追回——文件保持"按序全量"契约,同时 E3(db 清理后重导)池不缩。
+    for (const o of oldPool) {
+      const k = crypto.createHash('sha1').update(String(o.prompt).replace(/\s+/g, ' ').trim().toLowerCase(), 'utf8').digest('hex');
+      if (!dbKeys.has(k)) linesOut.push(JSON.stringify(o));
+    }
+    atomicWriteFileSync(out, linesOut.join('\n') + '\n');
   } finally { db.close(); }
   const labels = {};
   const projects = {};
-  for (const rec of seenPrompt.values()) {
+  for (const rec of best.values()) {
     labels[rec.label] = (labels[rec.label] || 0) + 1;
     projects[rec.project] = (projects[rec.project] || 0) + 1;
   }

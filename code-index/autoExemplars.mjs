@@ -19,13 +19,65 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR } from './config.mjs';
+import { DATA_DIR, decisionActive, loadConfig } from './config.mjs';
 import { isInquiryShape, normalizeType, classifyPrompt } from './classify.mjs';
 import { buildExemplars, loadPool, promptKey } from './buildExemplars.mjs';
+import { atomicWriteFileSync, takeJsonLock, releaseJsonLock } from './proc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = 'autoexemplars.json';
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// 阶段①(2026-11-10):争议池与标签 TTL
+const CONTESTED_FILE = 'contested-pool.jsonl';
+const LABEL_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 标签有效期 90 天(复核正常时每周期刷新 reviewedAt)
+const CONTESTED_CAP = 500;
+
+/** 标签 TTL 执行:autoSigned 行 reviewedAt 超期 → 摘签退池;缺失 reviewedAt(迁移期)盖戳保留。
+ *  独立于 grow 分支(2026-11-10):长期无新对齐数据时也要能摘掉过期标签。返回 {stamped,demoted,entries}。 */
+function enforceLabelTtl(dataDir, now, labelTtlMs) {
+  const entries = [];
+  let stamped = 0, demoted = 0;
+  try {
+    const gf = path.join(dataDir, 'routing', 'golden-set.jsonl');
+    const gRows = readJsonl(gf);
+    if (!gRows.length) return { stamped, demoted, entries };
+    let changed = false;
+    const next = gRows.map((r) => {
+      if (r.autoSigned !== true) return r;
+      const at = Number(r.reviewedAt || 0);
+      if (!at) { stamped += 1; changed = true; return { ...r, reviewedAt: now }; }
+      if (now - at > labelTtlMs) {
+        demoted += 1; changed = true;
+        entries.push({ pkey: r.pkey || promptKey(r.prompt || ''), prompt: String(r.prompt || '').slice(0, 500), from: r.humanLabel || null, reason: 'ttl-expired' });
+        return { ...r, reviewed: false, autoSigned: false, humanLabel: null, autoLabel: null, demotedAt: now, demotedFrom: r.humanLabel || null, demoteRule: 'TTL 过期未复核(自动摘签退池)' };
+      }
+      return r;
+    });
+    if (changed) atomicWriteFileSync(gf, next.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  } catch { /* fail-open */ }
+  return { stamped, demoted, entries };
+}
+
+/** 争议/翻案/过期条目入池(按 pkey 合并,保留最近 at,上限 CONTESTED_CAP)。fail-open。 */
+function recordContested(dataDir, entries = []) {
+  if (!entries.length) return 0;
+  try {
+    const file = path.join(dataDir, 'routing', CONTESTED_FILE);
+    const byKey = new Map();
+    for (const r of readJsonl(file)) {
+      const k = r.pkey || promptKey(r.prompt || '');
+      if (k) byKey.set(k, r);
+    }
+    for (const e of entries) {
+      const k = e.pkey || promptKey(e.prompt || '');
+      if (!k) continue;
+      byKey.set(k, { ...(byKey.get(k) || {}), ...e, pkey: k, at: Date.now() });
+    }
+    const rows = [...byKey.values()].sort((a, b) => Number(b.at || 0) - Number(a.at || 0)).slice(0, CONTESTED_CAP);
+    atomicWriteFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    return entries.length;
+  } catch { return 0; }
+}
 
 function readJson(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
 
@@ -98,8 +150,13 @@ export function loadShadowEvidence({ dataDir = DATA_DIR, tailCap = 50000, host =
  * 自动增长一次:对齐 → 并池 → **四票自动代签黄金集** → 写 exemplars.json → 需要时后台重建向量。
  * 返回 {state:'skipped'|'grown'|'failed', ...}。
  */
-export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAULT_INTERVAL_MS, now = Date.now(), spawnVectors = true, label = true, exportFn = null } = {}) {
+export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAULT_INTERVAL_MS, now = Date.now(), spawnVectors = true, label = true, exportFn = null, labelTtlMs = LABEL_TTL_MS } = {}) {
+  // 并发锁(2026-11-10 根治):prompt-guard --check 可能多进程同轮并发(09:41 实测两次 grow 叠跑),
+  // 重复导出/签入会写坏状态,双双重试向量重建还会叠加常驻重启窗口的资源压力。锁按 pid 存活判定,进程崩溃自动过期。
+  const lockPath = path.join(dataDir, 'routing', '.autoexemplars.lock');
+  if (!takeJsonLock(lockPath)) return { state: 'skipped', reason: '并发锁占用' };
   try {
+    try {
     const statePath = path.join(dataDir, 'routing', STATE_FILE);
     const state = readJson(statePath) || {};
     // 节流(2026-11-08 时钟防御):负龄(上次时间戳在未来 = 机器时钟漂移过)不节流,立即放行并自愈——
@@ -124,12 +181,16 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       out: path.join(dataDir, 'routing', 'routinglog-labels.jsonl'),
     });
     if (!built.aligned) {
+      // 无新数据也要执行 TTL(2026-11-10):标签不因"管线闲着"而永久有效
+      const ttl = enforceLabelTtl(dataDir, now, labelTtlMs);
+      if (ttl.entries.length) recordContested(dataDir, ttl.entries);
       fs.mkdirSync(path.dirname(statePath), { recursive: true });
-      fs.writeFileSync(statePath, JSON.stringify({ at: now, result: built }) + '\n');
-      return { state: 'skipped', reason: '无新对齐数据', logRows: built.total };
+      fs.writeFileSync(statePath, JSON.stringify({ at: now, result: built, ttl: { stamped: ttl.stamped, demoted: ttl.demoted } }) + '\n');
+      return { state: 'skipped', reason: '无新对齐数据', logRows: built.total, ttlDemoted: ttl.demoted };
     }
     const labels = readJsonl(path.join(dataDir, 'routing', 'routinglog-labels.jsonl'));
-    // 三投票+一加权代签:L1/L2/行为各 1 票,决策模型生效时按置信加权(可影响结果),唯一领先 + 权重≥2 + ≥2 源才签。
+    // 四票合议代签:L1/L2/决策/行为,决策票按模型档案门槛加权(signing.min 起投/twoVote 记 2 票,反压制),
+    // 唯一领先 + 权重≥2 + ≥2 源才签。
     let signStats = null;
     let signedRows = [];
     let reviewStats = null;
@@ -144,6 +205,34 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       // 复核翻案(2026-11-04 全自动纠错通道):与代签同周期,同一套四票复核已签机器条目
       try { reviewStats = await reviewGolden({ dataDir }); } catch { /* 复核 fail-open */ }
     }
+    // ---------- 阶段①(2026-11-10):争议池 + 标签 TTL ----------
+    // 争议池:四票未签出的候选 + 复核翻案行 → data/routing/contested-pool.jsonl(不进黄金集),
+    //   供后续人工/跨模型复核;按 pkey 合并、上限 500、按 at 保留最近。
+    // TTL:有 reviewedAt 且超期的机器签入行 → 摘签退池(标签不永久有效);缺失 reviewedAt = 迁移期,
+    //   盖当前时间戳保留(不误杀存量 279 行)。
+    const contestedEntries = [];
+    if (signStats && Array.isArray(signStats.contestedRows)) {
+      for (const c of signStats.contestedRows) {
+        const v = c.vote || {};
+        contestedEntries.push({
+          pkey: c.pkey || promptKey(c.prompt || ''), prompt: String(c.prompt || '').slice(0, 500),
+          suggested: v.type || null, votes: v.votes ?? 0, sources: v.sources ?? 0, agreement: v.agreement ?? 0,
+          voters: v.voters || {}, reason: 'quorum-not-met',
+        });
+      }
+    }
+    if (reviewStats && Array.isArray(reviewStats.demotedRows)) {
+      for (const d of reviewStats.demotedRows) {
+        contestedEntries.push({
+          pkey: d.pkey || promptKey(d.prompt || ''), prompt: String(d.prompt || '').slice(0, 500),
+          suggested: null, reason: 'review-demoted', demoteRule: d.demoteRule || null,
+        });
+      }
+    }
+    const ttl = enforceLabelTtl(dataDir, now, labelTtlMs);
+    if (ttl.entries.length) contestedEntries.push(...ttl.entries);
+    if (ttl.stamped || ttl.demoted) reviewStats = { ...(reviewStats || {}), ttlStamped: ttl.stamped, ttlDemoted: ttl.demoted };
+    if (contestedEntries.length) recordContested(dataDir, contestedEntries);
     const primary = loadPool(path.join(dataDir, 'routing', 'raw-labels.jsonl')).pool;
     const extra = toPoolRows(labels);
     // 自动代签的标签回流样本库(2026-11-02 补分发链路;2026-11-06 修优先级倒置):L2 向量空间原先只学
@@ -158,10 +247,18 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       labelRule: `ensemble:${s.labelRule || ''}`,
       toolCalls: s.evidence && s.evidence.toolCalls,
       writeEdits: s.evidence && s.evidence.writeEdits,
+      // 质量排序用(2026-11-10):signed 来源 + 合议一致度 + 签入时间;新签行因此能挤掉旧弱标签
+      confidence: Number(s.agreement) || 0,
+      signedAt: Number(s.signedAt) || 0,
       source: 'auto-signed',
     }));
     const merged = mergePools([...signedPool, ...primary], extra);
-    const builtLib = buildExemplars(merged, { capPerLabel: 120 }); // 返回 {version,builtAt,source,stats,exemplars[]}
+    const exCfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
+    const builtLib = buildExemplars(merged, {
+      capPerLabel: Number(exCfg.capPerLabel) || 120,
+      totalCap: Number(exCfg.totalCap) || 400,
+      dynamicQuota: exCfg.dynamicQuota !== false,
+    }); // 返回 {version,builtAt,source,stats,exemplars[]};配额策略 2026-11-10 起由 config.exemplars 控制
     const exemplars = builtLib.exemplars;
     const outFile = path.join(dataDir, 'routing', 'exemplars.json');
     const before = readJson(outFile);
@@ -173,7 +270,8 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     fs.writeFileSync(outFile, JSON.stringify({ ...builtLib, source: 'raw-labels + 自动代签 + routing-log行为形态' }, null, 1) + '\n');
     const changed = sig(exemplars) !== beforeSig;
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    fs.writeFileSync(statePath, JSON.stringify({ at: now, pool: merged.length, exemplars: exemplars.length, changed, sign: signStats, review: reviewStats }) + '\n');
+    const slim = (o) => (o ? Object.fromEntries(Object.entries(o).filter(([k]) => !/Rows$/.test(k))) : o); // 状态文件不落整批行(防膨胀)
+    fs.writeFileSync(statePath, JSON.stringify({ at: now, pool: merged.length, exemplars: exemplars.length, changed, sign: slim(signStats), review: slim(reviewStats) }) + '\n');
     if (changed && spawnVectors) {
       // 向量重建耗时十几秒 → 分离后台,不等它
       try {
@@ -181,21 +279,32 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
           cwd: here, detached: true, stdio: 'ignore', windowsHide: true,
         });
         child.unref();
+        // 留痕分工(2026-11-10 根治):成功/失败由**子进程自己**写(见 modelRoute --build-vectors 分支);
+        // 这里只兜底记录异常退出——父进程(prompt-guard --check)可能先退,旧实现全靠它的 exit 回调,
+        // 结果 09:41 失败时 build-vectors.log 0 字节、问题被静默一整天。
+        const logPath = path.join(path.dirname(statePath), 'build-vectors.log');
+        child.on('exit', (code, signal) => {
+          if (code === 0 && !signal) return; // 正常退出:子进程已自行落痕,不重复
+          try { fs.appendFileSync(logPath, JSON.stringify({ at: new Date().toISOString(), source: 'spawn-exit', code, signal }) + '\n'); } catch { /* 日志失败不影响主流程 */ }
+        });
       } catch { /* 起不来不影响样本库本身 */ }
     }
-    return { state: 'grown', pool: merged.length, exemplars: exemplars.length, before: beforeN, changed, sign: signStats, review: reviewStats };
+    return { state: 'grown', pool: merged.length, exemplars: exemplars.length, before: beforeN, changed, contestedPooled: contestedEntries.length, sign: signStats, review: reviewStats };
   } catch (e) {
     return { state: 'failed', reason: String(e && e.message ? e.message : e) };
+  }
+  } finally {
+    releaseJsonLock(lockPath);
   }
 }
 
 /**
- * 三投票+一加权自动代签(2026-11-03 用户定档,L3 层彻底取消——语义兜底由四档分档承担):
- *   三投票 = L1(词法)/L2(向量)/行为形态,各 1 票;
- *   一加权 = 决策模型,开关生效(modelRouting.decisionModel.enabled)且断路器未开时批量判定,
- *     按置信加权参与计票(≥0.9 记 2 票/≥0.6 记 1 票/更低弃权)——**可影响代签结果**(救回低证据签名/
- *     反向形成平票更保守),但单票永不独签(quorum 仍要求最高票 ≥2 个不同投票源);
- *   断网/开关关/跳闸 → 决策模型弃权,三票照常,完全离线可用。
+ * 四票合议自动代签(2026-11-03 三投票+一加权定档,L3 层取消;2026-11-09 v3 口径正式化为四票合议):
+ *   四票 = L1(词法)/L2(向量)/决策模型/行为形态;
+ *   决策票是常驻合议方(本机 225 条实测 49% 成票依赖其凑 quorum,名实相符):起投与 2 票权重门槛按
+ *     模型判定档案(resolveDecisionProfile().signing,缺省回退 0.6/0.9)标定——
+ *     ≥twoVoteConf 记 2 票/≥min 记 1 票/更低弃权,可影响代签结果,但单票永不独签(quorum 仍要求最高票 ≥2 个不同投票源);
+ *   反压制:决策票与行为票相左时权重降回 1 票(autoLabel.voteLabel);断网/跳闸 → 决策票弃权,三票照常,完全离线可用。
  * 唯一领先且 ≥2 票 ⇒ 签(reviewed=true, autoSigned=true);平票/单票 ⇒ 只留池。
  * 产出诊断报告(auto-label-report.md),**不需要人签字**。
  */
@@ -204,31 +313,38 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
  * 行为票默认取 row.label(代签候选=行为形态标签);复核场景传 behaviorFrom(row) 按 evidence 重放。
  * 决策模型批量判定失败/异常 → 跳闸并弃权,三票照常。返回 {voters:Map(row→voters), decisionNote}。
  */
-async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, classifyBatchFn, behaviorFrom = null }) {
+async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, twoVoteConf = 0.9, classifyBatchFn, behaviorFrom = null }) {
   const { classifyPromptRaw } = await import('./classify.mjs');
-  const { l2EmbedFn, loadVectors, knnClassify } = await import('./modelRoute.mjs');
+  const { l2EmbedFn, loadVectors, knnClassify, vectorsMatchModel } = await import('./modelRoute.mjs');
   const { signable } = await import('./autoLabel.mjs');
   const embedFn = await l2EmbedFn({ dataDir });
-  const vectorsDoc = embedFn ? loadVectors(dataDir) : null;
+  // 指纹不符(嵌入模型已切换)→ KNN 票弃权,不拿旧维度向量出错票(2026-11-08 修)
+  const vectorsLoaded = loadVectors(dataDir);
+  const vectorsDoc = embedFn && vectorsMatchModel(vectorsLoaded) ? vectorsLoaded : null;
   const dm = await import('./decisionModel.mjs');
-  const decisionOn = (() => {
-    try {
-      return JSON.parse(fs.readFileSync(path.join(dataDir, 'code-index.config.json'), 'utf8'))
-        ?.modelRouting?.decisionModel?.enabled === true;
-    } catch { return false; }
-  })() && !dm.breakerOpen(dataDir);
+  const cfgRaw = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'code-index.config.json'), 'utf8')); } catch { return {}; }
+  })();
+  // 判定总闸(v4 2026-11-09 远程链删):本地判定恒启用(decisionActive 恒 true);断路器开着时决策票弃权退三票。
+  // 把 data config 传给判定:judgeBatch 恒本地(ollama/常驻),与代理判定同口径。
+  const decisionOn = decisionActive(cfgRaw) && !dm.breakerOpen(dataDir);
   const decisionByRow = new Map();
   let decisionNote = null;
+  let dmModel = null; // 决策模型血缘(2026-11-09):judgeBatch 返回的 backend,随决策票落盘 golden-set
   if (decisionOn) {
     try {
       const batch = classifyBatchFn || dm.classifyBatch;
       const cand = rows.map((r, i) => ({ id: i + 1, text: String(r.prompt || ''), row: r })).filter((x) => signable(x.row.prompt));
       if (cand.length) {
-        const dr = await batch(cand.map((x) => x.text));
-        if (dr.error) {
+        const dr = await batch(cand.map((x) => x.text), { config: cfgRaw });
+        if (dr.skipped) {
+          // 批量嵌入让行(2026-11-10):忙跳过 ≠ 故障——不跳闸,决策票本轮弃权,三票照常签
+          decisionNote = dr.error || '批量嵌入进行中,决策票本轮弃权';
+        } else if (dr.error) {
           dm.tripBreaker(`代签加权失败:${dr.error}`, dataDir);
           decisionNote = `决策模型失败已跳闸:${dr.error}`;
         } else {
+          dmModel = dr.backend || null;
           for (const a of dr.answers) {
             const src = cand[a.id - 1];
             if (src) decisionByRow.set(src.row, a);
@@ -245,18 +361,23 @@ async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, classif
     }
   }
   const voters = new Map();
+  // LOO 参照集 pkey 索引(2026-11-10 阶段①):签入行会回流样本库,同一 prompt 的自邻居 cosine≈1;
+  // 代签/复核时按 pkey 排除自身,断掉"L2 背答案自证"(taintFactor 只降权不剔除)。
+  const refPkeys = vectorsDoc ? new Set(Object.values(vectorsDoc.vectors || {}).map((e) => e && e.pkey).filter(Boolean)) : null;
   for (const c of rows) {
     const l1 = classifyPromptRaw(c.prompt);
     let l2 = null;
+    const pk = c.pkey || c.promptKey || promptKey(c.prompt || '');
     if (embedFn && vectorsDoc) {
       try {
         const v = await embedFn(c.prompt);
-        l2 = knnClassify(v, vectorsDoc);
+        l2 = knnClassify(v, vectorsDoc, { excludePkey: pk });
+        if (l2 && refPkeys && refPkeys.has(pk)) l2.loo = true; // 审计标记:该票已排除自邻居
       } catch { /* L2 失败算弃权 */ }
     }
     const dec = decisionByRow.get(c);
     const dmVote = dec && dec.confidence >= decisionMinConf
-      ? { type: dec.type, confidence: dec.confidence, weight: dec.confidence >= 0.9 ? 2 : 1 }
+      ? { type: dec.type, confidence: dec.confidence, weight: dec.confidence >= twoVoteConf ? 2 : 1, model: dmModel } // 2 票权重门槛按模型档案(v3)
       : null;
     voters.set(c, {
       l1,
@@ -277,33 +398,43 @@ async function readL2MinConf(dataDir) {
   } catch { return 0.6; }
 }
 
-export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVotes = 2, decisionMinConf = 0.6, l2MinConf = null, classifyBatchFn = null, shadowEvidence = null } = {}) {
+export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVotes = 2, decisionMinConf = null, twoVoteConf = null, l2MinConf = null, classifyBatchFn = null, shadowEvidence = null } = {}) {
   // l2MinConf 缺省读配置 l2.minConf(与 classifyRoute 同一口径,2026-11-03 R1 审查修):
   // 旧硬编码 0.75 在边际置信口径下让 L2 票几乎恒弃权,配置调阈值不生效。
   if (l2MinConf == null) l2MinConf = readL2MinConf(dataDir);
+  // 决策票门槛缺省读模型判定档案(v3,2026-11-09):signing.min=起投 / signing.twoVote=2 票权重;
+  // 未建档模型回退 FALLBACK(0.6/0.9,与旧硬编码一致,行为零漂移)。
+  if (decisionMinConf == null || twoVoteConf == null) {
+    const { resolveDecisionProfile } = await import('./decisionModel.mjs');
+    const prof = resolveDecisionProfile();
+    if (decisionMinConf == null) decisionMinConf = Number(prof.signing.min) || 0.6;
+    if (twoVoteConf == null) twoVoteConf = Number(prof.signing.twoVote) || 0.9;
+  }
   const rows = labels || readJsonl(path.join(dataDir, 'routing', 'routinglog-labels.jsonl'));
   const { autoSign, mergeAutoSigned, writeReport } = await import('./autoLabel.mjs');
   const { renumberGolden } = await import('./buildExemplars.mjs');
-  const { voters, decisionNote } = await gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, classifyBatchFn });
+  const { voters, decisionNote } = await gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, twoVoteConf, classifyBatchFn });
   const withVotes = rows.map((c) => ({ ...c, voters: voters.get(c) }));
   const { signed, contested, skipped } = autoSign(withVotes, (c) => c.voters, { minVotes });
   // 影子账本证据回流:promptKey 命中 → evidence 补 escalated/servedTier(P2 硬证据进行为真值,
   // 让 R2/R3 不再是"恒 0";"活多"证不了能力,这份证据才证"低档干不动")。只补不删。
+  // signedAt(2026-11-10 阶段①):签入时间戳,TTL 复核的起点;每条都盖,不留"无时间"的标签。
+  const signedAt = Date.now();
   const signedWithEvidence = signed.map((s) => {
     const ex = shadowEvidence && shadowEvidence.get(promptKey(String(s.prompt || '')));
-    if (!ex || !s.evidence) return s;
+    if (!ex || !s.evidence) return { ...s, signedAt };
     const extra = {};
     if (ex.escalated === true) extra.escalated = true;
     if (ex.servedTier) extra.servedTier = ex.servedTier;
-    if (!Object.keys(extra).length) return s;
-    return { ...s, evidence: { ...s.evidence, ...extra } };
+    if (!Object.keys(extra).length) return { ...s, signedAt };
+    return { ...s, signedAt, evidence: { ...s.evidence, ...extra } };
   });
   const goldenFile = path.join(dataDir, 'routing', 'golden-set.jsonl');
   const existing = readJsonl(goldenFile);
   const merged = renumberGolden(mergeAutoSigned(signedWithEvidence, existing));
-  fs.writeFileSync(goldenFile, merged.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  atomicWriteFileSync(goldenFile, merged.map((r) => JSON.stringify(r)).join('\n') + '\n');
   const report = writeReport({ signed, contested, skipped }, { dataDir, decisionNote: decisionNote || '' });
-  return { signed: signedWithEvidence, signedCount: signedWithEvidence.length, contested: contested.length, skipped: skipped.length, golden: merged.length, report: report.out, decisionNote: decisionNote || null };
+  return { signed: signedWithEvidence, signedCount: signedWithEvidence.length, contested: contested.length, skipped: skipped.length, contestedRows: contested, skippedRows: skipped, golden: merged.length, report: report.out, decisionNote: decisionNote || null };
 }
 
 /**
@@ -317,15 +448,22 @@ export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVot
  *   (stability 口径=历次复核"维持"占比,翻转率最高者即疑似错签排序列表),复核段追加进
  *   auto-label-report.md。全程 fail-open。
  */
-export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionMinConf = 0.6, l2MinConf = null, classifyBatchFn = null, now = Date.now() } = {}) {
+export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionMinConf = null, twoVoteConf = null, l2MinConf = null, classifyBatchFn = null, now = Date.now() } = {}) {
   if (l2MinConf == null) l2MinConf = readL2MinConf(dataDir);
+  // 决策票门槛缺省读模型判定档案(v3,与 autoSignGolden 同口径)
+  if (decisionMinConf == null || twoVoteConf == null) {
+    const { resolveDecisionProfile } = await import('./decisionModel.mjs');
+    const prof = resolveDecisionProfile();
+    if (decisionMinConf == null) decisionMinConf = Number(prof.signing.min) || 0.6;
+    if (twoVoteConf == null) twoVoteConf = Number(prof.signing.twoVote) || 0.9;
+  }
   const { voteLabel, signable } = await import('./autoLabel.mjs');
   const { labelFromShape } = await import('./importRoutingLog.mjs');
   const goldenFile = path.join(dataDir, 'routing', 'golden-set.jsonl');
   const rows = readJsonl(goldenFile);
   const cand = rows.filter((r) => r.autoSigned === true && r.reviewed === true && signable(r.prompt));
   const { voters, decisionNote } = await gatherVoters({
-    rows: cand, dataDir, l2MinConf, decisionMinConf, classifyBatchFn,
+    rows: cand, dataDir, l2MinConf, decisionMinConf, twoVoteConf, classifyBatchFn,
     behaviorFrom: (r) => {
       const ev = r.evidence || {};
       const calls = Number(ev.toolCalls);
@@ -401,9 +539,13 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
       });
     }
   }
-  if (demotedSet.size) {
-    const next = rows.map((r) => demotedSet.get(r) || r);
-    fs.writeFileSync(goldenFile, next.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  // 复核时间戳(2026-11-10 阶段①):每条机器签入行盖 reviewedAt——TTL 判活的依据。
+  // 复核正常时每周期刷新;复核失效(异常/断路器)时旧戳会超期,由 maybeGrowPool 的 TTL 摘签兜底。
+  const keptStamped = new Map();
+  for (const r of cand) if (!demotedSet.has(r)) keptStamped.set(r, { ...r, reviewedAt: now });
+  if (demotedSet.size || keptStamped.size) {
+    const next = rows.map((r) => demotedSet.get(r) || keptStamped.get(r) || r);
+    atomicWriteFileSync(goldenFile, next.map((r) => JSON.stringify(r)).join('\n') + '\n');
   }
   // stability 台账(只增;超 2MB 截尾保留最近 2000 条,防单调膨胀)
   const reviewFile = path.join(dataDir, 'routing', 'golden-review.jsonl');
@@ -411,7 +553,7 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
     let hist = readJsonl(reviewFile).concat(reviewRows);
     let blob = hist.map((r) => JSON.stringify(r)).join('\n') + '\n';
     if (blob.length > 2 * 1024 * 1024) { hist = hist.slice(-2000); blob = hist.map((r) => JSON.stringify(r)).join('\n') + '\n'; }
-    fs.writeFileSync(reviewFile, blob);
+    atomicWriteFileSync(reviewFile, blob);
   } catch { /* 台账失败不影响降级 */ }
   // 复核段追加进代签报告:stability 排序列表即"疑似错签"优先复核面
   try {
@@ -434,7 +576,7 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
     ];
     fs.appendFileSync(path.join(dataDir, 'routing', 'auto-label-report.md'), sec.join('\n'));
   } catch { /* 报告失败不影响降级 */ }
-  return { candidates: cand.length, demoted: demotedSet.size, golden: rows.length, decisionNote: decisionNote || null };
+  return { candidates: cand.length, demoted: demotedSet.size, demotedRows: [...demotedSet.values()], golden: rows.length, decisionNote: decisionNote || null };
 }
 
 function readJsonl(f) {

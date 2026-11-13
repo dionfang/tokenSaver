@@ -12,6 +12,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DATA_DIR, loadConfig } from './config.mjs';
 import { readVectorMeta } from './vectorStore.mjs';
+import { readRegistry } from './warmedRegistry.mjs';
 
 export function resolveBase(explicit) {
   return explicit || loadConfig().ollamaBase;
@@ -115,7 +116,13 @@ export function resolveGpuMode() {
   return mk('gpu', '未能探测显存,默认 GPU(Ollama 放不下会自动分层)');
 }
 
-/** 注入到 Ollama 请求 options 的 GPU/CPU 开关(num_gpu;只在加载时生效) */
+/**
+ * 注入到 Ollama 请求 options 的 GPU/CPU 开关(num_gpu;只在加载时生效)。
+ * ⚠️ 仅 /api/embed、/api/generate 认这个选项;决策模型(tev1:0.8b)只暴露 /v1/systemone,
+ * 该端点对 options 静默忽略(2026-11-08 实测:带 num_gpu:0 照常返回、模型仍 100% 进显存)。
+ * 故 gpu=cpu 强制时:嵌入/精排钉在 CPU,决策模型仍由 Ollama 自动放置(显存放得下就上 GPU);
+ * 自动分层兜底只在 auto 模式显存不足时生效。
+ */
 export function gpuOptions() {
   return resolveGpuMode().numGpu === 0 ? { num_gpu: 0 } : {};
 }
@@ -177,7 +184,11 @@ export async function unloadOllamaModel(name, onInfo) {
 
 function replacedExtras() {
   const prev = readLastWarmed() || {};
-  return [prev.embedding, prev.reranker, readVectorMeta('ollama')?.model];
+  // prev.decision 也要在卸载名单里:切换嵌入路径(ollama→local)时决策模型没人再拉,
+  // 不卸就白占 1.2GB 显存(2026-11-08 修:decision 进了 warmed 状态但漏了释放侧)
+  // 登记表(2026-11-08):切换模型后旧模型已不在 last-warmed 里,靠这张只增不减的表才认得出是我们拉起的
+  const reg = readRegistry();
+  return [...new Set([prev.embedding, prev.reranker, prev.decision, readVectorMeta('ollama')?.model, ...reg.ollama].filter(Boolean).map(String))];
 }
 
 async function listPsModels() {

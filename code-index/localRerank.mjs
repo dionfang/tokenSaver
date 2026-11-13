@@ -7,9 +7,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { HF_CACHE_DIR } from './config.mjs';
 
-/** transformers.js q8 权重是否已在 hf-cache。嵌入(jina)与精排(bge)共用。 */
+/** q8 权重是否已在 hf-cache。嵌入(jina)与精排(bge)共用;决策模型 strands:<dir> 前缀
+ *  指 hf-cache/<dir>/model_quantized.onnx(2026-11-09 切换 Strands-Decider-2B 后的布局)。 */
 export function localOnnxCached(modelId) {
-  const file = path.join(HF_CACHE_DIR, ...String(modelId).split('/'), 'onnx', 'model_quantized.onnx');
+  const s = String(modelId);
+  const file = s.startsWith('strands:')
+    ? path.join(HF_CACHE_DIR, s.slice('strands:'.length), 'model_quantized.onnx')
+    : path.join(HF_CACHE_DIR, ...s.split('/'), 'onnx', 'model_quantized.onnx');
   try { return fs.statSync(file).size > 0; } catch { return false; }
 }
 

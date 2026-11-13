@@ -28,13 +28,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './config.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 import { classifyDifficulty, TIER_LEXICON, termPresent, loadTierCalibration } from './tierClassify.mjs';
-import { reconcile, evidenceOf } from './tierTruth.mjs';
-import { resolveCostProfile, policyCost, fitFromLedger, DEFAULT_COST_PROFILE } from './costProfile.mjs';
+import { reconcile, evidenceOf, tierIntervalOf } from './tierTruth.mjs';
+import { resolveCostProfile, policyCost, intervalPolicyCost, fitFromLedger, DEFAULT_COST_PROFILE } from './costProfile.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FILES = {
   golden: 'routing/golden-set.jsonl',
+  evidence: 'routing/tier-evidence.jsonl',                  // v2 区间真值数据集(离线抽取器产物,见 extractTierEvidence.mjs)
   profile: 'routing/tier-calibration.json',                 // live:消费端唯一读取面(loadTierCalibration)
   candidate: 'routing/tier-calibration-candidate.json',     // 最近一次折外过门控的候选(恒 enabled:false)
   prev: 'routing/tier-calibration-prev.json',               // 晋升前的 live 备份(回滚恢复源)
@@ -59,7 +61,7 @@ const r3 = (v) => (Number.isFinite(Number(v)) ? Number(Number(v).toFixed(3)) : n
 const f = (dataDir, k) => path.join(dataDir, FILES[k]);
 function readJsonl(p) { try { return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; } }
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
-function writeJson(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(obj, null, 1) + '\n'); }
+function writeJson(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); atomicWriteFileSync(p, JSON.stringify(obj, null, 1) + '\n'); }
 function appendJsonl(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.appendFileSync(p, JSON.stringify(obj) + '\n'); }
 
 /** 稳定折划分:按 pkey/id 哈希,同一条目跨迭代恒定在同折(否则"折外"每次换人,趋势不可比)。 */
@@ -71,10 +73,15 @@ export function foldOf(key, k = DEFAULTS.folds) {
 }
 
 /**
- * 黄金集 → 评估行(带双真值 + 现网预测)。只收"至少一条真值通道给得出档"的条目。
- * truthSource='behavior' 用行为侧(独立于词法),'map' 用 T→R 映射,'both' 只留两条一致的条目(最硬子集)。
+ * 黄金集 + 区间证据 → 评估行(自进化 v2,2026-11-08 重建裁定)。
+ * 黄金行:双真值(behavior/map)+ 行级区间(tierIntervalOf;无区间→单点,与 v1 逐位同)。
+ * 证据行(tier-evidence.jsonl,extractTierEvidence.mjs 离线产出):直采行内 interval;trueTier=interval.min
+ *   (信号学习用保守点值:只把硬下界≥R2 当正例);learn=单点区间才参与信号学习——"跑到 R2 干净收尾"这类
+ *   宽区间 [R1, served] 无法反推 R1 不行,只进代价折叠、不教信号(防把弱证据学成强偏好)。
+ * 证据行不进 tierMatrix/逐档召回(点值口径只对黄金行算);代价与 CV 全量折叠。
+ * 返回 { rows, evidence }。
  */
-export function loadEvalRows({ dataDir = DATA_DIR, goldenFile = null, truth = 'behavior' } = {}) {
+export function loadEvalRows({ dataDir = DATA_DIR, goldenFile = null, truth = 'behavior', evidenceFile = null } = {}) {
   const rows = readJsonl(goldenFile || f(dataDir, 'golden'));
   const out = [];
   for (const r of rows) {
@@ -93,9 +100,25 @@ export function loadEvalRows({ dataDir = DATA_DIR, goldenFile = null, truth = 'b
       prompt: r.prompt || '', type: r.humanLabel || null, autoSigned: r.autoSigned === true,
       evidence: evidenceOf(r), trueTier, truthSource: source, behaviorTruth: bTruth, mapTruth: mTruth,
       agree: rec.agree, predTier: pred.tier, predSignals: pred.signals || [], predReason: pred.reason,
+      interval: rec.interval || { min: trueTier, max: trueTier },
     });
   }
-  return out;
+  const evRows = readJsonl(evidenceFile || f(dataDir, 'evidence'));
+  let evUsed = 0;
+  for (const r of evRows) {
+    const iv = tierIntervalOf(r);
+    if (!iv || !r.prompt) continue;
+    const pred = classifyDifficulty(r.prompt);
+    out.push({
+      id: r.id || null, pkey: r.pkey || `ev-${String(r.prompt).slice(0, 40)}`,
+      prompt: r.prompt, type: null, autoSigned: null,
+      evidence: {}, trueTier: iv.min, truthSource: 'evidence', behaviorTruth: iv.min, mapTruth: null,
+      agree: null, predTier: pred.tier, predSignals: pred.signals || [], predReason: pred.reason,
+      interval: iv, learn: iv.min === iv.max, servedTier: r.servedTier || null, conv: r.conv || null,
+    });
+    evUsed += 1;
+  }
+  return { rows: out, evidence: evUsed };
 }
 
 /** 逐档 precision/recall + 混淆矩阵(以真值为行、预测为列)。 */
@@ -133,7 +156,8 @@ export function tierMatrix(rows, predOf = (r) => r.predTier) {
 const POOL_DIRECTION = { CRITICAL_SIGNS: 'R2', EDIT_SIGNS: 'R2', SCOPE_WORDS: 'R2', VERIFY_WORDS: 'R1' };
 
 export function learnSignals({ rows = [], minN = DEFAULTS.minN, priorN = DEFAULTS.priorN, allowBoost = DEFAULTS.allowBoost } = {}) {
-  const labeled = rows.filter((r) => r.trueTier);
+  // learn===false 的证据行(宽区间,干净完成类)不教信号——只进代价折叠,不进正/负例(自进化 v2)
+  const labeled = rows.filter((r) => r.trueTier && r.learn !== false);
   const heavy = labeled.filter((r) => TIERS.indexOf(r.trueTier) >= 1).length;
   const baseR2 = labeled.length ? heavy / labeled.length : 0;
   const baseR1 = labeled.length ? 1 - baseR2 : 0;
@@ -170,14 +194,25 @@ function candidateProfile({ learned, thresholds }) {
   return { signals: learned.signals, thresholds: { critMin: thresholds.critMin, editMin: thresholds.editMin, verifyMin: thresholds.verifyMin, verifyOverride: thresholds.verifyOverride } };
 }
 
-/** 一套参数在给定行集上的完整评估(准确率 + 成本 + 逐档 + 混淆)。 */
+/** 一套参数在给定行集上的完整评估(自进化 v2:区间目标函数;点值召回/混淆仍只对黄金行算)。 */
 export function evaluate({ rows = [], calibration = null, cost = null } = {}) {
   const cp = resolveCostProfile(cost);
-  const withPred = rows.map((r) => ({ ...r, predTier: (classifyDifficulty(r.prompt, { calibration }) || {}).tier || 'R1' }));
-  const pol = policyCost(cp, withPred.map((r) => ({ trueTier: r.trueTier, predTier: r.predTier })));
-  const { perTier, confusion } = tierMatrix(withPred);
-  const tokOnly = policyCost({ ...cp, qualityPenaltyPerStepM: 0 }, withPred.map((r) => ({ trueTier: r.trueTier, predTier: r.predTier })));
-  return { rows: withPred, ...pol, perTier, confusion, tokenOnlyTotal: tokOnly.total, tokenOnlyAccuracy: tokOnly.accuracy };
+  const withPred = rows.map((r) => ({ ...r, interval: r.interval || { min: r.trueTier, max: r.trueTier }, predTier: (classifyDifficulty(r.prompt, { calibration }) || {}).tier || 'R1' }));
+  const gold = withPred.filter((r) => r.truthSource !== 'evidence');
+  const pol = intervalPolicyCost(cp, withPred.map((r) => ({ interval: r.interval, trueTier: r.trueTier, predTier: r.predTier })));
+  const { perTier, confusion } = tierMatrix(gold);
+  const tokOnly = intervalPolicyCost({ ...cp, qualityPenaltyPerStepM: 0 }, withPred.map((r) => ({ interval: r.interval, trueTier: r.trueTier, predTier: r.predTier })));
+  // v1 点值口径在黄金子集上的历史可比数(报告"历史口径"行用,与重建前报告同族)
+  const pointLegacy = policyCost(cp, gold.map((r) => ({ trueTier: r.trueTier, predTier: r.predTier })));
+  // 硬下界(interval.min≥R2)行的漏升计数:门控用它防"以漏升换代价"(自进化 v2)
+  const lb = withPred.filter((r) => r.interval && TIERS.indexOf(r.interval.min) >= 1);
+  const lbUnder = lb.filter((r) => TIERS.indexOf(r.predTier) < TIERS.indexOf(r.interval.min)).length;
+  return {
+    rows: withPred, gold, ...pol, perTier, confusion,
+    tokenOnlyTotal: tokOnly.total, tokenOnlyAccuracy: tokOnly.accuracy,
+    pointLegacyTotal: pointLegacy.total, pointLegacyAccuracy: pointLegacy.accuracy,
+    lbN: lb.length, lbUnder, evidenceN: withPred.length - gold.length,
+  };
 }
 
 /**
@@ -217,6 +252,8 @@ export function crossValidate({ rows = [], cost = null, liveProfile = null, fold
     let under = 0;
     let switches = 0;
     let n = 0;
+    let lbN = 0;
+    let lbUnder = 0;
     const perFold = [];
     const allRows = [];
     for (const fd of foldData) {
@@ -229,14 +266,21 @@ export function crossValidate({ rows = [], cost = null, liveProfile = null, fold
       under += e.under;
       switches += e.switches;
       n += e.n;
+      for (const r of e.rows) {
+        if (r.interval && TIERS.indexOf(r.interval.min) >= 1) {
+          lbN += 1;
+          if (TIERS.indexOf(r.predTier) < TIERS.indexOf(r.interval.min)) lbUnder += 1;
+        }
+      }
       allRows.push(...e.rows);
       perFold.push({ fold: fd.i, n: e.n, total: Number(e.total.toFixed(2)), accuracy: e.accuracy });
     }
     return {
-      n, hit, over, under, switches, perFold,
+      n, hit, over, under, switches, perFold, lbN, lbUnder,
       total: Number(total.toFixed(3)), tokenCost: Number(token.toFixed(3)), qualityPenalty: Number(penalty.toFixed(3)),
       accuracy: n ? Number((hit / n).toFixed(3)) : null,
-      perTier: tierMatrix(allRows).perTier,
+      // 点值召回/混淆只对黄金行算(证据行是区间真值,无点值语义)
+      perTier: tierMatrix(allRows.filter((x) => x.truthSource !== 'evidence')).perTier,
     };
   };
   const legacy = agg((fd) => fd.leg);
@@ -263,6 +307,9 @@ export function crossValidate({ rows = [], cost = null, liveProfile = null, fold
       reasons.push(`候选折外 ${best.total} 劣于现网 live ${live.total}(只赢无档案基线不算赢)`);
     }
     if (accepted && recallDrop > num(DEFAULTS.maxR1RecallDrop, 0.02)) { accepted = false; reasons.push(`R1 召回倒退 ${recallDrop.toFixed(3)} > 容忍 ${DEFAULTS.maxR1RecallDrop}`); }
+    // 硬下界行(interval.min≥R2,即 P2 上梯/疑难形态的真硬证据)漏升不得变多:区间量尺给了"降档省钱的诱惑",
+    // 这一条保证优化器不靠把硬需求的档位预测拉低来换代价(自进化 v2,2026-11-08)。
+    if (accepted && best && best.lbUnder > legacy.lbUnder) { accepted = false; reasons.push(`硬下界(≥R2)行漏升 ${legacy.lbUnder}→${best.lbUnder},不允许以漏升换代价`); }
     if (accepted && best.under > legacy.under) reasons.push(`注意:漏升数 ${legacy.under}→${best.under}(代价仍降,因误升更贵)`);
   }
   return { legacy, live, best, runs: runs.slice(0, 4), accepted, reasons, folds: folds, labeled: labeled.length, perBucket: buckets.map((b) => b.length) };
@@ -280,7 +327,8 @@ const STOP_BIGRAM = new Set(['的话', '什么', '这个', '那个', '现在', '
  */
 export function mineTerms({ rows = [], minSupport = 5, minRate = 0.7, limit = 20, cost = null } = {}) {
   const cp = resolveCostProfile(cost);
-  const labeled = rows.filter((r) => r.trueTier);
+  // 词挖矿只对黄金行(点值语义);区间证据行不参与(自进化 v2)
+  const labeled = rows.filter((r) => r.trueTier && r.truthSource !== 'evidence');
   const existing = new Set(Object.values(TIER_LEXICON).flat().map((w) => String(w).toLowerCase()));
   const stat = new Map();
   for (const r of labeled) {
@@ -340,7 +388,9 @@ export function promoteCandidate({ dataDir = DATA_DIR, reason = 'manual', now = 
   let cand = readJson(f(dataDir, 'candidate'));
   if (!cand) {
     const legacy = readJson(f(dataDir, 'profile'));
-    if (legacy && legacy.enabled !== true && !legacy.rejected) cand = legacy;
+    // S10-F2(2026-11-11 夜审):旧制迁移兜底只认**从未有 enabled 键**的纯旧档案;
+    // enabled:false = 已被显式关停的 live 档案,不得经此兜底绕过晋升门控重新启用(旧行为 = 静默复活)。
+    if (legacy && legacy.enabled === undefined && !legacy.rejected) cand = legacy;
   }
   if (!cand || typeof cand !== 'object') return { error: '候选档案不存在,先跑 --iterate' };
   const cur = readJson(f(dataDir, 'profile'));
@@ -406,10 +456,14 @@ export function renderReport({ cost, rows, legacy, cv, mined, learned, profilePa
   for (const r of rows) bySource[r.truthSource] = (bySource[r.truthSource] || 0) + 1;
   const agreeN = rows.filter((r) => r.agree === true).length;
   const agreeAll = rows.filter((r) => r.behaviorTruth && r.mapTruth).length;
+  const evN = rows.filter((r) => r.truthSource === 'evidence').length; // 区间证据行数(自进化 v2)
   const L = [];
   L.push('# 难度档迭代优化报告(tierOptimize)');
   L.push('');
-  L.push(`> 生成时间:${new Date().toISOString()}　量尺:${rows.length} 条　候选档案:${profilePath}　live:${liveEnabled === null ? '未运行' : (liveEnabled ? '已启用' : '未启用')}`);
+  L.push(`> 生成时间:${new Date().toISOString()}　量尺:${rows.length} 条(黄金 ${rows.length - evN} + 区间证据 ${evN})　候选档案:${profilePath}　live:${liveEnabled === null ? '未运行' : (liveEnabled ? '已启用' : '未启用')}`);
+  // S10-F1(2026-11-11 夜审):黄金集缺失/为空但仍有区间证据时,本轮是 evidence-only 残量尺学习——
+  // 旧版报告无任何提示,人读 rows:N 难以察觉缩水。顶部显式标注降级。
+  if (rows.length - evN === 0 && evN > 0) L.push('> ⚠ 降级:golden-missing——黄金集缺失/为空,本轮仅凭区间证据学习,点值召回/混淆与词挖矿均无黄金语义,结果仅作参考');
   if (grow) L.push(`> 本轮扩样:${JSON.stringify(grow)}`);
   L.push('');
   L.push('## 0. 成本画像(单位 M = 100 万 R1 等效 token / 每请求)');
@@ -430,9 +484,10 @@ export function renderReport({ cost, rows, legacy, cv, mined, learned, profilePa
   L.push('');
   L.push(`行为侧与 T→R 映射的一致率:${agreeAll ? pctv(agreeN / agreeAll) : '—'}(${agreeN}/${agreeAll})——一致率就是"量尺软硬"的读数,低说明映射口径在漂。`);
   L.push('');
-  L.push('## 2. 现网分类器(无档案)');
+  L.push('## 2. 现网分类器(无档案;区间真值口径)');
   L.push('');
-  L.push(`准确率 ${pctv(legacy.accuracy)}　命中/误升/漏升 ${legacy.hit}/${legacy.over}/${legacy.under}　总代价 ${legacy.total}M(纯 token 口径 ${legacy.tokenOnlyTotal}M)　基准:恒 R1 ${legacy.baselines.alwaysR1}M / 理想 ${legacy.baselines.oracle}M`);
+  L.push(`准确率(区间带内命中) ${pctv(legacy.accuracy)}　带外误升/漏升 ${legacy.over}/${legacy.under}　硬下界(≥R2)行 ${legacy.lbN} / 漏升 ${legacy.lbUnder}　总代价 ${legacy.total}M(纯 token 口径 ${legacy.tokenOnlyTotal}M)　基准:恒 R1 ${legacy.baselines.alwaysR1}M / 理想 ${legacy.baselines.oracle}M`);
+  L.push(`历史点值口径(黄金行子集,v1 可比):总代价 ${legacy.pointLegacyTotal}M / 准确率 ${pctv(legacy.pointLegacyAccuracy)}`);
   L.push('');
   L.push('| 真值档 | n | 召回 | 精确 |');
   L.push('|---|---|---|---|');
@@ -450,6 +505,7 @@ export function renderReport({ cost, rows, legacy, cv, mined, learned, profilePa
     L.push(`| 纯 token 代价 M | ${cv.legacy.tokenCost} | ${r3(cv.best.tokenCost)} |`);
     L.push(`| 准确率 | ${pctv(cv.legacy.accuracy)} | ${pctv(cv.best.accuracy)} |`);
     L.push(`| 误升 / 漏升 | ${cv.legacy.over}/${cv.legacy.under} | ${cv.best.over}/${cv.best.under} |`);
+    L.push(`| 硬下界行漏升 | ${cv.legacy.lbUnder} | ${cv.best.lbUnder} |`);
     L.push(`| 换档次数 | ${cv.legacy.switches} | ${cv.best.switches} |`);
     L.push('');
     L.push(`门槛:${JSON.stringify(cv.best.thresholds)}　折:${cv.folds}(各折条数 ${cv.perBucket.join(',')})　逐折代价 ${cv.best.perFold.map((x) => `f${x.fold}:${x.total}`).join(' ')}`);
@@ -496,9 +552,9 @@ export function renderReport({ cost, rows, legacy, cv, mined, learned, profilePa
   L.push('');
   L.push('## 6. 口径与局限(不掩饰)');
   L.push('');
-  L.push('- 真值仍是**代理指标**:行为侧把"写得多"当"需要强模型",重实现 ≠ 慎重修改;T→R 映射是设计口径。两者一致率是本量尺的天花板。');
+  L.push('- 真值仍是**代理指标**:行为侧把"写得多"当"需要强模型",重实现 ≠ 慎重修改;T→R 映射是设计口径。两者一致率是本量尺的天花板。自进化 v2(2026-11-08)起真值为**区间**:上梯=硬下界、干净完成=可解性上界,带内计价零罚;宽区间行(干净完成类)不教信号,只进代价。');
   L.push('- 词表永不自动改,自动的只有逐信号倍数与四个门槛(critMin/editMin/verifyMin/verifyOverride);档案 enabled 默认 false,不改现网。');
-  L.push('- 现网 R4 词法入口与 P2 上梯不在黄金集里评(黄金集无 R3/R4 行为真值),R4 误升只能看 routing-shadow。');
+  L.push('- 词法 R3(顶格词+独立印证同击,R3_SIGNS)不在黄金集点值里评:真值表仍无 R3,词法 R3 的质量看区间证据行的硬下界漏升数 + routing-shadow 审计;R4 只认显式点名,误升只能看 shadow。');
   L.push('- 质量惩罚是人工定价旋钮:调到 0 时"恒 R1"就是最优解(纯 token 口径的事实),要谈升档价值必须先给它定价。');
   L.push('');
   return L.join('\n');
@@ -525,7 +581,8 @@ export async function runIteration({
   const rawCost = readJson(f(dataDir, 'cost')) || {};
   cost = { ...cost, fitted: cost.fitted ?? rawCost.fitted ?? null, fitSample: cost.fitSample || rawCost.fitSample || null, fitNote: cost.fitNote || rawCost.fitNote || null };
   if (qualityPenalty !== null) cost.qualityPenaltyPerStepM = Number(qualityPenalty);
-  const rows = loadEvalRows({ dataDir, truth });
+  const loaded = loadEvalRows({ dataDir, truth });
+  const rows = loaded.rows;
   if (!rows.length) return { state: 'skipped', reason: `黄金集无可评估行(truth=${truth})` };
   const legacy = evaluate({ rows, calibration: null, cost });
   // live 对照腿(2026-11-06 P0):现网 live 已启用才作为对照基准(关着时与基线同物,无对照意义)
@@ -536,7 +593,8 @@ export async function runIteration({
   const mined = mineTerms({ rows, cost });
   const history = readJsonl(f(dataDir, 'history'));
   const summary = {
-    at: now, rows: rows.length, truth,
+    at: now, rows: rows.length, evidence: loaded.evidence, truth,
+    degraded: (rows.length - loaded.evidence === 0 && loaded.evidence > 0) ? 'golden-missing' : null, // S10-F1:黄金缺失降级显式化
     // costTotal/legacyTotal = 现网分类器在"全序列"上的代价(实弹口径,含跨折延续的状态)
     // foldLegacy/foldCandidate = 同一折切分下的现网 vs 候选(门控只认这一对,口径逐字一致)
     costTotal: legacy.total, legacyTotal: legacy.total, legacyAccuracy: legacy.accuracy,
@@ -567,7 +625,7 @@ export async function runIteration({
   if (!dry) {
     try {
       fs.mkdirSync(path.dirname(f(dataDir, 'report')), { recursive: true });
-      fs.writeFileSync(f(dataDir, 'report'), renderReport({ cost, rows, legacy, cv, mined, learned, profilePath: f(dataDir, 'candidate'), liveEnabled: readJson(f(dataDir, 'profile'))?.enabled === true, grow: growResult, history: history.concat([summary]) }));
+      atomicWriteFileSync(f(dataDir, 'report'), renderReport({ cost, rows, legacy, cv, mined, learned, profilePath: f(dataDir, 'candidate'), liveEnabled: readJson(f(dataDir, 'profile'))?.enabled === true, grow: growResult, history: history.concat([summary]) }));
       fs.appendFileSync(f(dataDir, 'history'), JSON.stringify(summary) + '\n');
       writeJson(f(dataDir, 'state'), { at: now, rows: rows.length, accepted: !!cv.accepted });
     } catch (e) { return { state: 'grown_report_failed', reason: String(e && e.message ? e.message : e), summary }; }
@@ -584,7 +642,9 @@ export async function maybeOptimizeTier({ dataDir = DATA_DIR, minIntervalMs = 6 
     const opt = cfg?.modelRouting?.tierOptimize || {};
     if (opt.enabled !== true) return { state: 'skipped', reason: 'modelRouting.tierOptimize.enabled 未打开' };
     const st = readJson(f(dataDir, 'state')) || {};
-    if (st.at && now - Number(st.at) < num(opt.minIntervalMs, minIntervalMs)) return { state: 'skipped', reason: '距上次不足间隔' };
+    const stAge = now - Number(st.at || 0);
+    // 负龄(st.at 在未来 = 时钟回拨)不节流,放行自愈(2026-11-10 夜审 S5-F3;同 autoExemplars:107 口径)
+    if (st.at && stAge >= 0 && stAge < num(opt.minIntervalMs, minIntervalMs)) return { state: 'skipped', reason: '距上次不足间隔' };
     const r = await runIteration({ dataDir, now, grow: opt.grow !== false, fit: opt.fitCost === true, folds: num(opt.folds, DEFAULTS.folds), minN: num(opt.minN, DEFAULTS.minN), allowBoost: opt.allowBoost === true, dry: opt.dry === true });
     // 先回滚后晋升(2026-11-06 P0):旧顺序同轮"晋升→回滚检查",刚写的 promote 把回滚观察窗基准刷成 now,
     // 24h 观察窗恒不满,回滚永不具备资格(台账 5 promote / 0 rollback)。对调后先结算既有晋升的观察窗。
@@ -631,9 +691,13 @@ export async function maybePromoteTier({ dataDir = DATA_DIR, lastRun = null, opt
     if (!cand) return { state: 'skipped', reason: '候选档案缺失' };
     const sig = profileSignature(cand);
     const ledger = readJsonl(f(dataDir, 'promotion'));
-    const rb = [...ledger].reverse().find((e) => e.type === 'rollback');
-    if (rb && rb.signature === sig && rb.cooldownUntil && now < Number(rb.cooldownUntil)) {
-      return { state: 'skipped', reason: `该签名在回滚冷却期(至 ${new Date(Number(rb.cooldownUntil)).toISOString()})` };
+    // 回滚冷却全量扫描(2026-11-09 夜审 S5-F2):旧实现只看台账最后一条 rollback——
+    // 另一签名完成一轮 promote+rollback 后,先前已回滚签名的冷却即失效,可在冷却期内被重新晋升。
+    const cooldownUntil = ledger
+      .filter((e) => e && e.type === 'rollback' && e.signature === sig)
+      .reduce((mx, e) => Math.max(mx, Number(e.cooldownUntil) || 0), 0);
+    if (cooldownUntil && now < cooldownUntil) {
+      return { state: 'skipped', reason: `该签名在回滚冷却期(至 ${new Date(cooldownUntil).toISOString()})` };
     }
     const live = readJson(f(dataDir, 'profile'));
     if (live && live.enabled === true && profileSignature(live) === sig) {
@@ -750,18 +814,18 @@ if (directRun) {
     } else if (has('--report')) {
       console.log(fs.readFileSync(f(dataDir, 'report'), 'utf8'));
     } else if (has('--mine')) {
-      const rows = loadEvalRows({ dataDir, truth: opt('--truth', DEFAULTS.truth) });
-      console.log(JSON.stringify(mineTerms({ rows, minSupport: Number(opt('--min-support', 5)), cost: loadCostProfile({ dataDir }) }), null, 1));
+      const loaded = loadEvalRows({ dataDir, truth: opt('--truth', DEFAULTS.truth) });
+      console.log(JSON.stringify(mineTerms({ rows: loaded.rows, minSupport: Number(opt('--min-support', 5)), cost: loadCostProfile({ dataDir }) }), null, 1));
     } else if (has('--eval')) {
       let cost = loadCostProfile({ dataDir });
       if (has('--fit-cost')) cost = await applyCostFit({ dataDir, cost });
       if (has('--quality-penalty')) cost.qualityPenaltyPerStepM = Number(opt('--quality-penalty', 1));
-      const rows = loadEvalRows({ dataDir, truth: opt('--truth', DEFAULTS.truth) });
+      const loaded = loadEvalRows({ dataDir, truth: opt('--truth', DEFAULTS.truth) });
       const calibration = loadTierCalibration(f(dataDir, 'profile'));
       console.log(JSON.stringify({
-        rows: rows.length, truth: opt('--truth', DEFAULTS.truth), profileEnabled: !!calibration,
+        rows: loaded.rows.length, evidence: loaded.evidence, truth: opt('--truth', DEFAULTS.truth), profileEnabled: !!calibration,
         cost: { tierMultiplier: cost.tierMultiplier, implicit: cost.implicit, qualityPenaltyPerStepM: cost.qualityPenaltyPerStepM },
-        legacy: evaluate({ rows, cost }), withProfile: calibration ? evaluate({ rows, calibration, cost }) : null,
+        legacy: evaluate({ rows: loaded.rows, cost }), withProfile: calibration ? evaluate({ rows: loaded.rows, calibration, cost }) : null,
       }, null, 1));
     } else {
       const r = await runIteration({
