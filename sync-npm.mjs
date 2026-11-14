@@ -38,7 +38,8 @@ fs.writeFileSync(npmPkgPath, JSON.stringify(npmPkg, null, 2) + '\n')
 
 for (const n of fs.readdirSync(srcDir)) {
   if (SKIP_SRC.has(n) || n.endsWith('.test.mjs') || n === 'regress.mjs') continue
-  if (n.endsWith('.mjs') || n === 'output-diet.md') copy(n)
+  // .cs(hook-relay.cs)随包分发:init.mjs ensureHookRelay 依赖「源码与 init 同目录」,缺源=npm 用户永远回退 node 直启(ZCode 闪窗)
+  if (n.endsWith('.mjs') || n.endsWith('.cs') || n === 'output-diet.md') copy(n)
 }
 
 const deployDoc = fs.readFileSync(path.join(srcDir, '部署使用说明.txt'), 'utf8')

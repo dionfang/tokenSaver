@@ -10,6 +10,7 @@
   "files": [
     "*.mjs",
     "output-diet.md",
+    "hook-relay.cs",
     "README.md",
     "部署使用说明.txt"
   ],
