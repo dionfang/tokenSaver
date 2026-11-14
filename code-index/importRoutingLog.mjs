@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { DATA_DIR } from './config.mjs';
 import { WRITE_TOOLS, DISPATCH_TOOLS, READ_TOOLS } from './calibrateSignals.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 import { promptKey } from './buildExemplars.mjs';
 import { labelFromCounts } from './tierTruth.mjs';
 

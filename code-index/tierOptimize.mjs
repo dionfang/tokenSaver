@@ -790,8 +790,11 @@ export function rollbackNow({ dataDir = DATA_DIR, reason = 'manual', now = Date.
   const prev = readJson(f(dataDir, 'prev'));
   if (prev) writeJson(f(dataDir, 'profile'), { ...prev, rolledBackAt: now });
   else if (cur) { cur.enabled = false; cur.rolledBackAt = now; writeJson(f(dataDir, 'profile'), cur); }
-  appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'rollback', reason: String(reason || 'manual'), signature: cur ? profileSignature(cur) : null });
-  return { state: 'rolled-back', restoredPrev: !!prev };
+  // S5-F2(2026-11-11 夜审,2026-11-14 补修):手动回滚与自动回滚同权——台账带 cooldownUntil
+  // (默认同自动 7 天),否则晋升门控读不到冷却期,同一签名可绕过冷却直接复活。
+  const cooldownUntil = now + 7 * 24 * 60 * 60 * 1000;
+  appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'rollback', reason: String(reason || 'manual'), signature: cur ? profileSignature(cur) : null, cooldownUntil });
+  return { state: 'rolled-back', restoredPrev: !!prev, cooldownUntil };
 }
 
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));

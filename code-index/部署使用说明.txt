@@ -10,6 +10,7 @@ TokenSaver 部署使用说明
      约 1.5GB(q4f16 决策 1.0GB+嵌入+精排;q8 权重已删,切回需重新获取——指标备档在 data/routing/profile-calibration-strands-q8.md),复制部署需整目录带走;npm 安装缓存在 ~/.tokensaver/hf-cache),
      缺失时首次使用自动下载;
    - ollama:本机自行安装并启动 Ollama,再手工 pull(本工具不代拉、不自动启动):
+     版本推荐:**钉 Ollama 0.40.15**(实测嵌入批量 ~0.83s/块;0.40.16 退化至 1.17-1.42s/块约慢 1.5 倍,0.40.7 居中且波动大;三版本 /v1/systemone 决策端点均兼容)。升级前按同口径复测嵌入吞吐(batch 32、腾显存、90s 双采样)。
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16
        ollama pull tev1:0.8b(决策判定)
@@ -112,15 +113,11 @@ TokenSaver 部署使用说明
     maxPhaseTurns              升档阶段最多持续的人类轮数(默认 4)
     switchGuard                上下文过厚时不升档(默认开,阈值 20 万 tokens;
                                同会话连拦 3 次自动放行,拦截时客户端会收到压缩建议)
-    l2                         L2 向量能力嵌套配置(2026-11-07 收口):{shadow 嵌入器
-                               总闸(默认 false) / vote:{minSim,minConf} 代签投票阈值
-                               (0.55/0.6) / live:{enabled,minConf} 线上路由救回(默认
-                               关)}——shadow 关则两条支路都拿不到嵌入器;旧顶层
-                               l2Shadow/l2Live/旧 l2.minSim 兼容读一个版本期
-    r3Lexical                  R3 词法通道总闸(2026-11-08 v2 重建;enabled=顶格词+
-                               独立印证同击的词法 R3,eagerEscalate=P2 提前一拍:               
-                               R2 难度任务第 1 次报错即上 R3;缺省双开,任一显式
-                               false 关对应通道;kill-switch 语义,进程每请求现读)
+    l2                        **已回收(2026-11-14 用户裁定)**:L2 影子/实弹融合票恒开(代码常量,
+                               配置键不再读取);阈值(minSim 0.55/minConf 0.6/live 0.3)属标定
+                               域走代码默认,不暴露给用户配置面
+    r3Lexical                 **已回收**:R3 词法通道与 P2 提前一拍恒开(代码常量,enabled/
+                               eagerEscalate 不可配);词表本体在 tierClassify.mjs
     decisionModel              四票合议代签的判定模型(2026-11-09 v4 本地化收口:判定
                                恒本地、零远程调用——ollama=models.decision
                                (tev1:0.8b) / local=models.localDecision(Strands
@@ -188,6 +185,7 @@ TokenSaver deployment guide
      copy-deploying; npm installs cache to ~/.tokensaver/hf-cache). Missing models
      download automatically on first use.
    - ollama: install and start Ollama yourself, then pull by hand (this tool never
+     Version pin: **Ollama 0.40.15** (measured bulk embedding ~0.83s/chunk; 0.40.16 regressed to 1.17-1.42s/chunk, ~1.5x slower; 0.40.7 in between with high variance; /v1/systemone decision endpoint compatible on all three). Re-benchmark with the same protocol before upgrading.
      starts Ollama or pulls for you):
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16

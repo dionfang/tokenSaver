@@ -116,4 +116,12 @@ if (backend === 'local') {
 
 console.error(`[done] 预热完成,耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 // 嵌入或精排没拉起 → 失败退出。状态句以 modelStatus 的现场判定为准,不单凭这个退出码。
+// A(2026-11-14 用户定案):预热收尾当场跑一次真实健康评估——assessModelStatus 内部会写健康缓存,
+// 消除"预热把模型拉回、状态句还吃最长 5 分钟陈旧'未拉起'快照"的空窗;下轮状态句立即翻正。
+if (embedOk && rerankOk) {
+  try {
+    const { assessModelStatus } = await import('./modelStatus.mjs');
+    await assessModelStatus();
+  } catch { /* 缓存刷新失败不影响预热结果 */ }
+}
 process.exit(embedOk && rerankOk ? 0 : 1);

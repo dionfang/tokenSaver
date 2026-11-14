@@ -18,14 +18,17 @@ hf-cache/
 # 动态模型路由设计决策与实施文档,仅本地维护不推送
 /model-routing.md
 
-# 本地测试/审查/学习/夜间编排资产(2026-11-10 用户定:非部署文件,不入库、不进远程仓库)
-# 例外:A/B 实验原始证据 ab-logs/ 保持版本控制(2026-11-11 自 test/ab/result 迁入)
-/agent_reports/*
-!/agent_reports/ab-logs/
+# 本地测试/审查/学习/夜间编排/实验证据资产(2026-11-14 用户定:agent_reports 全部不入库——
+# 原先 ab-logs 例外入库的政策废除,668 个证据文件已 git rm --cached 取消追踪,磁盘保留)
+/agent_reports/
 /tools/
+/bugfix-sop.md
+/agent_generated_tests/
+/bugfix-sop.md
+/agent_generated_tests/
 
-# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
-/C:/Users/Administrator/AppData/Local/Temp/tmp.FEHZdy3OVr/
+# 失效的一次性绝对路径条目(2026-11-14 清理:临时目录条目对协作无意义)
+# (原两条 /C:/Users/...tmp.*/ 已移除)
 
-# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
-/C:/Users/Administrator/AppData/Local/Temp/tmp.hyjiOVkAEd/
+# GUI 中继编译产物(本地,init 按需重编;bin/hook-relay.exe)
+/code-index/bin/

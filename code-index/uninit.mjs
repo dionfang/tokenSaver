@@ -141,11 +141,24 @@ export function uninstallQoderUserHooks({ home = os.homedir() } = {}) {
 
 /** 剥掉纪律段:<!-- code-index --> 标记锚(与 init wireAgents 同构:标题文字可变——
  *  旧版锚定固定标题「## 代码检索纪律」,用户改过标题且未被新版 init 重写的旧部署会剥不掉残留),
- *  至下一个注入段标记或任意层级标题。 */
+ *  至下一个注入段标记或任意层级标题。
+ *  S3-F1(2026-11-14 夜审,与已修 P2-15 同族):段后既无标记也无标题时,旧逻辑吞到文末,
+ *  连段后无标题的用户纯文本一起删。收窄:段体以编号条目行结尾——尾部非编号行保留不删;
+ *  段内无编号行(未知形态)维持旧行为(无法判定边界,保守不动)。 */
 export function stripDisciplineSection(content) {
   const sectionRe = /<!-- code-index[^>]*-->[^\r\n]*\r?\n[^\r\n]*[\s\S]*?(?=\r?\n<!-- (?:code-index|ponytail|output-diet)[^>]* -->|\r?\n#{2,6} |$)/;
-  if (!sectionRe.test(content)) return null;
-  return content.replace(sectionRe, '');
+  const m = content.match(sectionRe);
+  if (!m) return null;
+  let cut = m[0];
+  const rest = content.slice(m.index + m[0].length);
+  const bounded = /\r?\n<!-- (?:code-index|ponytail|output-diet)[^>]* -->|\r?\n#{2,6} /.test('\n' + rest);
+  if (!bounded) {
+    const lines = cut.split(/\r?\n/);
+    let last = -1;
+    lines.forEach((l, i) => { if (/^\d+\.\s/.test(l)) last = i; });
+    if (last >= 0 && last < lines.length - 1) cut = lines.slice(0, last + 1).join('\n');
+  }
+  return content.slice(0, m.index) + content.slice(m.index + cut.length);
 }
 
 /** 剥掉输出纪律段:优先按 init 写入的精确模板块移除(段后用户内容保留);

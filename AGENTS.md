@@ -23,7 +23,7 @@
 
 10. **部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `cd code-index && node deploySync.mjs` 校验一致性;不一致就重新运行 `node init.mjs` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致。**增删/改名用户级 hooks 转发器时,必须同步 `init.mjs` 与 `uninit.mjs` 两处部署/清理逻辑**:先登记 `init.mjs` 的 `USER_FORWARDER_FILES` 单源清单(uninit 清理与 deploySync 门禁都从这里取),漏登记会被 deploySync 拦下(安装⊆登记、卸载≡登记,卸载残留/手抄漂移都算不过)
 
-11. **实验数据保护**:`agent_reports/ab-logs/`(A/B 实验结果,2026-11-07 自 data/ab 迁入、2026-11-11 自 test/ab/result 迁入)等实验目录里是唯一的原始证据,删了不可再生(已入版本控制受 git 保护,但 `test/` 其余部分仍是本地沙盒):禁止 `git clean -x/-X`、`rm -rf agent_reports/ab-logs` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意
+11. **实验数据保护**:`agent_reports/`(A/B 实验结果 ab-logs 等,2026-11-07 自 data/ab 迁入、2026-11-11 自 test/ab/result 迁入;2026-11-14 用户定:全部本地资产不入 git)等实验目录里是唯一的原始证据,删了不可再生且**无版本控制兜底**(git 里已取消追踪):禁止 `git clean -x/-X`、`rm -rf agent_reports` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意
 
 12. **缺陷文档回写**:按缺陷文档(如 `agent_reports/failures.md`)修完 bug 后,必须回写该文档——逐条标注已修/未修与修复位置,并把该文档标记为「已处理」;同一份文档不得再作为待修清单二次下发,重复下发时先核对文档内的已修标记,只处理仍未修的条目
 

@@ -14,6 +14,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS } from './thresholds.mjs'; // S1-F4:阈值单源(thresholds.mjs,叶子无环)
+export { MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS }; // 供 init 播种骨架引用同一单源
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -95,11 +97,13 @@ export function loadKnownAnnotations(file = KNOWN_ANNOTATIONS_PATH) {
  * Ollama 加载参数。warm、search、embed 必须用同一组:
  * 换 num_ctx 会重载模型,更短的 keep_alive 会把预热的 2 小时驻留改掉。
  */
-export const OLLAMA_KEEP_ALIVE = '2h';
+/** Ollama 模型空闲驻留时长,也是 local 常驻进程的空闲自退周期(2026-11-14 用户定案 B:'2h'→'24h',
+ *  三模型常驻不因空闲消失,状态句不再反复"未拉起";显存恒占 ≈4.5GB,桌面上由 Ollama 按压力自行驱逐并自愈)。
+ *  取值 'Nh'/'Nm'/'Ns';'-1' 不允许(常驻侧解析仅认数字单位),要近似永久用超大时长如 '168h'(一周)。 */
+export const OLLAMA_KEEP_ALIVE = '24h';
 export const OLLAMA_NUM_CTX = 4096;
-/** ollama 批量嵌入批间节流(毫秒,2026-11-11 WHEA 缓解):批与批之间给显存/供电留喘息,0=不限流。
- *  5 次 MCE 全在加载 ramp(曲线平稳猝死),节流不针对根因(嫌疑供电瞬态),是"稳优先于快"的降压垫;embed.mjs --pace 可单次覆盖。 */
-export const OLLAMA_EMBED_PACE_MS = 500;
+/** ollama 批量嵌入批间节流:已废并移除(2026-11-14 审查回退——死导出零消费;节流仅存于 embed.mjs --pace CLI,默认 0)。
+ *  WHEA 复发时的应急旋钮仍是 embed.mjs --pace;历史见 agent_reports/fix-logs/fix-20261112-whea-mitigation.md */
 
 /** 读取目录的 git HEAD;非 git 仓库/命令失败返回 null(保鲜判定与构建记录共用) */
 export function gitHeadOf(dir) {
@@ -127,7 +131,9 @@ export const DEFAULT_CONFIG = {
   //   authority=同名内容键的标签权威层:'local'(默认,= 项目当前四票自签模式)用本地标签覆盖服务器;
   //     'base' 保留服务器清洗结果(本地只补向量、不改标签)。
   // data/code-index.config.json 的 exemplars 段可覆盖(深合并)。
-  exemplars: { capPerLabel: 200, totalCap: 400, dynamicQuota: true, authority: 'local' },
+  // 2026-11-14:base+local 双层向量合并生效 ⇒ 本地层**不限比例**——capPerLabel/totalCap 默认
+  //   **0=不生效**(全量入库);显式配正数才重新启用配额治理(两键可独立生效,见 buildExemplars)。
+  exemplars: { capPerLabel: 0, totalCap: 0, dynamicQuota: true, authority: 'local' },
   // 非 git root 的保鲜回退阈值(git root 走 HEAD 比对,不用时间)
   staleNonGitMs: 24 * 60 * 60 * 1000,
   // 模型部署只写在本文件(入库)。不读 OLLAMA_EMBEDDING / OLLAMA_RERANKER / OLLAMA_BASE / OLLAMA_FORCE_*。
@@ -138,6 +144,14 @@ export const DEFAULT_CONFIG = {
   // 实测(w=1)两个精排模型都会把一阶段的好序翻坏;细网格调参 w∈[0.25,0.35] 为 fileR5=44/50 平台,
   // 0.275 是平台内 MRR 峰且各子集 maximin 最优,见 exp-2026-10-26/rerank-bench(tune.mjs/maximin.mjs)。
   rerankBlend: 0.275,
+  // 本地 transformers.js 嵌入的 CPU 线程上限(2026-11-14 用户定案:嵌入默认"后台缓慢运行"不拉满 CPU):
+  //   传给 ORT 会话 intraOpNumThreads(interOp 恒 1);默认=min(4, max(2, 物理核数/4))≈25% CPU。
+  //   data/code-index.config.json 顶层键可覆盖;0=全核(旧行为)。embed.mjs 另可用 --cpu-threads 单次覆盖。
+  embedCpuThreads: Math.max(2, Math.min(4, Math.floor(os.cpus().length / 4))),
+  // 自愈补拉节流(2026-11-14 用户定案:可配置):模型被驱逐/缺位后,两次补拉之间的最小间隔。
+  //   默认 600000=10 分钟(防持续故障时的进程风暴);调小=驱逐后拉回更快,代价是故障时 spawn 频率高。
+  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。
+  warmMinIntervalMs: 600000,
   models: {
     embedding: 'qwen3-embedding:0.6b',
     reranker: 'sam860/qwen3-reranker:0.6b-F16',
@@ -193,7 +207,7 @@ export const DEFAULT_CONFIG = {
   //   minIntervalMs=节流间隔(默认 6h);folds/minN/priorN=折数/最小支持/平滑先验,量尺小时加大 priorN 更保守;
   //   grow=false 只评不扩样;fitCost=true 从 proxy-usage.jsonl 反标定冷热轮实测值(默认用人工画像);
   //   dry=true 只出报告不落档案;allowBoost=false 学到的高纯度信号也只降不升(升档代价 8 倍,升权是加杠杆)。
-  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }] }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: 4, switchGuard: { enabled: true, maxContextTokens: 200000 }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
+  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }] }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: MAX_PHASE_TURNS, switchGuard: { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
 };
 
 export function loadConfig({ soft = false } = {}) {

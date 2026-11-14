@@ -131,6 +131,7 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
   const overrides = {};
   const seen = new Set();
   let embedded = 0, reusedBase = 0, reusedLocal = 0, fail = 0, dim = 0;
+  let targetDim = 0; // 目标模型实测维度(S4-F1:dim 锚定到目标模型产出,旧档复用可能带历史污染)
   const put = (key, meta, v) => {
     if (!dim && v && v.length) dim = v.length;
     vectors[key] = { ...meta, v_b64: encodeVector(v) }; // 统一存 base64 Float32(省体积 ~4x)
@@ -174,7 +175,7 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
     if (oldV) { put(key, meta, oldV); reusedLocal += 1; continue; }
     try {
       const v = await embedForWantFinal(e.prompt);
-      if (Array.isArray(v) && v.length) { put(key, meta, v); embedded += 1; continue; }
+      if (Array.isArray(v) && v.length) { put(key, meta, v); if (!targetDim) targetDim = v.length; embedded += 1; continue; }
     } catch (err) { if (failFast) throw err; }
     fail += 1;
   }
@@ -183,6 +184,15 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
   if (!dim) {
     const anyOld = baseOk && Object.values(baseOk.vectors).map(entryVector).find(Boolean);
     dim = (anyOld && anyOld.length) || (localOld && localOld.dim) || 0;
+  }
+  // S4-F1(2026-11-14 夜审):目标模型实测维度优先——旧档复用条目可能带历史污染(768 冒充),
+  // 以本次目标模型产出为准锚定 dim,再逐条自检丢弃错维条目(含被污染的旧档复用)。
+  if (targetDim) dim = targetDim;
+  if (dim) {
+    for (const [id, v] of Object.entries(vectors)) {
+      const vec = entryVector(v);
+      if (vec && vec.length !== dim) { delete vectors[id]; fail += 1; console.error(`[warn] 混维条目丢弃:${id}(${vec.length} 维 ≠ ${dim})`); }
+    }
   }
   const doc = {
     version: 1, builtAt: new Date().toISOString(), model: want, dim,
@@ -1041,14 +1051,15 @@ export function resolveL2Config(mr = {}) {
   const oldLive = mr.l2Live && typeof mr.l2Live === 'object' && !Array.isArray(mr.l2Live) ? mr.l2Live : {};
   const num = (v) => Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null;
   return {
-    // 总闸:新 l2.shadow 优先;缺则回落旧顶层 l2Shadow
-    shadow: l2.shadow !== undefined ? l2.shadow === true : mr.l2Shadow === true,
-    // 代签投票阈值:新 l2.vote 优先;缺则回落旧 l2.minSim/minConf(同键名旧形态)
+    // 总闸:**恒开**(2026-11-14 用户裁定:默认开启不支持关闭)——嵌入资源压力随 GPU 线材修复解除,
+    //   配置键 l2.shadow/旧 l2Shadow 不再读取
+    shadow: true,
+    // 代签投票阈值:新 l2.vote 优先;缺则回落旧 l2.minSim/minConf(同键名旧形态);标定域,用户配置面已回收
     voteMinSim: num(vote.minSim) ?? num(l2.minSim) ?? L2_MIN_SIM,
     voteMinConf: num(vote.minConf) ?? num(l2.minConf) ?? L2_MIN_CONF,
-    // 线上救回:新 l2.live 优先;缺则回落旧顶层 l2Live;再缺 enabled=false/minConf=0.8(保守档)
-    liveEnabled: live.enabled !== undefined ? live.enabled === true : oldLive.enabled === true,
-    liveMinConf: num(live.minConf) ?? num(oldLive.minConf) ?? 0.8,
+    // 线上救回:**恒开**(2026-11-14 用户裁定,同 shadow);配置键 l2.live.enabled/旧 l2Live.enabled 不再读取
+    liveEnabled: true,
+    liveMinConf: num(live.minConf) ?? num(oldLive.minConf) ?? 0.3, // 2026-11-14 单源对齐:init scaffold 与 2026-11-06 实测定档均为 0.3(0.8 是更老遗留,只配 enabled:true 不配 minConf 时会静默拿到 0.8 几乎不触发)
   };
 }
 
@@ -1057,7 +1068,7 @@ export function resolveL2Config(mr = {}) {
  *  2026-11-01 实测:此前所有入口(--shadow-async/--classify)都不传 embedFn ⇒ L2 从未运行过,
  *  routing-shadow.jsonl 193 条全为 source:'none'。这里把"通电"变成一条开关,而不是默认行为。 */
 export function l2ShadowEnabled(cfg = {}, explicit = false) {
-  return explicit === true || resolveL2Config(cfg.modelRouting || {}).shadow;
+  return true; // 2026-11-14 用户裁定:嵌入器总闸恒开(默认开启不支持关闭);参数保留签名兼容
 }
 
 /**
@@ -1098,8 +1109,10 @@ async function cli(argv) {
     const logPath = path.join(dataDir, 'routing', 'build-vectors.log');
     const logLine = (obj) => { try { fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.appendFileSync(logPath, JSON.stringify(obj) + '\n'); } catch { /* 日志失败不影响主流程 */ } };
     try {
-      const { embedIntentResilient } = await import('./rangePick.mjs');
-      const r = await buildVectors({ dataDir, embedFn: (t) => embedIntentResilient(t) });
+      // S4-F1(2026-11-14 夜审修复,报告方案①):CLI 不再注入 embedFn——走 buildVectors 内建
+      // embedForWant(模型绑定:ollama 目标直打 /api/embed,禁跨模型兜底)。此前经
+      // embedIntentResilient 的 jina 兜底曾产出 768 维冒充 ollama 指纹入库(实锤 1/302 条)。
+      const r = await buildVectors({ dataDir });
       logLine({ at: new Date().toISOString(), source: 'child', ok: true, okCount: r.ok, fail: r.fail, dim: r.dim, model: r.model });
       console.log(JSON.stringify(r));
     } catch (e) {

@@ -84,9 +84,10 @@ if (MODE !== 'bm25') {
       // 覆盖度守卫(2026-11-11 崩溃复盘):嵌入中断留下的部分快照可能只有几十行,
       // 不得吞掉整个语料——只有覆盖当前块清单一半以上才值得切过去
       if (paired.length && paired.length * 2 >= chunks.length && Math.abs(size - expect) <= 4) {
+        const currentN = chunks.length; // S14-P1(2026-11-14):先存当前块数再切换,否则警告恒打印快照数(诊断失真)
         chunks = paired;
         vecSnapshot = true;
-        console.error(`[warn] 签名过期,基于嵌入时快照检索(快照 ${paired.length} 块/当前 ${chunks.length} 块;新改动待重嵌后可见: node embed.mjs)`);
+        console.error(`[warn] 签名过期,基于嵌入时快照检索(快照 ${paired.length} 块/当前 ${currentN} 块;新改动待重嵌后可见: node embed.mjs)`);
       }
     } catch { /* 快照不可读:保持当前块清单,向量段指纹校验会拒绝并降级 bm25 */ }
   }
@@ -366,7 +367,7 @@ async function rerankCandidates(query, pool, firstStage, chunks) {
         process.stderr.write(`\r[rerank] ${done}/${pool.length}`);
       }
     }
-    await Promise.all(Array.from({ length: 2 }, worker)); // 并发 4→2(2026-11-11 WHEA 缓解):ollama 单队列串行执行,客户端并发只加排队深度
+    await Promise.all(Array.from({ length: 4 }, worker)); // 并发 4(2026-11-14 回退 WHEA 保守化 4→2:根因=显卡供电线材已排除,恢复 v1.0.0 吞吐;ollama 服务端仍单队列)
     process.stderr.write(`  模型:${rrModel}${failedCount ? `(失败${failedCount}已回退)` : ''}\n`);
     return results;
   } catch (e) {

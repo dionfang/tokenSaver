@@ -61,12 +61,17 @@ async function loadEmbedder(modelId) {
   const { env, pipeline } = await import('@huggingface/transformers');
   env.cacheDir = HF_CACHE_DIR;
   env.allowLocalModels = false;
+  // CPU 线程上限(2026-11-14 用户定案):常驻会话同时承接 embed.mjs 的批量复用路径——批量在此跑时
+  // 不允许拉满 CPU;查询单条本就轻,限线程无感。0=全核(旧行为)。
+  const cap = Math.max(0, Number(loadConfig().embedCpuThreads) || 0);
+  const sopt = cap > 0 ? { session_options: { intraOpNumThreads: cap, interOpNumThreads: 1 } } : {};
+  console.error(`[info] 嵌入模型会话 threads=${cap || '全核'}`);
   try {
-    return await pipeline('feature-extraction', modelId, { dtype: 'q8' });
+    return await pipeline('feature-extraction', modelId, { dtype: 'q8', ...sopt });
   } catch (e) {
     console.error(`[warn] HuggingFace 下载失败(${e.message}),切换 hf-mirror.com 重试...`);
     env.remoteHost = 'https://hf-mirror.com';
-    return pipeline('feature-extraction', modelId, { dtype: 'q8' });
+    return pipeline('feature-extraction', modelId, { dtype: 'q8', ...sopt });
   }
 }
 

@@ -23,7 +23,7 @@ const lockPath = path.join(DATA_DIR, '.warm.lock');
  *  未追踪新文件也计入:build 扫描盘面会把它们编进索引,漏了它们新鲜度同样失真。 */
 function gitDirtyOf(dir) {
   try {
-    const r = spawnSync('git', ['status', '--porcelain'], { cwd: dir, timeout: 5000, encoding: 'utf8' });
+        const r = spawnSync('git', ['status', '--porcelain'], { cwd: dir, timeout: 5000, encoding: 'utf8', windowsHide: true }); // 闪窗泄漏修复(2026-11-14):git 是控制台程序,漏 hide 每会话×3仓闪窗
     return r.status === 0 && String(r.stdout || '').trim() !== '';
   } catch { return false; }
 }

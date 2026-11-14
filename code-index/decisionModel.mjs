@@ -47,7 +47,8 @@ export const TIER_CRITERIA = {
 // ---------- 模型判定档案(2026-11-09 v3 方案 §2):门槛跟随被选模型,不跟全局数字 ----------
 // 键=判定后端名(与 decision-ledger 的 backend 前缀同源):'ollama:<models.decision>' / 'local:<models.localDecision>'。
 // '*' 结尾=品牌前缀匹配;未命中(未建档模型)回退 FALLBACK(=2026-11-08 硬编码默认,行为零漂移)。
-// data JSON 覆盖:modelRouting.decisionModel.profiles["<键或前缀*>"] = {signing:{min,twoVote}, arm1:{live,minConf,window,maxChars}, arm2:{r3MinConf}}。
+// 客户端 config 覆盖通道已移除(2026-11-14 用户裁定):data JSON 的 decisionModel.profiles 不再被读取——
+// arm1/arm2/signing 最终参数权威=代码档案表 → 服务器档案层(base 包下发);客户端不得以 config 打乱最终参数。
 // window:'ambiguous'=仅词法置信≤0.5 的 R1 轮咨询(旧窄缝);'all-r1'=全部 R1 轮咨询(本地零成本下的标定窗)。
 // 默认表按 2026-11-09 标定回放(240 条黄金集评测行,code-index/profileCalibrate.mjs --backend tev1|strands 可复跑,
 // 报告 data/routing/profile-calibration-<后端>.md)取值:
@@ -78,7 +79,7 @@ export const DECISION_PROFILE_FALLBACK = { signing: { min: 0.6, twoVote: 0.9 }, 
 
 /** 服务器下发档案层(2026-11-10 "一起发包"):档案可内嵌在 base 向量包(profiles 字段),
  *  也可放独立 decision-profiles.base.json(兼容旧部署);base 内嵌优先。
- *  解析顺序:代码默认表 → 服务器档案层 → data JSON 用户 profiles(用户显式配置仍最高优先)。
+ *  解析顺序:代码默认表 → 服务器档案层(base 包)。客户端 config profiles 通道已移除(2026-11-14 用户裁定)。
  *  安全校验:只接受已知键;置信/门槛必须在 [0,1](越界拒绝,不钳成边界值);window 白名单;
  *  非法条目整体忽略(fail-open 到默认),服务器参数不能把判定链改到无法工作。 */
 export const SERVER_PROFILES_FILE = 'decision-profiles.base.json';
@@ -132,8 +133,8 @@ export function readServerProfiles(dataDir = DATA_DIR) {
     const paths = vectorsLayerPaths(dataDir);
     const files = [
       path.join(dataDir, 'routing', SERVER_PROFILES_FILE), // ① 独立文件(旧)
-      paths.base.slugFile,                                 // ② base 包内嵌(当前模型,优先)
       paths.base.fixedFile,                                // ② base 旧固定名(迁移期)
+      paths.base.slugFile,                                 // ② base 包内嵌(当前模型,权威)——S14-F1:slug 后读,旧固定名不得覆盖
     ];
     const mt = files.map((f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } });
     const key = `${dataDir}|${paths.slug}|${mt.join(',')}`;
@@ -155,7 +156,7 @@ export function readServerProfiles(dataDir = DATA_DIR) {
   } catch { return _serverProfilesCache.data || {}; }
 }
 
-/** 当前判定后端 → 生效档案(默认表 → 服务器层 → data JSON 用户 profiles 深合并;测试可注入 config/dataDir)。 */
+/** 当前判定后端 → 生效档案(默认表 → 服务器层;客户端 config profiles 通道已移除,参数权威在档案)。 */
 export function resolveDecisionProfile(config = null, { dataDir = DATA_DIR } = {}) {
   const cfg = { ...loadConfig(), ...(config || {}) };
   const isOllama = String(cfg.modelIn) === 'ollama';
@@ -164,11 +165,11 @@ export function resolveDecisionProfile(config = null, { dataDir = DATA_DIR } = {
   let prof = DECISION_PROFILE_FALLBACK;
   let matched = null;
   if (backend) {
-    const dmCfg = (cfg.modelRouting && cfg.modelRouting.decisionModel && typeof cfg.modelRouting.decisionModel === 'object') ? cfg.modelRouting.decisionModel : {};
-    const userProfiles = dmCfg.profiles && typeof dmCfg.profiles === 'object' ? dmCfg.profiles : {};
     const serverProfiles = readServerProfiles(dataDir);
-    // 三段匹配:默认表给标定基线,服务器层随 base 包更新,用户 profiles 最后覆盖(个人微调优先)
-    for (const table of [DECISION_PROFILES_DEFAULT, serverProfiles, userProfiles]) {
+    // 两段匹配(2026-11-14 用户裁定:arm1/arm2 参数权威=模型档案,base 包同步到客户端;
+    // **客户端 config 的 decisionModel.profiles 通道已移除**——不允许通过 data JSON 打乱最终参数,
+    // 档案修正只能走服务器档案层随包下发)。默认表给标定基线,服务器层随包更新。
+    for (const table of [DECISION_PROFILES_DEFAULT, serverProfiles]) {
       for (const [k, v] of Object.entries(table)) {
         if (!v || typeof v !== 'object') continue;
         const pat = String(k).replace(/\*$/, '');
@@ -374,8 +375,13 @@ export function breakerOpen(dataDir = DATA_DIR) {
   } catch { return null; }
 }
 
-/** 跳闸:复核失败即写,之后零网关尝试;reason 留痕供人判断。 */
+/** 跳闸:复核失败即写,之后零网关尝试;reason 留痕供人判断。
+ *  S12-F1(2026-11-14 夜审):dataDir 校验必为字符串(省略=生产 DATA_DIR)——曾有 harness 误传
+ *  对象作第二参,静默把断路器写进生产路径;错传就地抛错而非静默写错处。 */
 export function tripBreaker(reason, dataDir = DATA_DIR) {
+  if (dataDir !== undefined && dataDir !== null && typeof dataDir !== 'string') {
+    throw new TypeError(`tripBreaker: dataDir 必须是字符串路径(收到 ${typeof dataDir},疑似参数误传)`);
+  }
   try {
     fs.mkdirSync(path.dirname(breakerPath(dataDir)), { recursive: true });
     // 原子写(2026-11-10 夜审 S12-F4c):断路器半写 = 静默解除,崩溃留半截 JSON 会让下次读到"未跳闸"

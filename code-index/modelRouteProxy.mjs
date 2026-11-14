@@ -48,6 +48,7 @@ import { DATA_DIR, loadConfig } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
+import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext } from './thresholds.mjs'; // S1-F4:歧义窗/上梯表单源(thresholds.mjs)
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
 import { resolveDecisionProfile } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
@@ -83,7 +84,7 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 // 判定缓存:同 prompt 判一次,按 pkey 缓存(进程级,代理长驻);TTL 6h、容量 200,简单 LRU。
 // 影子账 data/usage/r-ref-shadow.jsonl:逐条记 L1 vs 决策票对照——决策票能否晋升实弹,
 // 唯一依据是它与结果侧证据(上梯/干净完成)的一致率,这里只攒数据。
-const RREF_AMB_CONF = 0.5; // 词法置信 ≤ 此值的 R1 才属"词法最瞎区",才值得现查判定模型
+// RREF_AMB_CONF 已单源化(S1-F4):import 自 thresholds.mjs(R1_AMBIGUOUS_CONF as RREF_AMB_CONF)
 const RREF_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const RREF_CACHE_MAX = 200;
 const rRefCache = new Map(); // key = pkey|decisionModel(2026-11-09 加模型身份):切换决策模型后旧模型结果不再被命中,防 6h 缓存串味
@@ -865,7 +866,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   // P2 提前一拍(v2 2026-11-08 重建裁定):eagerR3=true(开关+1 连败+本轮任务定档 R2)且服务档=R2 时,
   // 第 1 次报错即上 R3——R2 难度任务第 1 次报错就是"R2 可能不够"的真实行为证据,省一轮 8x 空转;R1→R2 仍 2 连败。
   // 返回 {decision} 上梯成功 | {mark:false} 已封顶/目标档不可达/门控抑制(落到普通工具续接,streak 保持)。
-  const ESC_NEXT = { R1: 'R2', R2: 'R3', R3: null, R4: null };
+  const ESC_NEXT = thresholdsEscNext; // S1-F4:上梯表单源(thresholds.mjs)
   const servingTier = tierOfModel(inPhase ? phase.model : baseModel, tcls.modelTiers ? tcls : undefined) || 'R1';
   const escTarget = ESC_NEXT[servingTier] || null;
   const tryEscalate = () => {
@@ -933,7 +934,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   // classifyDifficulty 的"无信号兜底/过短"R1 判定 confidence ≤0.5,属于"判不出"而非"明确日常轮";
   // 这类轮跳过 R1 宽限,立即降档到 R1 档模型(宽限本是明确 R1 轮的热缓存 economics,不为歧义轮留高价档)。
   // 明确 R1 轮(提问 0.6/杂务 0.7/单点编辑 0.65)宽限照旧;auto 会话 sticky 基准本就是 R1 链头,天然不受影响。
-  const AMBIGUOUS_R1_CONF = 0.5;
+  const AMBIGUOUS_R1_CONF = RREF_AMB_CONF; // S1-F4:与 arm1 触发窗同一单源(thresholds.mjs R1_AMBIGUOUS_CONF)
   const ambiguousR1 = r1Asks && Number(diff?.confidence) <= AMBIGUOUS_R1_CONF;
   const r1Streak = phase?.r1Streak || 0;
   const phaseAtCap = inPhase && (phase.humanTurns || 0) >= g.maxPhaseTurns;
@@ -1327,7 +1328,14 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             const msgs = bodyObj.messages || [];
             for (let i = msgs.length - 2; i >= 0; i--) {
               const m = msgs[i];
-              if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) { prevHuman = String(m.content).slice(0, 400); break; }
+              // S14-P4(2026-11-14):content 支持 blocks 数组形态(Anthropic [{type:'text',text}])——
+              // 旧实现只认 string,数组形态 prevHuman 恒 null → rRef/D4 咨询 context 静默缺失
+              if (m && m.role === 'user') {
+                const txt = Array.isArray(m.content)
+                  ? m.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
+                  : String(m.content || '');
+                if (txt.trim()) { prevHuman = txt.slice(0, 400); break; }
+              }
             }
           } catch { /* 取不到不带上下文 */ }
         }
@@ -1747,14 +1755,15 @@ export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.co
     // 模型名只认 config.mjs(models 段),与 judgeLocal 的后端分派同源。
     decisionModel: (() => { try { const c = loadConfig(); return c.modelIn === 'local' ? String(c.models?.localDecision || 'local') : String(c.models?.decision || 'ollama'); } catch { return ''; } })(),
     // R3 词法通道总闸(v2 重建 2026-11-08):enabled 缺省开(直接实弹,用户裁定)、eagerEscalate=P2 提前一拍缺省开。
-    // fail-open:配置缺段按默认生效;kill-switch = 显式 enabled:false 或 eagerEscalate:false。语义见 tierClassify 文件头。
-    r3Lexical: (() => { const r = mr.r3Lexical && typeof mr.r3Lexical === 'object' ? mr.r3Lexical : {}; return { enabled: r.enabled !== false, eagerEscalate: r.eagerEscalate !== false }; })(),
+    // R3 词法通道(2026-11-14 用户裁定:**恒开**,配置键 r3Lexical 不再读取)——enabled=词法 R3 同击总闸,
+    // eagerEscalate=P2 提前一拍;词表本体在 tierClassify.mjs,不进优化器网格。
+    r3Lexical: { enabled: true, eagerEscalate: true },
     // 决策模型 R-ref 预兜底票(v2.1→v2.6 2026-11-08;v4 2026-11-09 远程链删,恒本地档案制):
     // decisionOn 恒 true(本地判定恒启用,断路器另有挡闸);rRef 参数走模型判定档案——
     // 默认表 tev1 0.4/all-r1、strands 0.8/all-r1,data JSON profiles 可覆盖,未建档回退 FALLBACK(旧硬编码,零漂移)。
     decisionOn: true,
     rRef: (() => {
-      const prof = resolveDecisionProfile(readJson(configPath));
+      const prof = resolveDecisionProfile(readJson(configPath), { dataDir: path.dirname(configPath) }) // 档案层文件随 dataDir(测试隔离契约,同断路器);
       return {
         live: prof.arm1.live !== false,
         minConf: Number.isFinite(Number(prof.arm1.minConf)) ? Number(prof.arm1.minConf) : 0.75,

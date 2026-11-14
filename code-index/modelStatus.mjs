@@ -952,9 +952,31 @@ function formatTokenCount(n) {
   return `${text} 万`;
 }
 
+/** 读嵌入进度(2026-11-14 用户定案:状态句给具体进度,不再只说"建立中"):
+ *  尾读 embed.log 最后一条 [progress] 嵌入 X/Y(spawnLogged 双流落盘,稳定存在)。
+ *  返回 {done,total,pct} 或 null(无日志/无进度行)。纯读,64KB 尾窗防大文件。 */
+export function readEmbedProgress(logFile = path.join(DATA_DIR, 'embed.log')) {
+  try {
+    const st = fs.statSync(logFile);
+    const start = Math.max(0, st.size - 64 * 1024);
+    const tail = fs.readFileSync(logFile, { encoding: 'utf8', start, end: st.size });
+    const hits = tail.match(/\[progress\] 嵌入 (\d+)\/(\d+)/g);
+    if (!hits || !hits.length) return null;
+    const m = hits[hits.length - 1].match(/(\d+)\/(\d+)/);
+    const done = Number(m[1]);
+    const total = Number(m[2]);
+    if (!(total > 0)) return null;
+    return { done, total, pct: Math.min(100, Math.round((done / total) * 100)) };
+  } catch { return null; }
+}
+
 function likelyReason(p, emb, rr) {
+  const embedProgress = () => {
+    const g = readEmbedProgress();
+    return g ? `向量索引嵌入中 ${g.done}/${g.total}(${g.pct}%)` : '向量索引正在建立';
+  };
   if (p.modelIn === 'local') {
-    if (p.embedPid && !p.indexOk) return '向量索引正在建立';
+    if (p.embedPid && !p.indexOk) return embedProgress();
     if (!p.chunks) return '代码块清单未建立';
     if (p.indexError) return 'index.json 无法解析';
     if (!p.indexOk) return 'local 向量索引未建立,检索降级 bm25';
@@ -970,7 +992,7 @@ function likelyReason(p, emb, rr) {
   }
   if (p.ollama === 'down') return 'Ollama 未启动';
   if (p.ollama === 'process-only') return `Ollama 没有在 ${p.base} 响应`;
-  if (p.embedPid && !p.indexOk) return '向量索引正在建立';
+  if (p.embedPid && !p.indexOk) return embedProgress();
   if (p.embedInstalled === null || p.rerankInstalled === null) return 'Ollama 未响应,无法确认模型是否已下载';
   if (p.embedInstalled === false) return `嵌入模型 ${emb} 未下载`;
   if (p.rerankInstalled === false) return `精排模型 ${rr} 未下载`;
@@ -1041,14 +1063,21 @@ export function renderModelStatus(p) {
   const today = Math.max(0, Math.round(Number(p.savedTokens) || 0));
   const total = Number.isFinite(p.totalAllDays) ? Math.max(0, Math.round(p.totalAllDays)) : today;
   const modelTag = p.remoteModel ? `【${p.remoteModel}】` : '';
+  // 嵌入进行中 → 两种形态的句尾都带具体进度(2026-11-14 用户定案:不再只说"建立中")
+  const progClause = p.embedPid && !p.indexOk
+    ? (() => { const g = readEmbedProgress(); return g ? `;向量索引嵌入中 ${g.done}/${g.total}(${g.pct}%)` : ''; })()
+    : '';
   const relay = healthy
-    ? `⚙ ${modelTag}本地模型已启动成功，今日累计节约 ${formatTokenCount(today)} tokens，总计节约 ${formatTokenCount(total)} tokens(${names})`
+    ? `⚙ ${modelTag}本地模型已启动成功，今日累计节约 ${formatTokenCount(today)} tokens，总计节约 ${formatTokenCount(total)} tokens(${names})${progClause}`
     : `⚙ ${modelTag}本地模型未启动成功,最可能原因:${likelyReason(p, emb, rr)}(${names})`;
   return { relay, detail: relay, healthy };
 }
 
 export async function assessModelStatus({ sessionId = null } = {}) {
-  const models = loadConfig().models;
+  const cfg = loadConfig();
+  const models = cfg.models;
+  // 自愈补拉节流(2026-11-14 用户定案:用户级可配):最小 1000ms 防 0/负值风暴
+  const warmMinIntervalMs = Math.max(1000, Math.floor(Number(cfg.warmMinIntervalMs) || 600000));
   const modelIn = activeBackend();
   const base = resolveBase();
   let ollama = 'down';
@@ -1069,7 +1098,7 @@ export async function assessModelStatus({ sessionId = null } = {}) {
     // 2026-11-08:decisionOk 并入判定——嵌入/精排就绪但决策模型未拉起时周期补预热;
     // decisionWanted=false(开关关/显式远程)时不传决策字段 → 决策闸整体失效,不因"预期无决策"反复补拉。
     const decisionWanted = decisionLocalWanted();
-    try { maybeWarmReranker({ health: { modelIn, embedOk: health?.embedOk === true, rerankOk: health?.rerankOk === true, decisionWanted, decisionOk: decisionWanted ? (health?.decisionOk == null ? undefined : health.decisionOk === true) : undefined, localDecisionReady: decisionWanted ? localOnnxCached(models.localDecision) : undefined } }); } catch { /* 拉起失败不影响状态句 */ }
+    try { maybeWarmReranker({ health: { modelIn, embedOk: health?.embedOk === true, rerankOk: health?.rerankOk === true, decisionWanted, decisionOk: decisionWanted ? (health?.decisionOk == null ? undefined : health.decisionOk === true) : undefined, localDecisionReady: decisionWanted ? localOnnxCached(models.localDecision) : undefined }, minIntervalMs: warmMinIntervalMs }); } catch { /* 拉起失败不影响状态句 */ }
   } else {
     const [tagsRes, versionUp, psRes] = await Promise.all([
       getJson(`${base}/api/tags`, 2000).then(j => ({ ok: true, j })).catch(() => ({ ok: false })),
@@ -1094,7 +1123,7 @@ export async function assessModelStatus({ sessionId = null } = {}) {
       // (显存挤占/服务重启/keep_alive 到期)后无人再拉——嵌入有检索持续保活而精排没有。
       // 这里借每轮健康评估(缓存 5 分钟)轻量判定,缺位即 detached 后台补预热(warm.mjs 幂等,双模型对齐);fail-open。
       // 2026-11-08:决策模型(tev1)同轨并入——已下载未驻留时同样补预热;显式远程/开关关时不带决策字段,不加决策闸。
-      try { maybeWarmReranker({ health: decisionLocalWanted() ? { modelIn, ollama, rerankInstalled, rerankRunning, decisionInstalled, decisionRunning } : { modelIn, ollama, rerankInstalled, rerankRunning } }); } catch { /* 拉起失败不影响状态句 */ }
+      try { maybeWarmReranker({ health: decisionLocalWanted() ? { modelIn, ollama, rerankInstalled, rerankRunning, decisionInstalled, decisionRunning } : { modelIn, ollama, rerankInstalled, rerankRunning }, minIntervalMs: warmMinIntervalMs }); } catch { /* 拉起失败不影响状态句 */ }
     }
   }
 
@@ -1164,8 +1193,22 @@ export function renderStatusWith(health, sessionId = null) {
   return renderModelStatus({ ...health, ...savings, totalAllDays, remoteModel });
 }
 
-/** 每轮实时状态句:健康走缓存(默认 5 分钟),节约现算。供 UserPromptSubmit 注入。 */
+/** 每轮实时状态句:健康走缓存(健康快照 TTL 5 分钟;**未健康快照 30s**——2026-11-14 用户定案 B:
+ *  自愈补拉/预热完成后,状态句最多 30s 内翻正,不再吃最长 5 分钟的陈旧"未拉起"),节约现算。供 UserPromptSubmit 注入。 */
 // ---------- 精排自愈(2026-11-03):缺位即后台补预热 ----------
+
+/** 健康快照的"健康"判定(B 的 TTL 分档依据,纯函数)。对齐 renderModelStatus 的拉起三件套:
+ *  ollama=up ∧ 嵌入/精排已驻留 ∧(带决策字段时)决策已驻留;local=常驻就绪 ∧ 双模型未缺席。 */
+export function healthIsHealthy(h) {
+  if (!h || typeof h !== 'object') return false;
+  if (h.modelIn === 'local') {
+    return h.residentReady === true && h.embedRunning !== false && h.rerankRunning !== false;
+  }
+  return h.ollama === 'up'
+    && h.embedRunning === true
+    && h.rerankRunning === true
+    && (h.decisionRunning == null || h.decisionRunning === true);
+}
 
 /** 预热补拉判定(纯函数,测试密闭)。ollama:网关可达 ∧ 模型已下载 ∧ 未驻留;local:常驻缺位/未就绪。
  * 决策模型(2026-11-08)并入同一自愈判定:仅当健康数据带 decision 字段时才加闸(旧状态/测试夹具缺字段走原逻辑)。距上次拉起 ≥ minInterval 才补。 */
@@ -1226,7 +1269,10 @@ export async function assessModelStatusCached(sessionId = null, { healthMaxAgeMs
   const backendDown = cached?.health && (cached.health.modelIn === 'local'
     ? cached.health.residentReady !== true
     : cached.health.ollama !== 'up');
-  if (cached && Date.now() - cached.at < healthMaxAgeMs && !backendDown) {
+  // B(2026-11-14 用户定案):未健康快照的 TTL 压到 30s——自愈/预热把模型拉回后,状态句
+  // 最多 30s 内翻正;健康快照维持原 5 分钟(省每轮探针)。
+  const maxAge = healthIsHealthy(cached?.health) ? healthMaxAgeMs : Math.min(healthMaxAgeMs, 30000);
+  if (cached && Date.now() - cached.at < maxAge && !backendDown) {
     return renderStatusWith(cached.health, sessionId);
   }
   return assessModelStatus({ sessionId });

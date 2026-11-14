@@ -47,11 +47,13 @@ export function loadPool(file) {
  *     旧实现"先到先得"会让新签的高质量行被旧弱标签挤掉。
  *   - 动态配额(dynamicQuota):按各类供给的 sqrt 平滑分配,再在 capPerLabel 与总预算内回填;
  *     供给不足的类不占额度。
- *   - 三重硬上限:per-label capPerLabel、全库 totalCap;
+ *   - 三重硬上限:per-label capPerLabel、全库 totalCap——**2026-11-14 起默认不限(0)**:base+local
+ *     双层向量合并生效后,本地层不再设比例限制(全量入库);config exemplars.capPerLabel/totalCap
+ *     显式配正数才重新启用治理,0/未配=不限。
  *   - stats 记录 supply / droppedByCap(触顶可观测,旧实现静默丢弃)。
  * 池内已由导出端按 prompt 去重。
  */
-export function buildExemplars(pool, { capPerLabel = 120, totalCap = 400, dynamicQuota = true } = {}) {
+export function buildExemplars(pool, { capPerLabel = 0, totalCap = 0, dynamicQuota = true } = {}) {
   const rows = (pool || []).filter((r) => r && r.label && r.prompt);
   const srcRank = (r) => {
     const s = String(r.source || '');
@@ -68,12 +70,18 @@ export function buildExemplars(pool, { capPerLabel = 120, totalCap = 400, dynami
   const labels = Object.keys(supply);
   const quota = {};
   const wsum = labels.reduce((s, l) => s + Math.sqrt(supply[l]), 0) || 1;
-  let budgetLeft = Math.max(0, Number(totalCap) || 0);
+  // 2026-11-14:base+local 双层合并生效后,本地层默认**不限**(cap≤0 ⇒ 全量保留,droppedByCap 恒 0);
+  // 显式配正数(config exemplars.capPerLabel/totalCap)才重新启用配额治理。两键可独立生效:
+  // 只配 capPerLabel ⇒ 仅单类上限(无总预算约束);只配 totalCap ⇒ 仅 sqrt 动态总预算。
+  const capped = (Number(capPerLabel) || 0) > 0 || (Number(totalCap) || 0) > 0;
+  const hasTotal = (Number(totalCap) || 0) > 0;
+  let budgetLeft = hasTotal ? Number(totalCap) : Infinity;
   for (const l of labels) {
+    if (!capped) { quota[l] = supply[l]; continue; }
     // 动态:按供给 sqrt 分摊总预算(供给不足的类不多占);capPerLabel 仅作单类垄断兜底。
-    const dynamic = dynamicQuota ? Math.ceil((Number(totalCap) || 0) * Math.sqrt(supply[l]) / wsum) : capPerLabel;
-    quota[l] = Math.max(0, Math.min(capPerLabel, dynamic, supply[l], budgetLeft));
-    budgetLeft -= quota[l];
+    const dynamic = dynamicQuota && hasTotal ? Math.ceil(budgetLeft * Math.sqrt(supply[l]) / wsum) : (capPerLabel || Infinity);
+    quota[l] = Math.max(0, Math.min(capPerLabel || Infinity, dynamic, supply[l], budgetLeft));
+    if (hasTotal) budgetLeft -= quota[l];
   }
   // 注:不做"剩余预算回填"——实测回填会把没用完的额度全灌给供给最大的类(light 逼近 50%),
   // 破坏 sqrt 平滑的类别平衡;少用预算优于制造先验偏置。
@@ -204,7 +212,7 @@ function main() {
   const opt = (name, def) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : def);
   const poolFile = opt('--pool', path.join(DATA_DIR, 'routing', 'raw-labels.jsonl'));
   const outDir = opt('--out-dir', path.join(DATA_DIR, 'routing'));
-  const cap = Number(opt('--cap', 0)) || 0; // 0=读配置 exemplars.capPerLabel
+  const cap = Number(opt('--cap', 0)) || 0; // 0=读配置 exemplars.capPerLabel;配置也未设=不限(0)
   const totalCapOpt = Number(opt('--total-cap', 0)) || 0; // 0=读配置 exemplars.totalCap
   const goldenN = Number(opt('--golden', 50));
   // --review-only:只用现有 golden-set.jsonl 重生代签清单 md;不碰 jsonl 与样本库(免触嵌入过期)

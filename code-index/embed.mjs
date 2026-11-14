@@ -22,7 +22,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, releaseReplacedOllamaModels } from './ollamaGuard.mjs';
-import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, OLLAMA_EMBED_PACE_MS, decisionLocalWanted } from './config.mjs';
+import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, decisionLocalWanted } from './config.mjs';
 import { vectorPaths, readVectorMeta, writeVectorMeta, wantEmbedModel } from './vectorStore.mjs';
 import { ensureLocalResident, residentEmbed } from './localResident.mjs';
 import { takeJsonLock, releaseJsonLock } from './proc.mjs';
@@ -46,11 +46,14 @@ const { backend } = wantEmbedModel();
 const store = vectorPaths(backend);
 const PAIRED_PATH = store.paired;
 const EMB_PATH = store.emb;
-const BATCH_OPT = Number(getOpt('--batch', backend === 'ollama' ? 8 : 16)); // ollama 32→8(2026-11-10):大批次在显存紧张时会 >5 分钟无响应,触发 undici 300s headers 超时崩溃
-const BATCH = Number.isFinite(BATCH_OPT) ? Math.max(1, Math.floor(BATCH_OPT)) : (backend === 'ollama' ? 8 : 16);
+const BATCH_OPT = Number(getOpt('--batch', backend === 'ollama' ? 32 : 16)); // 2026-11-14 恢复 32(曾 8):WHEA 死机初步排查=显卡供电线材(非 GPU 满载本身),保守化解除;若复发先回 --batch 8 --pace 500 并查线材
+const BATCH = Number.isFinite(BATCH_OPT) ? Math.max(1, Math.floor(BATCH_OPT)) : (backend === 'ollama' ? 32 : 16);
 const FORCE = args.includes('--force');
-// 批间节流(2026-11-11 WHEA 缓解):默认 ollama 500ms(config.OLLAMA_EMBED_PACE_MS)、local 0;--pace 单次覆盖,0=关。
-const PACE_MS = Math.max(0, Number(getOpt('--pace', backend === 'ollama' ? OLLAMA_EMBED_PACE_MS : 0)) || 0);
+// 批间节流(2026-11-11 WHEA 缓解引入;2026-11-14 根因转向显卡供电线材后默认关,0=无限速;--pace 单次覆盖)
+const PACE_MS = Math.max(0, Number(getOpt('--pace', 0)) || 0);
+// CPU 线程上限(2026-11-14 用户定案:本地 transformers.js 嵌入默认"后台缓慢运行"不拉满 CPU):
+//   默认取 config embedCpuThreads(≈核数/4,0=全核=旧行为);--cpu-threads 单次覆盖,仅 local 后端生效。
+const EMBED_THREADS = Math.max(0, Number(getOpt('--cpu-threads', loadConfig().embedCpuThreads)) || 0);
 
 if (!fs.existsSync(CHUNKS_PATH)) {
   console.error('未找到 data/chunks.jsonl,请先运行 node build.mjs');
@@ -206,15 +209,16 @@ async function makeEmbedder() {
     env.cacheDir = HF_CACHE_DIR;
     env.allowLocalModels = false;
     // 常驻进程不在时才在本进程加载。jina 不需要输入前缀,也不访问 Ollama
-    console.log(`[info] local 常驻进程不可用,改为本进程加载 ${MODEL_ID}`);
+    console.log(`[info] local 常驻进程不可用,改为本进程加载 ${MODEL_ID},threads=${EMBED_THREADS || '全核'}`);
+    const sopt = EMBED_THREADS > 0 ? { session_options: { intraOpNumThreads: EMBED_THREADS, interOpNumThreads: 1 } } : {};
     let pipe;
     try {
       try {
-        pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8' });
+        pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8', ...sopt });
       } catch (e) {
         console.warn(`[warn] HuggingFace 下载失败(${e.message}),切换 hf-mirror.com 重试...`);
         env.remoteHost = 'https://hf-mirror.com';
-        pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8' });
+        pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8', ...sopt });
       }
     } catch (e) {
       console.error(`[err] local 嵌入模型拉起失败(${e.message})。本次嵌入失败,检索降级 bm25。不改换 Ollama 路径。`);

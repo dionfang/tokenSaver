@@ -35,6 +35,8 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 - Node.js ≥ 18,以及 git。
 - local:模型在 `code-index/hf-cache`(三个本地模型——嵌入/精排 transformers.js、决策 Strands ONNX,约 1.5GB)。该目录超过 git 单文件上限,不入库;缺失时首次使用才下载。复制部署时请整目录带走。
 - ollama:本机先安装并自行启动 Ollama,再手工 pull。Ollama 模型不随目录复制。
+  版本推荐:**钉 Ollama 0.40.15**——实测嵌入批量 ~0.83s/块;0.40.16 退化至 1.17-1.42s/块(约 1.5 倍慢),0.40.7 居中且波动大;三个版本的 /v1/systemone 决策端点均兼容。升级前先按同口径复测嵌入吞吐(batch 32、腾显存、90s 双采样)。
+
 
 ```bash
 ollama pull qwen3-embedding:0.6b
@@ -113,7 +115,7 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 | `models.localReranker` | `Xenova/bge-reranker-base` |
 | `ollamaBase` | `http://localhost:11434` |
 | `gpu` | `auto`(还可设 `cpu`、`gpu`;注意:num_gpu 只对嵌入/精排生效,决策模型(ollama 路径)忽略该选项、由 Ollama 自动放置) |
-| `OLLAMA_KEEP_ALIVE` | `2h` |
+| `OLLAMA_KEEP_ALIVE` | `24h`(2026-11-14 起,模型常驻不因空闲消失;显存恒占≈4.5GB) |
 | `OLLAMA_NUM_CTX` | `4096` |
 
 项目配置在与 `code-index/` 平级的 `data/code-index.config.json`。未写的键用 `config.mjs` 的默认值。
@@ -146,13 +148,13 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 | `retryOnRateLimit` / `maxRetries` | 运行时 429/5xx/网络失败同轮换模型重选(默认 true / 2) |
 | `maxPhaseTurns` | 升档阶段最多持续的人类轮数(默认 4),到顶回 R1 基准 |
 | `switchGuard` | 切换税门控 `{enabled 默认 true, maxContextTokens 默认 200000}`;只拦升档;同会话被拦满 3 次疲劳放行,拦截时注入一次压缩建议 |
-| `l2` | L2 向量能力嵌套配置(2026-11-07 收口):`{shadow 嵌入器总闸(默认 false), vote:{minSim,minConf} 代签投票阈值(0.55/0.6), live:{enabled,minConf} 线上路由救回(默认关)}`——shadow 关则两条支路都拿不到嵌入器;旧顶层 l2Shadow/l2Live/旧 l2.minSim 兼容读一个版本期 |
-| `l2Live` | (已收进 `l2.live`,旧键兼容)代理实弹 L2 融合票:词法判 R1 但 kNN 高置信投 multi ⇒ 救回 R2;词法判 R2 且 kNN 以 ≥0.85 投 R3 ⇒ 救回 R3(只救回不压制;2026-11-08 v2,R3 类嵌入待精确样本 ≥8 条,样本不足自然不触发);需 `l2.shadow` 同开;失败 fail-open 维持词法定档 |
+| ~~l2~~ | **已回收(2026-11-14 用户裁定)**:L2 影子/实弹融合票**恒开**(代码常量,配置键不再读取);阈值(minSim 0.55/minConf 0.6/live 0.3)属标定域走代码默认,不暴露给用户配置面 |
+| ~~l2Live~~ | 同上:旧键不再读取,实弹 L2 融合票恒开(词法 R1+kNN 投 multi→救回 R2;R2+kNN 投 R3→救回 R3,只救回不压制) |
 | `decisionModel` | 四票合议代签的判定模型(v4 2026-11-09 本地化收口:判定**恒本地**——ollama=`models.decision`(tev1:0.8b)/ local=`models.localDecision`(Strands ONNX q4f16 常驻),跟 `modelIn` 同路径;旧键 `enabled/model/providers/chunkSize/rRef` 已废弃不读)。定档双臂与代签门槛全部走**模型判定档案** `profiles`(键=判定后端名,默认表:tev1→arm1 minConf 0.6/window all-r1、代签 0.4/0.85;strands→0.5/ambiguous、0.4/0.85;arm2 r3MinConf 0.85;未建档模型回退 FALLBACK(0.75/ambiguous/0.6/0.9;2026-11-10 S2-F4 后 arm1 **恒影子 live=false**,只记影子账不改判))。臂1 按档案窗口咨询词法 R1 轮(tev1=全部 R1、strands=置信≤0.5 的 R1),法官投到 R1 以上任何档都只按 R2 救回(一步一档封顶,R3 留给臂2;R4 恒不救);臂2 在词法定档 R2 时现查,法官投 R3 且过 r3MinConf ⇒ 救回 R3;判定失败/投他档维持原档(fail-open),影子留痕 `data/usage/r-ref-shadow.jsonl`。判定模型拉不起=决策票弃权,不拖垮检索/路由 |
 | 双轴标签 | 黄金集每条同时记两个正交轴:`semanticType`(语义形态 multi/routine/light,由 L1/L2/决策三票合议——"这话要求的是不是多点改组")与 `intensityType`(行为强度 heavy/normal/light,由行为票——"这轮实际干了多重的活")。此前两者塞进同一标签比较,multi 一致率被压到 0.2;拆开后各轴各评(`node code-index/modelRoute.mjs --score-golden-dual`)。两轴真值均为机器合议弱真值,无外部人工锚点 |
 | `tierOptimize` | 自进化闭环 `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`:enabled=true 后每 6h 学习信号权重与门槛,折外过门控自动晋升 live,观察窗成本恶化自动回滚 |
 | `blendNotice` | auto 综合费率行注入开关 `{enabled 默认 true}`:仅路由宿主注入"最近会话实际费 ÷ R3 基准费(R3=1x)"倍率行;关=只停注入,记账照常 |
-| `r3Lexical` | R3 词法通道总闸 `{enabled 默认 true, eagerEscalate 默认 true}`(2026-11-08 v2):enabled=顶格词+独立印证同击的词法 R3;eagerEscalate=P2 提前一拍(R2 难度任务第 1 次报错即上 R3);任一显式 false 关对应通道,词表本体在 tierClassify.mjs 不进优化器网格 |
+| ~~r3Lexical~~ | **已回收**:R3 词法通道与 P2 提前一拍**恒开**(代码常量,enabled/eagerEscalate 不可配);词表本体在 tierClassify.mjs |
 
 生效范围与边界:仅 ZCode/Qoder 两端参与;auto 只调度自定义模型中以 Anthropic Messages 协议接入的模型;模型分档按名字自动判定(2026-11-06 v4 品牌三档+轻量降档,v4.1 调档:普通品牌 deepseek/glm/qwen/minimax→R2、中档 kimi/grok/gemini→R3、高档 claude/gpt→R4,轻量后缀(flash/preview/turbo/mini/haiku/sonnet/sol 等)在默认档上降一档、flash 恒 R1,未识别品牌按普通档兜底;两表都在 `modelRouting.modelTiers` / `lightSuffixes`,可改配置重排全链)。接入步骤与配置字段见 [`部署使用说明.txt`](code-index/部署使用说明.txt) 的配置说明。
 
@@ -203,6 +205,8 @@ Built for agent-based development on local repositories. One TokenSaver can inde
 - Node.js ≥ 18, and git.
 - local: models live in `code-index/hf-cache` (three local models — embedding / reranker via transformers.js, decision via resident Strands ONNX, about 1.5GB). That directory exceeds git's per-file limit and is not in the repository. Missing models are downloaded on first use. When you copy the tool, take the whole directory with you.
 - ollama: install and start Ollama yourself, then pull the models by hand. Ollama model weights are not copied with this directory.
+   Version pin: **Ollama 0.40.15** — measured embedding throughput ~0.83s/chunk; 0.40.16 regressed to 1.17-1.42s/chunk (~1.5x slower), 0.40.7 sits in between with high variance; /v1/systemone decision endpoint is compatible on all three. Re-benchmark with the same protocol (batch 32, free VRAM, 90s double-sampling) before upgrading.
+
 
 ```bash
 ollama pull qwen3-embedding:0.6b
@@ -281,7 +285,7 @@ Change model deployment only in `code-index/config.mjs`. The same keys in the da
 | `models.localReranker` | `Xenova/bge-reranker-base` |
 | `ollamaBase` | `http://localhost:11434` |
 | `gpu` | `auto` (also `cpu` or `gpu`; note: num_gpu only applies to embedding/reranker — the decision model (ollama path) silently ignores it and is placed automatically by Ollama) |
-| `OLLAMA_KEEP_ALIVE` | `2h` |
+| `OLLAMA_KEEP_ALIVE` | `24h`(2026-11-14 起,模型常驻不因空闲消失;显存恒占≈4.5GB) |
 | `OLLAMA_NUM_CTX` | `4096` |
 
 Project settings live in `data/code-index.config.json`, beside `code-index/`. Keys you omit use the defaults in `config.mjs`.
@@ -314,13 +318,13 @@ The `modelRouting` section of `data/code-index.config.json` is scaffolded by ini
 | `retryOnRateLimit` / `maxRetries` | Same-turn model re-selection on runtime 429/5xx/network failure (default true / 2) |
 | `maxPhaseTurns` | How many human turns an upgrade phase may last (default 4), then back to the R1 base |
 | `switchGuard` | Switch-tax gate `{enabled default true, maxContextTokens default 200000}`; upgrades only; releases by fatigue after 3 consecutive blocks and injects a one-shot compression suggestion while blocking |
-| `l2` | Nested L2 config (collapsed 2026-11-07): `{shadow — embedder master gate (default false), vote:{minSim,minConf} golden-set voting thresholds (0.55/0.6), live:{enabled,minConf} live-proxy routing rescue (default off)}` — with shadow off, neither branch gets the embedder; legacy top-level l2Shadow/l2Live and old l2.minSim stay readable for one version window |
-| `l2Live` | (moved into `l2.live`, legacy key still read) Live-proxy L2 fusion vote: when lexicon says R1 but kNN votes multi with high confidence, rescue to R2; when lexicon says R2 and kNN votes R3 with confidence ≥0.85, rescue to R3 (rescue-only, never suppresses; v2 2026-11-08 — R3-class embeddings wait for ≥8 exact-truth samples, so it simply never fires before then); requires `l2.shadow` on; fail-open keeps the lexical tier on any error |
+| ~~l2~~ | **Recycled (2026-11-14)**: L2 shadow/live fusion votes are **always on** (code constants, config keys no longer read); thresholds (minSim 0.55/minConf 0.6/live 0.3) are calibration-domain defaults, not user-exposed |
+| ~~l2Live~~ | Same as above: legacy key no longer read; live L2 fusion vote always on (lexical R1 + kNN multi → rescue R2; R2 + R3 vote → rescue R3, rescue-only) |
 | `decisionModel` | The judge model for four-vote auto-signing (localized v4, 2026-11-09: judging is **always local** with zero remote calls — ollama = `models.decision` (tev1:0.8b) / local = `models.localDecision` (resident Strands ONNX q4f16), on the same path as `modelIn`; legacy keys `enabled/model/providers/chunkSize/rRef` are no longer read). Both routing arms and signing thresholds follow the **per-model decision profiles** `profiles` (key = judge backend name; default table: tev1 → arm1 minConf 0.6 / window all-r1, signing 0.4/0.85; strands → 0.5/ambiguous, signing 0.4/0.85; arm2 r3MinConf 0.85; unmatched models fall back to FALLBACK (0.75/ambiguous/0.6/0.9; since S2-F4 on 2026-11-10, arm1 is **shadow-only with live=false** — shadow-logged, never rescues live)). Arm 1 consults lexical-R1 turns per the profile window (tev1 = all R1, strands = confidence ≤0.5), and any judge vote above R1 is always capped at an R2 rescue (one step only — R3 belongs to arm 2, R4 never); arm 2 consults on lexical R2 and rescues to R3 when the judge votes R3 above r3MinConf; judge failure / other votes keep the original tier (fail-open), shadow-logged to `data/usage/r-ref-shadow.jsonl`. If the judge cannot start, decision votes abstain — search and routing are unaffected |
 | Dual-axis labels | Every golden-set row carries two orthogonal axes: `semanticType` (multi/routine/light — the L1/L2/decision consensus, "does this ask for a multi-point restructure?") and `intensityType` (heavy/normal/light — the behavior vote, "how heavy was the work actually done?"). Mixing both into one label had pushed multi accuracy to 0.2; split, each axis is scored on its own (`node code-index/modelRoute.mjs --score-golden-dual`). Both axes are machine-consensus weak truth — no external human anchor |
 | `tierOptimize` | Self-evolution loop `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`: with enabled=true, every 6h it learns signal weights and thresholds from the golden set, auto-promotes a candidate that passes the out-of-fold gate, and auto-rolls back if cost worsens inside the observation window |
 | `blendNotice` | Injection switch for the auto blended-rate line `{enabled default true}`; routing hosts only — injects the "latest session's actual spend ÷ R3-equivalent spend (R3 = 1x base)" multiplier; off = stops the line, accounting continues |
-| `r3Lexical` | R3 lexical-channel master switch `{enabled default true, eagerEscalate default true}` (v2 2026-11-08): enabled = the lexical R3 that requires a top-risk word plus independent corroboration; eagerEscalate = P2 one-strike speedup (an R2-difficulty task escalates to R3 on its first error); setting either to false closes that channel — the word list itself lives in tierClassify.mjs, outside the optimizer grid |
+| ~~r3Lexical~~ | **Recycled**: the lexical R3 channel and P2 one-strike speedup are **always on** (code constants, not configurable); the word list itself lives in tierClassify.mjs |
 
 Scope and boundaries: only ZCode/Qoder take part; auto dispatches only custom models wired via the Anthropic Messages protocol; model tiering is derived from the name (brand three grades + lightweight demotion, 2026-11-06 v4, adjusted in v4.1: normal brands deepseek/glm/qwen/minimax→R2, mid-grade kimi/grok/gemini→R3, high-grade claude/gpt→R4; lightweight suffixes (flash/preview/turbo/mini/haiku/sonnet/sol etc.) demote one tier from the brand default and flash is always R1; unrecognized brands fall back to the normal grade. Both tables live in `modelRouting.modelTiers` / `lightSuffixes` and re-derive the whole chain from config). Wiring steps and config keys live in [`部署使用说明.txt`](code-index/部署使用说明.txt), configuration section.
 

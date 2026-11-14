@@ -12,9 +12,9 @@
  * R4 真值只认"用户显式点名旗舰/客户端选定的模型本身就在 R4 档"这类用户侧事实,词法永远给不出 R4 真值。
  */
 import { TIER_FROM_TYPE, TIER_FROM_INTENSITY } from './tierClassify.mjs';
+import { ESC_NEXT } from './thresholds.mjs'; // S1-F4:上梯表单源(thresholds.mjs)
 
 const TIERS = ['R1', 'R2', 'R3', 'R4'];
-const ESC_NEXT = { R1: 'R2', R2: 'R3', R3: null, R4: null };
 
 /** 黄金条目里的 evidence 归一化('—'/缺字段 → null,不把脏值当 0)。 */
 export function evidenceOf(row = {}) {

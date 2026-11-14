@@ -53,7 +53,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot, KNOWN_ANNOTATIONS_PATH, loadKnownAnnotations } from './config.mjs';
+import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot, KNOWN_ANNOTATIONS_PATH, loadKnownAnnotations, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS } from './config.mjs';
 import { localOnnxCached } from './localRerank.mjs';
 import { spawnLogged } from './proc.mjs';
 
@@ -294,29 +294,12 @@ export function modelRoutingScaffold() {
     // 失败轮本就拿不到回复,同轮重试是纯改善;设 retryOnRateLimit:false 整体关闭回到"透传单次错误"旧行为。
     retryOnRateLimit: true,
     maxRetries: 2,
-    // L2 配置(2026-11-07 嵌套收口):shadow=嵌入器资源总闸(原顶层 l2Shadow);vote=代签投票阈值(原 l2.minSim/minConf);
-    // live=线上路由救回(原顶层 l2Live)——总闸关则两条支路都拿不到嵌入器、静默零影响。旧键双读兼容一个版本期。
-    l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } },
-    // R3 词法通道总闸(2026-11-08 v2 重建裁定):enabled=词法 R3(顶格词+独立印证同击)总闸;eagerEscalate=
-    // P2 提前一拍(R2 难度任务第 1 次报错即上 R3,不等第 2 连败)。缺省双开(直接实弹用户裁定),
-    // 代码 fail-open 同价语义;任一显式 false 即关对应通道。词表本体在 tierClassify.mjs,不进优化器网格。
-    r3Lexical: { enabled: true, eagerEscalate: true },
-    // 决策模型判定(v4 2026-11-09 本地化收口,2026-11-03 三投票定档已正式化为四票合议):
-    // 判定**恒本地**(modelIn=ollama 打 models.decision tev1:0.8b / local 打常驻 models.localDecision
-    // Strands q8),零远程调用;整段旧键 model/providers/chunkSize/rRef 已废弃不读——实弹 arm1/arm2
-    // 参数与代签门槛全走模型判定档案(modelRouting.decisionModel.profiles 可覆盖,未建档回退代码默认)。
-    // 失败自动跳闸(恢复=人工 --probe 探活或下次会话启动自动探活);复核 CLI 只出报告不改量尺。
-    // model=判定模型名(仅显式远程用,空=内置 decision-model-preview);providers=[{baseUrl,apiKey,path?}]
-    // 配了真条目才走远程;空数组/全空模板条目(占位示例)/未配=本地判定(默认启用)。
-    // 判定恒 1 题一判(2026-11-08 v2.7:chunkSize 不再支持配置——16 题批量稀释置信 97% 弃权,1 题/请求最佳)。
-    decisionModel: {
-      enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }],
-      // R-ref 预兜底票(2026-11-08 v2.1→v2.6):前置到路由侧,两臂——arm1 只补"词法最瞎区"(歧义 R1,置信≤0.5
-      // 的 default 兜底前一段);arm2(R2→R3 判定救回)在词法定档 R2 时现查判定模型,法官投 R3 且过 r3MinConf ⇒
-      // 救回 R3 执行,判定失败/投他档维持 R2(fail-open)。本段参数与总闸一样只对显式远程生效:
-      // 本地判定时恒 live=true / r3Rescue=true(参数走代码默认);远程才按本配置读写。
-      rRef: { live: true, minConf: 0.75, maxChars: 1200, r3Rescue: true, r3MinConf: 0.85 },
-    },
+    // L2/标定键已回收(2026-11-14 用户裁定):shadow/live.enabled 恒开(不再播种);vote/live 阈值属
+    // 标定域走代码默认(resolveL2Config),不暴露给用户配置面。
+    // r3Lexical 恒开(2026-11-14 用户裁定):enabled/eagerEscalate 不再播种/不再读配置;
+    // l2/decisionModel 段同样已回收(恒开项不播种,标定键走代码默认,死键不落配置面)。
+    // decisionModel 段已回收(2026-11-14):判定恒本地,enabled/model/providers/rRef 全部零消费
+    // (参数权威=模型判定档案,客户端 config 不得打乱)——不再播种死键。
     // auto 综合费率行开关(2026-11-06):prompt-guard 每轮注入"最近会话实际费 ÷ R3 基准费"倍率行的总开关
     // (仅路由宿主);enabled=false 只停注入,记账照常。价格表=data/routing/model-prices.json。
     blendNotice: { enabled: true },
@@ -340,20 +323,20 @@ export function modelRoutingScaffold() {
     lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'],
     // 阶段轮数上限(2026-11-04 自 switchGuard 迁出):升档阶段最多持续的人类轮数,到顶回主循环;
     //   恒生效、不受切换税门控开关控制——语义属阶段生命周期,不属门控;旧位置 switchGuard.maxPhaseTurns 仍兼容读取。
-    maxPhaseTurns: 4,
+    maxPhaseTurns: MAX_PHASE_TURNS,
     // 切换税门控(#3):升档前估算上下文 tokens(标定口径 bytes/3.2),超阈值则不换档;**只拦升档**——
     // R1 降档当轮即省钱,不受门控(2026-11-04 成本复算修正)。
     // 阈值口径:冷读一口税 ≈ 0.34 credits/千 tokens(reasoner 档实测);原 32000(≈11 credits)与用户
     // 2026-11-01 定调"切换税相对长期占用高价模型划算、不是障碍"冲突 ⇒ 抬到 200000(≈640KB 请求体),
     // 只在极厚上下文才拦;2026-11-05 用户定档:门控默认开启(极厚上下文升档的冷读税不值得付),
     // 要放行改 data 配置 switchGuard.enabled=false。
-    switchGuard: { enabled: true, maxContextTokens: 200000 },
+    switchGuard: { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS },
 // 难度档迭代优化 + 自进化闭环(2026-11-04):enabled=true 后 --check 后台分支在扩样后顺跑一轮 tierOptimize——
   //   学逐信号倍数 + 搜门槛小网格,折外代价过门控才落候选(恒 disabled,绝不碰 live);
   //   自动晋升=连续 2 轮接受(间隔≥半节流窗)+逐折无回归+签名异于 live 才通电,晋升满观察窗(默认 24h)后
   //   成本中位恶化>15% 自动回滚 prev 并冷却签名;--enable/--disable/--rollback-now 手动晋升/关回/回滚。
   //   词表永不自动改;allowBoost=false 时高纯度信号只降不升(升档 8 倍价,升权等于加杠杆)。
-    tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false },
+    tierOptimize: { enabled: false }, // 算法参数(folds/minN/priorN 等)已回收为系统域(2026-11-14),代码默认兜底
   };
 }
 
@@ -369,18 +352,17 @@ export function ensureModelRoutingSection(cfg) {
     const mr = cfg.modelRouting;
     const scaffold = modelRoutingScaffold();
     const add = {};
-    if (!mr.decisionModel || typeof mr.decisionModel !== 'object' || Array.isArray(mr.decisionModel)) add.decisionModel = scaffold.decisionModel;
-    // tierOptimize 缺失补默认关的骨架(2026-11-04):补上键不等于通电,enabled 仍 false
+    // 2026-11-14 用户裁定:decisionModel(死键)/l2(恒开+标定回收)/r3Lexical(恒开)三段**不再补段**——
+    // 人工配置里残留的旧键原样保留不碰(不删用户文件内容),但 init 不再写入这些键。
+    // tierOptimize 缺失补默认关的骨架(2026-11-04):补上键不等于通电,enabled 仍 false(算法参数已回收为系统域)
     if (!mr.tierOptimize || typeof mr.tierOptimize !== 'object' || Array.isArray(mr.tierOptimize)) add.tierOptimize = scaffold.tierOptimize;
     // blendNotice 缺失补默认开骨架(2026-11-06):人工改过则原样保留
     if (!mr.blendNotice || typeof mr.blendNotice !== 'object' || Array.isArray(mr.blendNotice)) add.blendNotice = scaffold.blendNotice;
     // 品牌三档表/轻量后缀缺失补默认骨架(2026-11-06 v4):人工配置过(哪怕空数组)原样保留
     if (!mr.modelTiers || typeof mr.modelTiers !== 'object' || Array.isArray(mr.modelTiers)) add.modelTiers = scaffold.modelTiers;
     if (!Array.isArray(mr.lightSuffixes)) add.lightSuffixes = scaffold.lightSuffixes;
-    // l2 嵌套骨架缺失补默认关(2026-11-07 收口):旧配置有 l2Shadow/l2Live/旧 l2 任一键时不补(由 resolveL2Config 双读兼容接管,人工配置原样保留)
-    if ((!mr.l2 || typeof mr.l2 !== 'object' || Array.isArray(mr.l2)) && mr.l2Shadow === undefined && mr.l2Live === undefined) add.l2 = scaffold.l2;
-    // r3Lexical 缺失补默认开骨架(2026-11-08 v2):词法 R3 同击制 kill-switch(缺省双开=代码 fail-open 同价语义),人工改过则原样保留
-    if (!mr.r3Lexical || typeof mr.r3Lexical !== 'object' || Array.isArray(mr.r3Lexical)) add.r3Lexical = scaffold.r3Lexical;
+    // l2/r3Lexical 不再补段(2026-11-14 用户裁定):l2.shadow/live.enabled 与 r3Lexical.enabled/eagerEscalate
+    // 恒开(代码常量,配置键不读取);l2 阈值属标定域走代码默认——旧配置残留键原样保留不碰。
     if (Object.keys(add).length) {
       return { cfg: { ...cfg, modelRouting: { ...mr, ...add } }, seeded: false, patched: true };
     }
@@ -551,7 +533,7 @@ log(`\n[2/5] 安装依赖`);
 if (PACKED_INSTALL) {
   ok('npm 包已安装,跳过模块目录 npm install');
 } else {
-  const r = spawnSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: here, stdio: 'inherit', shell: true });
+  const r = spawnSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: here, stdio: 'inherit', shell: true, windowsHide: true }); // 闪窗修复(2026-11-14):shell:true 的 cmd 窗也要藏
   if (r.status !== 0) {
     console.error('  [err] npm install 失败(可试 --registry=https://registry.npmmirror.com 后重跑)');
     process.exit(1);
@@ -773,8 +755,35 @@ export function cleanCursorWorkspaceHooks(root) {
   ok(`[${path.basename(root)}] Cursor 工作区钩子已清理${fileGone ? '(空壳 hooks.json 已删除)' : ''}(钩子在用户级 ~/.cursor/hooks.json)`);
 }
 
-function zcodeProcess(script, timeoutMs, statusMessage, extraArgs = []) {
-  return { type: 'process', command: 'node', args: [script.split(path.sep).join('/'), ...extraArgs], timeoutMs, statusMessage };
+/** GUI 子系统中继 exe(闪窗方案 C' 本地等效,2026-11-13):ZCode 每条钩子入口经它启动 node,
+ *  入口(GUI 子系统,永不分配控制台)与子进程(CREATE_NO_WINDOW)双双零闪,stdout 契约不变,
+ *  超时由 Job Object 级联回收。缺 exe 且为 Windows 时用系统 csc 现编;编不出的环境回退 node 直启(仅剩入口闪)。 */
+export const HOOK_RELAY_EXE = path.join(here, 'bin', 'hook-relay.exe');
+export const HOOK_RELAY_CS = path.join(here, 'hook-relay.cs');
+
+export function ensureHookRelay() {
+  if (process.platform !== 'win32') return { relay: null, note: '非 Windows,回退 node 直启' };
+  if (fs.existsSync(HOOK_RELAY_EXE)) return { relay: HOOK_RELAY_EXE, note: '已有中继' };
+  const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+  if (!fs.existsSync(csc)) return { relay: null, note: '无 .NET Framework csc,回退 node 直启' };
+  if (!fs.existsSync(HOOK_RELAY_CS)) return { relay: null, note: '缺 hook-relay.cs,回退 node 直启' };
+  try {
+    fs.mkdirSync(path.dirname(HOOK_RELAY_EXE), { recursive: true });
+    const r = spawnSync(csc, ['-nologo', '-target:winexe', `-out:${HOOK_RELAY_EXE}`, HOOK_RELAY_CS], { timeout: 60000, windowsHide: true });
+    if (r.status !== 0 || !fs.existsSync(HOOK_RELAY_EXE)) throw new Error(String(r.stderr || '未知编译错误').slice(0, 200));
+    ok('[user] 钩子 GUI 中继已编译:bin/hook-relay.exe(入口+子进程零闪,stdout 契约不变)');
+    return { relay: HOOK_RELAY_EXE, note: '现编译成功' };
+  } catch (e) {
+    console.error(`[warn] 中继编译失败,回退 node 直启:${e.message}`);
+    return { relay: null, note: `编译失败:${e.message}` };
+  }
+}
+
+function zcodeProcess(script, timeoutMs, statusMessage, extraArgs = [], relayExe = null) {
+  // C'(2026-11-13):有中继时入口换成 GUI 子系统 exe(零闪),脚本进 args;无中继回退 node 直启
+  const scriptPosix = script.split(path.sep).join('/');
+  if (relayExe) return { type: 'process', command: relayExe.split(path.sep).join('/'), args: [scriptPosix, ...extraArgs], timeoutMs, statusMessage };
+  return { type: 'process', command: 'node', args: [scriptPosix, ...extraArgs], timeoutMs, statusMessage };
 }
 
 export function isOurZcodeHook(h) {
@@ -914,7 +923,9 @@ function qoderAgentUsageScanSource(hooksDir) {
  * ZCode 用户级接线:~/.zcode/cli/config.json 的 hooks 键,绝对路径直指本模块脚本。
  * 该文件还存插件开关等其他状态,只动 hooks 键;同文件其他钩子保留。无 workspace 信任门控。
  */
-export function rewriteZcodeUserHooks({ home = os.homedir() } = {}) {
+export function rewriteZcodeUserHooks({ home = os.homedir(), relayExe = 'auto' } = {}) {
+  // C'(2026-11-13):relayExe='auto'=按 ensureHookRelay 实况(生产);测试可显式传路径(断言中继形)或 null(断言回退形)
+  const relay = relayExe === 'auto' ? ensureHookRelay().relay : relayExe;
   const cfgPath = path.join(home, '.zcode', 'cli', 'config.json');
   let cfg = {};
   if (fs.existsSync(cfgPath)) {
@@ -935,17 +946,16 @@ export function rewriteZcodeUserHooks({ home = os.homedir() } = {}) {
   }
   const push = (name, group) => { events[name] = [...(Array.isArray(events[name]) ? events[name] : []), group]; };
   const readNudge = path.join(here, 'read-nudge.mjs');
-  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'auto.mjs'), 420000, '索引保鲜检查(HEAD 驱动)+ 预热本地嵌入/精排/决策模型')] });
-  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'snapshot-refresh.mjs'), 10000, '上游快照保鲜(provider_config 变更时重抓)')] });
-  push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(path.join(here, 'commit-refresh.mjs'), 10000, '提交后索引保鲜')] });
-  push('PostToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '连续读导航+工具结果记账')] });
-  push('PostToolUseFailure', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '读取失败导航')] });
+  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(path.join(here, 'session-start.mjs'), 420000, '会话启动合并入口:上游快照保鲜+索引保鲜/预热/状态句(闪窗方案 A+C\':零闪)', [], relay)] });
+  push('PostToolUse', { matcher: 'Bash', hooks: [zcodeProcess(path.join(here, 'commit-refresh.mjs'), 10000, '提交后索引保鲜', [], relay)] });
+  push('PostToolUse', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '连续读导航+工具结果记账', [], relay)] });
+  push('PostToolUseFailure', { matcher: '^Read$|^Bash$', hooks: [zcodeProcess(readNudge, 10000, '读取失败导航', [], relay)] });
   push('UserPromptSubmit', { hooks: [
-    zcodeProcess(path.join(here, 'snapshot-refresh.mjs'), 10000, '上游快照保鲜(mtime 快路径)'),
-    zcodeProcess(path.join(here, 'prompt-guard.mjs'), 10000, '模型变更检测+语义预取', ['--host', 'zcode']),
+    zcodeProcess(path.join(here, 'snapshot-refresh.mjs'), 10000, '上游快照保鲜(mtime 快路径)', [], relay),
+    zcodeProcess(path.join(here, 'prompt-guard.mjs'), 10000, '模型变更检测+语义预取', ['--host', 'zcode'], relay),
   ] });
-  push('PreToolUse', { matcher: '^Read$|^Bash$|^Grep$', hooks: [zcodeProcess(path.join(here, 'read-guard.mjs'), 10000, '超限 Read 改写为语义区间,选不出再拒绝;Grep 补 head_limit')] });
-  push('Stop', { hooks: [zcodeProcess(path.join(here, 'turn-close.mjs'), 15000, '回合末结算+真实模型按回合落账', ['--host', 'zcode'])] });
+  push('PreToolUse', { matcher: '^Read$|^Bash$|^Grep$', hooks: [zcodeProcess(path.join(here, 'read-guard.mjs'), 10000, '超限 Read 改写为语义区间,选不出再拒绝;Grep 补 head_limit', [], relay)] });
+  push('Stop', { hooks: [zcodeProcess(path.join(here, 'turn-close.mjs'), 15000, '回合末结算+真实模型按回合落账', ['--host', 'zcode'], relay)] });
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] ZCode 用户级钩子已写入 ${cfgPath}(绝对路径直指本模块)`);
@@ -1107,7 +1117,7 @@ export function disciplineItems({ rel, dataRel, packed = false }) {
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
     P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
     P(10, '**部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `' + (packed ? 'npx tokensaver sync' : 'cd ' + rel + ' && node deploySync.mjs') + '` 校验一致性;不一致就重新运行 `' + (packed ? 'npx tokensaver init' : 'node init.mjs') + '` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致。**增删/改名用户级 hooks 转发器时,必须同步 `init.mjs` 与 `uninit.mjs` 两处部署/清理逻辑**:先登记 `init.mjs` 的 `USER_FORWARDER_FILES` 单源清单(uninit 清理与 deploySync 门禁都从这里取),漏登记会被 deploySync 拦下(安装⊆登记、卸载≡登记,卸载残留/手抄漂移都算不过)'),
-    P(11, '**实验数据保护**:`agent_reports/ab-logs/`(A/B 实验结果,2026-11-07 自 data/ab 迁入、2026-11-11 自 test/ab/result 迁入)等实验目录里是唯一的原始证据,删了不可再生(已入版本控制受 git 保护,但 `test/` 其余部分仍是本地沙盒):禁止 `git clean -x/-X`、`rm -rf agent_reports/ab-logs` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
+    P(11, '**实验数据保护**:`agent_reports/`(A/B 实验结果 ab-logs 等,2026-11-07 自 data/ab 迁入、2026-11-11 自 test/ab/result 迁入;2026-11-14 用户定:全部本地资产不入 git)等实验目录里是唯一的原始证据,删了不可再生且**无版本控制兜底**(git 里已取消追踪):禁止 `git clean -x/-X`、`rm -rf agent_reports` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
     P(12, '**缺陷文档回写**:按缺陷文档(如 `agent_reports/failures.md`)修完 bug 后,必须回写该文档——逐条标注已修/未修与修复位置,并把该文档标记为「已处理」;同一份文档不得再作为待修清单二次下发,重复下发时先核对文档内的已修标记,只处理仍未修的条目'),
     P(13, '**修复复盘自更新**:按缺陷文档修完 bug 后,除回写缺陷文档(第 12 条)与归档修复日志(第 14 条)外,还须复盘本轮踩到的问题(缺陷可能已在工作区修过/断言空跑/守卫没进门禁链/文档行号漂移/范围外的坑等),把可互鉴的教训写成「触发条件→下次先做什么」追加进本仓 `bugfix-sop.md` 的「注意事项」(定位顺序:仓根目录,无则 `tools/`;只增不删,失效条目标【已废】),并在同文件「复盘流水」追加本轮小结——小结必须写「本轮用上了哪几条既有 N」,至少一条真实复用。开工前先读该文件,避免重复犯同样的错;两处均无该文件时,首次修复时按「作业规程 / 注意事项 / 复盘流水」三段骨架创建(铺在仓根目录)。`bugfix-sop.md` 是可演进的作业细则,本纪律段是它的索引与强制入口'),
     P(14, '**修复日志归档**:每次 bug 修复**轮次**收尾时,在本仓 `agent_reports/fix-logs/`(无则创建)落一份当轮修复日志,文件名 `fix-<YYYYMMDD>-<主题>.md`,内容至少五段:①输入文档与条目数 ②已修清单(file:行 + 验证方式) ③留待清单与理由 ④门禁/回归结果 ⑤关联指针(台账 id、缺陷文档回执位置、`bugfix-sop.md` 复盘条目)。复盘流水的当轮条目回链该日志;日志属本地资产(`agent_reports/` 已 ignore),不 commit。跨会话追溯路径:缺陷文档回执(第 12 条)→ 修复日志(本条)→ SOP 复盘(第 13 条)三层互链'),
