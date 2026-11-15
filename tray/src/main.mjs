@@ -28,6 +28,7 @@ let tray = null;
 let panel = null;
 let poller = null;
 let ctx = { paths: null, snapshot: null, autorunOn: false };
+let quitting = false; // 2026-11-15:退出握手——真退出时放行 close,X 按钮 close 一律改藏托盘(不退出)
 
 const sh = (cmd, args) => new Promise((resolve) => {
   execFile(cmd, args, { windowsHide: true, encoding: 'utf8' }, (e, stdout) => resolve({ ok: !e, stdout: String(stdout || '') }));
@@ -60,11 +61,14 @@ function openPanel() {
   if (panel && !panel.isDestroyed()) { panel.show(); panel.focus(); return; }
   panel = new BrowserWindow({
     title: 'TokenSaver 状态面板',
-    width: 460, height: 560, resizable: true, show: false,
+    width: 460, height: 560, resizable: false, maximizable: false, fullscreenable: false, show: false,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   panel.loadFile(PANEL_HTML);
   panel.once('ready-to-show', () => panel.show());
+  // 2026-11-15 用户定:X=最小化到托盘(非退出);仅「退出」菜单真退。禁 F11 全屏。
+  panel.on('close', (e) => { if (!quitting) { e.preventDefault(); panel.hide(); } });
+  panel.webContents.on('before-input-event', (_e, input) => { if (input.key === 'F11') _e.preventDefault(); });
   panel.on('closed', () => { panel = null; });
   if (ctx.snapshot) panel.webContents.once('did-finish-load', () => panel?.webContents.send('tray:snapshot', ctx.snapshot));
 }
@@ -106,11 +110,13 @@ function openWizard() {
   if (!ctx.paths?.dataDir) { dialog.showErrorBox('安装向导', '无法定位 code-index 数据目录(paths.mjs 无响应),暂无法运行向导'); return; }
   wizardWin = new BrowserWindow({
     title: 'TokenSaver 安装向导',
-    width: 640, height: 720, resizable: true, show: false,
+    width: 640, height: 720, resizable: false, maximizable: false, fullscreenable: false, show: false,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   wizardWin.loadFile(WIZARD_HTML);
   wizardWin.once('ready-to-show', () => wizardWin.show());
+  wizardWin.on('close', (e) => { if (!quitting) { e.preventDefault(); wizardWin.hide(); } });
+  wizardWin.webContents.on('before-input-event', (_e, input) => { if (input.key === 'F11') _e.preventDefault(); });
   wizardWin.on('closed', () => { wizardWin = null; });
   wizardController(); // IPC 注册与控制器就绪先于渲染层首问
 }
@@ -228,4 +234,6 @@ if (!gotLock) {
     if (ctx.paths?.dataDir && !wizardDone()) openWizard(); // M2:无 done 记录=未完成向导,自动弹窗续引导(§5.5)
   });
   app.on('window-all-closed', (e) => { /* 托盘常驻:面板关了不退 */ });
+  // 2026-11-15 退出握手:菜单「退出」→ app.quit() 触发 before-quit 置真,close 拦截放行(hide 兜底不拦真退)
+  app.on('before-quit', () => { quitting = true; });
 }
