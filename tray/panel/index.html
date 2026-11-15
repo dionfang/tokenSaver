@@ -21,6 +21,7 @@
   .bar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; flex: 1; }
   .bar > i { display: block; height: 100%; background: #d29922; width: 0; transition: width .4s; }  /* 2026-11-15:默认黄=未满;满则加 .full 转绿 */
   .bar > i.full { background: #3fb950; }
+  .bar > i.grey { background: #6e7681; }  /* 公共决策包未下载=灰(2026-11-15) */
   .pct { font-size: 12px; color: #8b949e; flex: none; min-width: 34px; text-align: right; }
   .lbl { font-size: 12px; color: #8b949e; flex: none; min-width: 88px; }
   #mode { color: #58a6ff; }
@@ -39,8 +40,8 @@
 
   <h2>决策向量 KNN</h2>
   <div class="row"><span class="dot" id="m-knn"></span><span class="name" id="knn-name">决策向量 KNN</span><span class="state" id="t-knn">检测中</span></div>
-  <div class="bar-row"><span class="lbl">本地向量</span><div class="bar"><i id="knn-bar"></i></div><span class="pct" id="knn-pct">—</span></div>
-  <div class="bar-row"><span class="lbl">公共决策向量包</span><div class="bar"><i id="knn-base-bar"></i></div><span class="pct" id="knn-base-pct">—</span></div>
+  <div class="bar-row"><span class="lbl">本地决策包</span><div class="bar"><i id="knn-bar"></i></div><span class="pct" id="knn-pct">—</span></div>
+  <div class="bar-row"><span class="lbl">公共决策包</span><div class="bar"><i id="knn-base-bar"></i></div><span class="pct" id="knn-base-pct"></span></div>
 
   <h2>三端钩子配置</h2>
   <div class="row"><span class="dot" id="m-zcode"></span><span class="name">ZCode</span><span class="state" id="t-zcode">检测中</span></div>
@@ -81,11 +82,11 @@
     $('knn-bar').style.width = `${kt != null ? (kpct ?? 0) : 0}%`;
     $('knn-bar').className = kpct != null && kpct >= 100 ? 'full' : '';
     $('knn-pct').textContent = kt != null ? `${kd}/${kt}(${kpct ?? 0}%)` : '—';
-    // 公共决策向量包(原名 base 向量包)状态条:已获取=绿满+条数,未获取=黄空条「未下载」
-    const hasBase = p.baseExists === true;
-    $('knn-base-bar').style.width = hasBase ? '100%' : '0%';
-    $('knn-base-bar').className = hasBase ? 'full' : '';
-    $('knn-base-pct').textContent = hasBase ? (p.baseEntries != null ? `${p.baseEntries} 条` : '已就绪') : '未下载';
+    // 公共决策包(原名 base 向量包):未下载=灰条且无文案;已下载=同本地格式「done/total(pct%)」
+    const bd = p.knnBaseDone, bt = p.knnBaseTotal, bpct = p.knnBasePct;
+    $('knn-base-bar').style.width = `${bd != null ? (bpct ?? 0) : 0}%`;
+    $('knn-base-bar').className = bd == null ? 'grey' : (bpct != null && bpct >= 100 ? 'full' : '');
+    $('knn-base-pct').textContent = bd != null && bt != null ? `${bd}/${bt}(${bpct ?? 0}%)` : '';
     for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
   }
 

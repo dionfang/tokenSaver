@@ -115,6 +115,11 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
   const knnDone = knnR.localEntries ?? 0;
   const knnTotal = goldenCount ?? null;
   const knnPct = knnTotal > 0 ? (knnDone >= knnTotal ? 100 : Math.floor((knnDone / knnTotal) * 100)) : null;
+  // 公共决策包(原名 base 向量包)同格式计数:包内条目 / 黄金集条目(2026-11-15 用户裁决)
+  const knnBaseDone = knnR.baseExists ? (knnR.baseEntries ?? 0) : null;
+  const knnBaseTotal = knnTotal;
+  const knnBasePct = knnBaseDone != null && knnBaseTotal > 0
+    ? (knnBaseDone >= knnBaseTotal ? 100 : Math.floor((knnBaseDone / knnBaseTotal) * 100)) : null;
   return {
     models,
     embed: embed.lamp,
@@ -127,6 +132,9 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
       knnDone,
       knnTotal,
       knnPct,
+      knnBaseDone,
+      knnBaseTotal,
+      knnBasePct,
       baseEntries: knnR.baseEntries,
       baseExists: knnR.baseExists === true,
       localEntries: knnR.localEntries,
