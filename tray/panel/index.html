@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>TokenSaver 状态面板</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; background: #161b22; color: #c9d1d9; padding: 14px 16px; }
+  h2 { font-size: 12px; color: #8b949e; font-weight: 600; margin: 14px 0 6px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .green { background: #3fb950; box-shadow: 0 0 6px #3fb95088; }
+  .yellow { background: #d29922; box-shadow: 0 0 6px #d2992288; }
+  .red { background: #f85149; box-shadow: 0 0 6px #f8514988; }
+  .absent, .empty { background: #6e7681; }
+  .name { flex: 1; }
+  .state { color: #8b949e; font-size: 12px; }
+  .note { color: #d29922; font-size: 12px; padding: 2px 0 0 18px; }
+  .bar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
+  .bar > i { display: block; height: 100%; background: #3fb950; width: 0; transition: width .4s; }
+  .pct { font-size: 12px; color: #8b949e; }
+  footer { margin-top: 16px; padding-top: 8px; border-top: 1px solid #21262d; font-size: 12px; color: #8b949e; word-break: break-all; }
+  #mode { color: #58a6ff; }
+</style>
+</head>
+<body>
+  <h2>模型启动状态</h2>
+  <div class="row"><span class="dot" id="m-embedding"></span><span class="name">嵌入模型</span><span class="state" id="t-embedding">检测中</span></div>
+  <div class="row"><span class="dot" id="m-reranker"></span><span class="name">精排模型</span><span class="state" id="t-reranker">检测中</span></div>
+  <div class="row"><span class="dot" id="m-decision"></span><span class="name">决策模型</span><span class="state" id="t-decision">检测中</span></div>
+
+  <h2>代码索引向量嵌入</h2>
+  <div class="row"><span class="dot" id="m-embed"></span><span class="name">向量嵌入</span><span class="state" id="t-embed">检测中</span></div>
+  <div class="note" id="embed-reason" style="display:none"></div>
+  <div class="bar"><i id="embed-bar"></i></div>
+  <div class="pct" id="embed-pct">—</div>
+
+  <h2>决策向量 KNN</h2>
+  <div class="row"><span class="dot" id="m-knn"></span><span class="name">base + local 双层</span><span class="state" id="t-knn">检测中</span></div>
+  <div class="note" id="knn-note" style="display:none"></div>
+  <div class="pct" id="knn-count">base — 条 / local — 条</div>
+
+  <h2>三端钩子配置</h2>
+  <div class="row"><span class="dot" id="m-zcode"></span><span class="name">ZCode</span><span class="state" id="t-zcode">检测中</span></div>
+  <div class="row"><span class="dot" id="m-cursor"></span><span class="name">Cursor</span><span class="state" id="t-cursor">检测中</span></div>
+  <div class="row"><span class="dot" id="m-qoder"></span><span class="name">Qoder</span><span class="state" id="t-qoder">检测中</span></div>
+
+  <footer>
+    <div>运行模式:<span id="mode">检测中</span></div>
+    <div id="status-line" style="margin-top:4px">—</div>
+  </footer>
+
+<script>
+  const LAMP_TEXT = { green: '正常', yellow: '未就绪', red: '异常', absent: '未安装', empty: '无内容' };
+  const HOOK_TEXT = { green: '接线正确', red: '接线错误', absent: '未安装' };
+  const MODEL_TEXT = { green: '已运行', yellow: '未运行', red: '未安装' };
+  const EMBED_TEXT = { green: '全量嵌入', yellow: '部分嵌入', red: '无嵌入', empty: '未选目录' };
+  const KNN_TEXT = { green: '双层齐备', yellow: '缺 base 层', red: '缺 local 层' };
+  const $ = (id) => document.getElementById(id);
+
+  function setLamp(id, lamp, textMap) {
+    $(`m-${id}`).className = `dot ${lamp || 'absent'}`;
+    $(`t-${id}`).textContent = (textMap || LAMP_TEXT)[lamp] || '未知';
+  }
+
+  function render(s) {
+    const L = s.lamps || {};
+    for (const k of ['embedding', 'reranker', 'decision']) setLamp(k, L.models?.[k], MODEL_TEXT);
+    setLamp('embed', L.embed, EMBED_TEXT);
+    const reason = L.detail?.embedReasons?.join(';');
+    $('embed-reason').style.display = reason ? '' : 'none';
+    if (reason) $('embed-reason').textContent = reason;
+    const p = L.detail || {};
+    $('embed-bar').style.width = `${p.embedPct ?? 0}%`;
+    $('embed-pct').textContent = p.embedTotal != null ? `嵌入进度 ${p.embedDone ?? 0}/${p.embedTotal}(${p.embedPct ?? 0}%)` : '无进行中的嵌入';
+    setLamp('knn', L.knn, KNN_TEXT);
+    const kn = L.detail?.knnNotes?.join(';');
+    $('knn-note').style.display = kn ? '' : 'none';
+    if (kn) $('knn-note').textContent = kn;
+    $('knn-count').textContent = `base ${p.baseEntries ?? '—'} 条 / local ${p.localEntries ?? '—'} 条`;
+    for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
+    $('mode').textContent = s.modelIn === 'local' ? 'cpu模型' : s.modelIn ? 'gpu模型' : '未知';
+    $('status-line').textContent = s.statusLine || '状态获取中…';
+  }
+
+  window.trayPanel?.onSnapshot(render);
+</script>
+</body>
+</html>

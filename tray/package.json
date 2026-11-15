@@ -1,0 +1,17 @@
+{
+  "name": "tokensaver-tray",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TokenSaver 托盘客户端壳(Electron)。托盘状态灯 + 轮询双通道 + 状态面板;能力一律 spawn code-index 微 CLI,不依赖根 package.json。 TokenSaver tray shell (Electron). Status lamps, dual-channel polling and panel; all capabilities go through code-index micro-CLIs.",
+  "main": "src/main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "icon": "node assets/gen-icon.mjs",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}
