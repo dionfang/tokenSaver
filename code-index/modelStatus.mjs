@@ -1076,8 +1076,8 @@ export function renderModelStatus(p) {
 export async function assessModelStatus({ sessionId = null } = {}) {
   const cfg = loadConfig();
   const models = cfg.models;
-  // 自愈补拉节流(2026-11-14 用户定案:用户级可配):最小 1000ms 防 0/负值风暴
-  const warmMinIntervalMs = Math.max(1000, Math.floor(Number(cfg.warmMinIntervalMs) || 600000));
+  // 自愈补拉节流(2026-11-14 用户定案:用户级可配;2026-11-16 默认回退改 60000 与 config.mjs 同步双点):最小 1000ms 防 0/负值风暴
+  const warmMinIntervalMs = Math.max(1000, Math.floor(Number(cfg.warmMinIntervalMs) || 60000));
   const modelIn = activeBackend();
   const base = resolveBase();
   let ollama = 'down';

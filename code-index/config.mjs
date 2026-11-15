@@ -148,10 +148,10 @@ export const DEFAULT_CONFIG = {
   //   传给 ORT 会话 intraOpNumThreads(interOp 恒 1);默认=min(4, max(2, 物理核数/4))≈25% CPU。
   //   data/code-index.config.json 顶层键可覆盖;0=全核(旧行为)。embed.mjs 另可用 --cpu-threads 单次覆盖。
   embedCpuThreads: Math.max(2, Math.min(4, Math.floor(os.cpus().length / 4))),
-  // 自愈补拉节流(2026-11-14 用户定案:可配置):模型被驱逐/缺位后,两次补拉之间的最小间隔。
-  //   默认 600000=10 分钟(防持续故障时的进程风暴);调小=驱逐后拉回更快,代价是故障时 spawn 频率高。
-  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。
-  warmMinIntervalMs: 600000,
+  // 自愈补拉节流(2026-11-14 用户定案:可配置;2026-11-16 默认改 60000):模型被驱逐/缺位后,两次补拉之间的最小间隔。
+  //   默认 60000=1 分钟(精排掉线滞后窗口实测 10min 太宽,用户裁决收紧);调大=更省电但滞后久。
+  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。⚠ 消费侧兜底 modelStatus.mjs:1080 的 ||600000 须同改(默认双点)。
+  warmMinIntervalMs: 60000,
   models: {
     embedding: 'qwen3-embedding:0.6b',
     reranker: 'sam860/qwen3-reranker:0.6b-F16',
