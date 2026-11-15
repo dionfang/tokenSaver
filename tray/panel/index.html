@@ -28,7 +28,7 @@
 </style>
 </head>
 <body>
-  <h2>模型启动状态</h2>
+  <h2>模型启动状态 <span class="pct" id="snap-age" style="float:right;font-weight:400"></span></h2>
   <div class="row"><span class="name">运行模式</span><span id="mode">检测中</span></div>
   <div class="row"><span class="dot" id="m-embedding"></span><span class="name">嵌入模型</span><span class="state" id="t-embedding">检测中</span></div>
   <div class="row"><span class="dot" id="m-reranker"></span><span class="name">精排模型</span><span class="state" id="t-reranker">检测中</span></div>
@@ -65,7 +65,14 @@
 
   function render(s) {
     const L = s.lamps || {};
-    for (const k of ['embedding', 'reranker', 'decision']) setLamp(k, L.models?.[k], MODEL_TEXT);
+    for (const k of ['embedding', 'reranker', 'decision']) {
+      setLamp(k, L.models?.[k], MODEL_TEXT);
+      // 2026-11-15:未运行=未驻留显存(Ollama 空闲卸载/未预热),非故障——悬停说明,避免误判
+      $(`t-${k}`).title = '「未运行」= 该模型当前未驻留显存:Ollama keep_alive 到期空闲卸载或尚未预热;检索/预热时会自动拉起';
+    }
+    // 快照新鲜度(用户两次误判「检测错误」的根因是不知道这是快照):显示健康缓存龄
+    const ageS = s.healthAt ? Math.max(0, Math.round((Date.now() - s.healthAt) / 1000)) : (s.at ? Math.max(0, Math.round((Date.now() - s.at) / 1000)) : null);
+    $('snap-age').textContent = ageS != null ? `快照 ${ageS}s 前` : '';
     $('mode').textContent = s.modelIn === 'local' ? 'cpu模型' : s.modelIn ? 'gpu模型' : '未知';
     setLamp('embed', L.embed, EMBED_TEXT);
     const p = L.detail || {};
