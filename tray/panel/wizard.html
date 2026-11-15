@@ -1,0 +1,222 @@
+<!doctype html>
+<!-- 在线安装/首次配置向导(§5.5 五步,M2):全部走 preload 白名单通道(window.trayWizard),渲染进程零 Node。
+     文案全汉字;运行模式只显示「cpu模型/gpu模型」。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>TokenSaver 安装向导</title>
+<style>
+  :root { --line: #d8d8d8; --ok: #1a7f37; --warn: #b58900; --err: #c0392b; }
+  * { box-sizing: border-box; }
+  body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; margin: 0; padding: 14px 18px 18px; color: #222; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: #666; font-size: 12px; margin-bottom: 10px; }
+  .steps { display: flex; gap: 6px; margin-bottom: 12px; }
+  .steps span { flex: 1; text-align: center; padding: 4px 0; border-bottom: 3px solid #eee; color: #999; font-size: 12px; }
+  .steps span.on { border-color: #2f6fdf; color: #2f6fdf; font-weight: bold; }
+  .steps span.done { border-color: var(--ok); color: var(--ok); }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+  button { padding: 6px 16px; border: 1px solid #bbb; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
+  button.primary { background: #2f6fdf; border-color: #2f6fdf; color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.link { border: none; background: none; color: #2f6fdf; padding: 0; text-decoration: underline; }
+  ul.roots { list-style: none; padding: 0; margin: 8px 0; max-height: 130px; overflow: auto; }
+  ul.roots li { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed #e2e2e2; padding: 3px 2px; }
+  .hint { font-size: 12px; color: var(--warn); }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  .lamp { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .lamp.green { background: #22c55e; } .lamp.red { background: #ef4444; } .lamp.absent { background: #cbd5e1; }
+  label.mode { display: block; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 6px 0; cursor: pointer; }
+  label.mode input { margin-right: 8px; }
+  .bar { height: 14px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: #f6f6f6; }
+  .bar > i { display: block; height: 100%; background: #2f6fdf; width: 0; transition: width .2s; }
+  .item { margin: 8px 0; }
+  .item .meta { display: flex; justify-content: space-between; font-size: 12px; color: #555; }
+  .disc { font-size: 12px; color: #555; background: #f8f8f8; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
+  .disc b { color: #333; }
+  pre.stderr { background: #2d2d2d; color: #f66; padding: 8px; border-radius: 6px; max-height: 110px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+  .nav { display: flex; justify-content: space-between; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>TokenSaver 在线安装 / 首次配置</h1>
+<div class="sub" id="subtitle">按步骤完成安装;中途退出会记住进度,下次打开继续。</div>
+<div class="steps" id="steps"></div>
+<div id="body"></div>
+<div class="nav">
+  <button id="btnBack">上一步</button>
+  <button id="btnNext" class="primary">下一步</button>
+</div>
+
+<script>
+const STEPS = [
+  ['ROOTS', '索引目录'], ['MODE', '运行模式'], ['CONSENT', '数据上传'],
+  ['DOWNLOAD', '下载组件'], ['INIT_RUN', '安装接线'],
+];
+const S = { w: null, progress: null, hooks: null, nodeForm: null };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const act = (name, payload) => window.trayWizard.action(name, payload).then((r) => { render(); return r; });
+
+window.trayWizard.onState((st) => { Object.assign(S, st); render(); });
+
+function stepIndex(status) {
+  if (status === 'INIT') return -1;
+  if (status === 'DONE') return STEPS.length;
+  return STEPS.findIndex(([k]) => k === status);
+}
+
+function render() {
+  const w = S.w || { status: 'INIT', roots: [], downloads: {} };
+  const cur = stepIndex(w.status);
+  $('steps').innerHTML = STEPS.map(([k, label], i) =>
+    `<span class="${i < cur ? 'done' : i === cur ? 'on' : ''}">${i + 1}. ${label}</span>`).join('');
+  $('btnBack').disabled = cur <= 0 || w.status === 'DONE';
+  $('btnBack').style.visibility = w.status === 'DONE' ? 'hidden' : 'visible';
+  const gate = nextGate(w);
+  $('btnNext').disabled = !gate.ok;
+  $('btnNext').textContent = w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步');
+  if (w.status === 'INIT') {
+    $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型)→ 数据上传同意 → 下载必要组件 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
+    return;
+  }
+  if (w.status === 'ROOTS') renderRoots(w);
+  else if (w.status === 'MODE') renderMode(w);
+  else if (w.status === 'CONSENT') renderConsent(w);
+  else if (w.status === 'DOWNLOAD') renderDownload(w);
+  else if (w.status === 'INIT_RUN') renderInitRun(w);
+  else if (w.status === 'DONE') renderDone(w);
+}
+
+// —— 下一步可用性(与主进程 fsm 守卫同口径;按钮禁用只是 UI 前置,真守卫在 fsm) ——
+function nextGate(w) {
+  if (w.status === 'INIT' || w.status === 'ROOTS' || w.status === 'CONSENT') return { ok: true };
+  if (w.status === 'MODE') return (w.runMode === 'cpu' || (w.runMode === 'gpu' && w.ollamaReady === true)) ? { ok: true } : { ok: false };
+  if (w.status === 'DOWNLOAD') {
+    const items = w.items || [];
+    if (!items.length) return { ok: false };
+    return items.every((it) => w.downloads?.[it.id]?.ok === true) ? { ok: true } : { ok: false };
+  }
+  return { ok: false };
+}
+
+function renderRoots(w) {
+  const rows = (w.roots || []).map((r) =>
+    `<li><span>${esc(r)}</span><button class="link" onclick="act('remove-root',{dir:${JSON.stringify(r).replace(/"/g, '&quot;')}})">移除</button></li>`).join('');
+  $('body').innerHTML = `
+    <div class="card">
+      <b>要语义索引哪些目录?</b>
+      <div class="row"><button onclick="act('pick-roots')">选择目录…</button><span class="sub">可反复添加,不设个数上限</span></div>
+      <ul class="roots">${rows || '<li class="sub">尚未选择目录</li>'}</ul>
+      ${(w.roots || []).length === 0 ? '<div class="hint">未选目录:语义检索暂不可用,可稍后在托盘添加。不索引也可完成安装(只装工具与钩子)。</div>' : ''}
+    </div>`;
+}
+
+function renderMode(w) {
+  const gpuReady = w.ollamaReady === true;
+  $('body').innerHTML = `
+    <div class="card">
+      <b>运行模式</b>
+      <label class="mode"><input type="radio" name="mode" ${w.runMode === 'cpu' ? 'checked' : ''} onchange="act('set-mode',{mode:'cpu'})"> cpu模型<span class="sub">—— 本机常驻推理,不依赖 Ollama(权重由向导下载)</span></label>
+      <label class="mode"><input type="radio" name="mode" ${w.runMode === 'gpu' ? 'checked' : ''} onchange="act('set-mode',{mode:'gpu'})"> gpu模型<span class="sub">—— 使用本机 Ollama(可走 GPU)。需要本机 Ollama(向导可代下载其官方安装包)</span></label>
+      ${w.runMode === 'gpu' ? `
+      <div class="disc">
+        <div id="ollamaState">${gpuReady ? '<span class="ok">✔ 已检测到 Ollama 服务' + (S.ollamaVersion ? '(版本 ' + esc(S.ollamaVersion) + ')' : '') + '</span>' : '<span class="err">✘ 未检测到 Ollama 服务在运行(gpu模型 必须先就绪才能继续)</span>'}</div>
+        <div class="row">
+          <button onclick="act('download-ollama-setup')">下载 Ollama 官方安装包</button>
+          <button onclick="act('recheck-ollama')">我已装好,重新检测</button>
+        </div>
+        <div class="sub">安装包为官方版本且经 sha256 校验;下载后请手动执行安装并启动 Ollama,再点「重新检测」。不想装 Ollama 可返回改选 cpu模型。</div>
+      </div>` : ''}
+    </div>`;
+}
+
+function renderConsent(w) {
+  const checked = w.consent === true;
+  $('body').innerHTML = `
+    <div class="card">
+      <b>数据上传同意(可跳过)</b>
+      <div class="row" style="margin-top:10px">
+        <label><input type="checkbox" id="ckConsent" ${checked ? 'checked' : ''} onchange="act('set-consent',{checked:this.checked})"> 同意上传本地向量 KNN 数据</label>
+      </div>
+      <div class="disc">
+        <b>勾选的后果:</b>① 向服务器上传本地向量 KNN 数据用于扩容公共决策池(其中<b>不含本地项目代码/业务数据</b>);② 解锁「更新 base 向量」(从服务器下载公共决策向量包)。<br>
+        <b>跳过的后果:</b>不上传,同时「更新 base 向量」功能禁用(按钮置灰),决策向量仅使用本机数据——互惠条款:不向服务器池贡献,也不从池受益。<br><br>
+        另外,无论是否同意,安装接线都会<b>向所选目录的 AGENTS.md 写入工具说明段,并配置 IDE 用户级钩子</b>(可随时用托盘的「修复钩子」/卸载功能移除)。<br><br>
+        同意状态<b>可随时在设置中撤回</b>。
+      </div>
+    </div>`;
+}
+
+function phaseText(p) {
+  return { fetching: '下载中', resume: '续传中', verify: '校验中', pull: '拉取中', done: '完成' }[p?.phase] || '';
+}
+function bytes(n) { return n == null ? '' : n >= 1 << 30 ? (n / (1 << 30)).toFixed(2) + ' GB' : n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + ' MB' : Math.ceil(n / 1024) + ' KB'; }
+
+function renderDownload(w) {
+  const items = w.items || [];
+  const prog = S.progress;
+  const rows = items.map((it) => {
+    const d = w.downloads?.[it.id];
+    const cur = prog && prog.itemId === it.id && !d?.ok ? prog : null;
+    const pct = d?.ok ? 100 : cur?.pct ?? 0;
+    const meta = d?.ok ? '<span class="ok">已校验完成</span>'
+      : cur ? `<span>${phaseText(cur)} ${cur.bytesTotal ? Math.round(cur.bytesDone / cur.bytesTotal * 100) + '%(' + bytes(cur.bytesDone) + '/' + bytes(cur.bytesTotal) + ')' : ''}</span>`
+      : '<span class="sub">排队中</span>';
+    return `<div class="item"><div class="meta"><span>${esc(it.label || it.id)}${it.mode === 'common' ? '(公共组件)' : ''}</span>${meta}</div><div class="bar"><i style="width:${pct}%"></i></div></div>`;
+  }).join('');
+  const doneAll = items.length && items.every((it) => w.downloads?.[it.id]?.ok === true);
+  $('body').innerHTML = `
+    <div class="card">
+      <b>正在下载必要安装组件…</b><span class="sub">(安装必需步骤,不是可选更新;公共组件先行)</span>
+      ${rows || '<div class="sub">正在获取组件清单…</div>'}
+      ${w.lastError ? `<div class="err">失败:${esc(w.lastError)} <button onclick="act('retry')">重试</button></div>` : ''}
+      <div class="row">
+        ${doneAll ? '<span class="ok">全部组件校验通过,可进入下一步。</span>' : '<button id="dlStart" onclick="act(\'start-download\')">开始下载</button> <button onclick="act(\'pause\')">暂停</button> <button onclick="act(\'cancel\')">取消</button>'}
+      </div>
+      <div class="sub">支持断点续传:暂停/取消都会保留已下载部分,重开向导不重复下载已校验通过项。源不可达会停留本步,不会假装完成。</div>
+    </div>`;
+  const btn = $('btnNext'); if (btn) { btn.textContent = doneAll ? '下一步' : '下一步(须先完成下载)'; }
+}
+
+function renderInitRun(w) {
+  const logs = (w.initLog || []).map((l) => `<li>${esc(l.label)} — ${l.code === 0 ? '<span class="ok">成功</span>' : '<span class="err">失败</span>'}</li>`).join('');
+  $('body').innerHTML = `
+    <div class="card">
+      <b>安装接线</b>
+      <div class="sub">逐目录执行 init 接线(写入 AGENTS.md 工具说明段+配置 IDE 用户级钩子+设置运行模式)。roots 为空时只设置运行模式。</div>
+      <ul>${logs || '<li class="sub">尚未开始</li>'}</ul>
+      <div class="row"><button class="primary" id="btnRunInit" onclick="act('run-init')" ${w.lastError ? '' : ''}>执行安装接线</button></div>
+      ${w.lastError ? `<pre class="stderr">${esc(w.lastError)}</pre><div class="row"><button onclick="act('run-init')">重试接线</button></div>` : ''}
+    </div>`;
+}
+
+function renderDone(w) {
+  const hooks = S.hooks;
+  const lamp = (s) => `<span class="lamp ${s || 'absent'}"></span>`;
+  $('body').innerHTML = `
+    <div class="card">
+      <b class="ok">✔ 安装完成!</b>
+      <div class="sub">索引目录:${(w.roots || []).length} 个;运行模式:${w.runMode === 'gpu' ? 'gpu模型' : 'cpu模型'};数据上传:${w.consent ? '已同意' : '未同意(更新 base 向量已禁用,仅使用本机 KNN)'}。</div>
+      ${hooks ? `<div class="row">
+        <span>${lamp(hooks.zcode)} ZCode 钩子</span><span>${lamp(hooks.cursor)} Cursor 钩子</span><span>${lamp(hooks.qoder)} Qoder 钩子</span>
+      </div><div class="sub">钩子灯异常时可用托盘菜单「修复钩子」。若刚接入下载的 Node 运行时,已打开的 IDE 需重启后钩子生效。</div>` : ''}
+      <div class="sub">托盘常驻后台;双击托盘图标可查看状态面板。</div>
+    </div>`;
+  const btn = $('btnNext'); btn.textContent = '完成'; btn.disabled = false;
+  btn.onclick = () => window.close();
+}
+
+$('btnBack').onclick = () => act('back');
+$('btnNext').onclick = () => {
+  const w = S.w;
+  if (!w) return;
+  if (w.status === 'DOWNLOAD' && !(w.items || []).length) { act('start-download'); return; }
+  if (w.status === 'DONE') { window.close(); return; }
+  act('next');
+};
+act('load');
+</script>
+</body>
+</html>
