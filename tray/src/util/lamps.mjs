@@ -80,9 +80,10 @@ export function embedLamp({ health, vectors, chunksLines }) {
 export function knnLamp({ knn }) {
   const baseEntries = knn?.baseEntries ?? null;
   const localEntries = knn?.localEntries ?? null;
-  if (!knn || !knn.localExists) return { lamp: 'red', notes: ['本地 local 向量 KNN 不存在(先完成嵌入)'], baseEntries, localEntries };
-  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用)'], baseEntries, localEntries };
-  return { lamp: 'green', notes: [], baseEntries, localEntries };
+  const baseExists = knn?.baseExists === true;
+  if (!knn || !knn.localExists) return { lamp: 'red', notes: ['本地 local 向量 KNN 不存在(先完成嵌入)'], baseEntries, localEntries, baseExists };
+  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用)'], baseEntries, localEntries, baseExists };
+  return { lamp: 'green', notes: [], baseEntries, localEntries, baseExists };
 }
 
 /** §5.3.4 三端钩子灯:直接映射 hooksStatus.mjs 的 state;拿不到结果(未跑/失败)按 absent 不判红。 */
@@ -127,6 +128,7 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
       knnTotal,
       knnPct,
       baseEntries: knnR.baseEntries,
+      baseExists: knnR.baseExists === true,
       localEntries: knnR.localEntries,
       missing,
       embedReasons: embed.reasons,
