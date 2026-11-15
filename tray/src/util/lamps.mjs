@@ -106,7 +106,9 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
   // (progress 实时批次仅供内部展示用途,不再进入 detail;embedPct 由总体口径计算)
   const embedTotal = chunksLines ?? null;
   const embedDone = vectors?.meta?.chunks ?? 0;
-  const embedPct = embedTotal > 0 ? Math.min(100, Math.round((embedDone / embedTotal) * 100)) : null;
+  // 向下取整(2026-11-15 修复):四舍五入会把 99.96% 抬成 100%——绿满条与「部分嵌入」黄灯自相矛盾
+  // (5214/5216 实测曾显示 100% 绿条)。仅 done≥total 才 100%,不足一律 <100 → 黄条。
+  const embedPct = embedTotal > 0 ? (embedDone >= embedTotal ? 100 : Math.floor((embedDone / embedTotal) * 100)) : null;
   return {
     models,
     embed: embed.lamp,
