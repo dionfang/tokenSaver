@@ -19,7 +19,8 @@
   .note { color: #d29922; font-size: 12px; padding: 2px 0 0 18px; }
   .bar-row { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; }
   .bar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; flex: 1; }
-  .bar > i { display: block; height: 100%; background: #3fb950; width: 0; transition: width .4s; }
+  .bar > i { display: block; height: 100%; background: #d29922; width: 0; transition: width .4s; }  /* 2026-11-15:默认黄=未满;满则加 .full 转绿 */
+  .bar > i.full { background: #3fb950; }
   .pct { font-size: 12px; color: #8b949e; flex: none; min-width: 34px; text-align: right; }
   #mode { color: #58a6ff; }
 </style>
@@ -34,7 +35,6 @@
   <h2>代码索引向量嵌入</h2>
   <div class="row"><span class="dot" id="m-embed"></span><span class="name">向量嵌入</span><span class="state" id="t-embed">检测中</span></div>
   <div class="bar-row"><div class="bar"><i id="embed-bar"></i></div><span class="pct" id="embed-pct">100%</span></div>
-  <div class="note" id="embed-reason" style="display:none"></div>
 
   <h2>决策向量 KNN</h2>
   <div class="row"><span class="dot" id="m-knn"></span><span class="name" id="knn-name">决策向量 KNN</span><span class="state" id="t-knn">检测中</span></div>
@@ -67,14 +67,11 @@
     $('mode').textContent = s.modelIn === 'local' ? 'cpu模型' : s.modelIn ? 'gpu模型' : '未知';
     setLamp('embed', L.embed, EMBED_TEXT);
     const p = L.detail || {};
-    $('embed-bar').style.width = `${p.embedPct ?? (p.embedTotal != null ? 0 : 100)}%`;
-    // 2026-11-15 用户裁决:进行中=右侧「嵌入进度 X/Y(Z%)」;空闲=右侧 100%(不再显示「无进行中的嵌入」)
-    $('embed-pct').textContent = p.embedTotal != null ? `嵌入进度 ${p.embedDone ?? 0}/${p.embedTotal}(${p.embedPct ?? 0}%)` : '100%';
-    // 2026-11-15 用户裁决:黄/红/空态在进度条下方必显示状态文案(原因缺失时兜底状态词);绿态不显示
-    const reasons = L.detail?.embedReasons || [];
-    const embedNote = L.embed && L.embed !== 'green' ? [EMBED_TEXT[L.embed] || '', ...reasons].filter(Boolean).join(' — ') : '';
-    $('embed-reason').style.display = embedNote ? '' : 'none';
-    if (embedNote) $('embed-reason').textContent = embedNote;
+    const total = p.embedTotal, done = p.embedDone ?? 0, pct = p.embedPct;
+    $('embed-bar').style.width = `${total != null ? (pct ?? 0) : 0}%`;
+    $('embed-bar').className = pct != null && pct >= 100 ? 'full' : '';
+    // 2026-11-15 用户裁决:总体状态——已嵌/总索引块+总比例;100%=绿条,不足=黄条;下方不显示状态原因文案
+    $('embed-pct').textContent = total != null ? `${done}/${total}(${pct ?? 0}%)` : '未选目录';
     setLamp('knn', L.knn, KNN_TEXT);
     $('knn-name').textContent = KNN_NAME[L.knn] || '决策向量 KNN';
     const kn = L.detail?.knnNotes?.join(';');

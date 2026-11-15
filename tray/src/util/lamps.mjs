@@ -102,15 +102,20 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
       : models.decision === 'red' ? 'decision'
         : knnR.lamp === 'red' ? 'localKnn'
           : knnR.lamp === 'yellow' ? 'baseKnn' : null;
+  // 2026-11-15 用户裁决:面板进度=总体状态——done=向量 meta 已嵌块数,total=chunks.jsonl 总索引块
+  // (progress 实时批次仅供内部展示用途,不再进入 detail;embedPct 由总体口径计算)
+  const embedTotal = chunksLines ?? null;
+  const embedDone = vectors?.meta?.chunks ?? 0;
+  const embedPct = embedTotal > 0 ? Math.min(100, Math.round((embedDone / embedTotal) * 100)) : null;
   return {
     models,
     embed: embed.lamp,
     knn: knnR.lamp,
     hooks,
     detail: {
-      embedDone: progress?.done ?? null,
-      embedTotal: progress?.total ?? null,
-      embedPct: progress?.pct ?? null,
+      embedDone,
+      embedTotal,
+      embedPct,
       baseEntries: knnR.baseEntries,
       localEntries: knnR.localEntries,
       missing,
