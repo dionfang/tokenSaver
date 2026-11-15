@@ -58,6 +58,8 @@ async function setAutorun(on) {
 
 // ---------- 面板(§18-A4 一期必做;渲染进程零 Node,只走 preload 白名单通道) ----------
 function openPanel() {
+  // 2026-11-15 用户裁决:打开面板=要实况——触发一次慢刷(低频事件,一次 spawn status 换真实时)
+  if (poller) poller.slowRefresh('panel-open').catch(() => {});
   if (panel && !panel.isDestroyed()) { panel.show(); panel.focus(); return; }
   panel = new BrowserWindow({
     title: 'TokenSaver 状态面板',

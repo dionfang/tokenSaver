@@ -23,6 +23,16 @@ export function shouldSlowRefresh({ lastSlowAt = 0, nowMs, stale = false, interv
   return stale || nowMs - lastSlowAt >= intervalMs;
 }
 
+/** 模型灯过期判定(2026-11-15 用户裁决 B):非绿且缓存龄 >60s → 值得一次慢刷。
+ *  资源取舍:不新增 probe 通道(每 5s 打 /api/ps 既持续耗 CPU 又判不出红黄),
+ *  复用 status.mjs 全量判定;调用方须再套 60s 慢刷节流防风暴。 */
+export const LAMP_STALE_MS = 60_000;
+export function needsLampRefresh(lamps, cachedAtMs, nowMs = Date.now()) {
+  const m = lamps?.models || {};
+  const anyNonGreen = ['embedding', 'reranker', 'decision'].some((k) => m[k] && m[k] !== 'green');
+  return anyNonGreen && cachedAtMs != null && nowMs - cachedAtMs > LAMP_STALE_MS;
+}
+
 export function createPoller(deps) {
   const {
     paths,
@@ -152,7 +162,11 @@ export function createPoller(deps) {
       consent,
     };
     onSnapshot(snapshot);
-    if (allowSlow && shouldSlowRefresh({ lastSlowAt: state.lastSlowAt, nowMs: now(), stale, intervalMs: slowIntervalMs })) slowRefresh('tick');
+    if (allowSlow) {
+      const due = shouldSlowRefresh({ lastSlowAt: state.lastSlowAt, nowMs: now(), stale, intervalMs: slowIntervalMs });
+      const lampDue = needsLampRefresh(lamps, cache?.at ?? null, now()) && now() - state.lastSlowAt >= slowIntervalMs; // 灯黄且缓存旧:受 60s 节流防风暴
+      if (due || lampDue) slowRefresh(lampDue && !due ? 'lamp' : 'tick');
+    }
     return snapshot;
   }
 
