@@ -92,7 +92,7 @@ export function hooksLamps(hooksResult) {
 }
 
 /** §6 getLamps 契约总装。progress 仅展示,不参与绿黄判定。 */
-export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights } = {}) {
+export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights, goldenCount = null } = {}) {
   const models = modelLamps(health, { localWeights });
   const embed = embedLamp({ health, vectors, chunksLines });
   const knnR = knnLamp({ knn });
@@ -109,6 +109,11 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
   // 向下取整(2026-11-15 修复):四舍五入会把 99.96% 抬成 100%——绿满条与「部分嵌入」黄灯自相矛盾
   // (5214/5216 实测曾显示 100% 绿条)。仅 done≥total 才 100%,不足一律 <100 → 黄条。
   const embedPct = embedTotal > 0 ? (embedDone >= embedTotal ? 100 : Math.floor((embedDone / embedTotal) * 100)) : null;
+  // 决策向量对齐进度(2026-11-15 用户需求):本地 local 层向量条目 vs 四票代签黄金集条目。
+  // 数量口径(golden pkey=promptKey、向量 pkey=24hex 且不带 prompt,逐条交集不可得);满=已对齐。
+  const knnDone = knnR.localEntries ?? 0;
+  const knnTotal = goldenCount ?? null;
+  const knnPct = knnTotal > 0 ? (knnDone >= knnTotal ? 100 : Math.floor((knnDone / knnTotal) * 100)) : null;
   return {
     models,
     embed: embed.lamp,
@@ -118,6 +123,9 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
       embedDone,
       embedTotal,
       embedPct,
+      knnDone,
+      knnTotal,
+      knnPct,
       baseEntries: knnR.baseEntries,
       localEntries: knnR.localEntries,
       missing,

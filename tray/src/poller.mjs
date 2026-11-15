@@ -39,6 +39,7 @@ export function createPoller(deps) {
     chunks: { key: '', lines: null },
     meta: { key: '', value: null },
     knn: { key: '', base: null, local: null },
+    golden: { key: '', value: null },   // 黄金集行数(决策向量对齐进度分母,2026-11-15)
     consent: { key: '', value: { uploadLocalKnn: false, consentedAt: null } },
     hooks: null,
     statusLine: null,
@@ -92,6 +93,16 @@ export function createPoller(deps) {
     return state.knn;
   }
 
+  /** 黄金集行数(对齐进度分母);mtime 门控缓存。 */
+  function readGolden() {
+    const p = `${paths.dataDir}/routing/golden-set.jsonl`;
+    const key = fileKey(p);
+    if (key === state.golden.key && key != null) return state.golden.value;
+    const v = paths.dataDir != null ? io.countGoldenLines(paths.dataDir) : null;
+    state.golden = { key: key ?? '', value: v };
+    return v;
+  }
+
   function readConsent() {
     const p = `${paths.dataDir}/tray-consent.json`;
     const key = fileKey(p);
@@ -125,7 +136,7 @@ export function createPoller(deps) {
         decision: hfWeightCached(paths.hfCacheDir, health?.models?.localDecision),
       }
       : {};
-    const lamps = computeLamps({ health, vectors, chunksLines, knn: knnLayerInput(knnL), hooks: state.hooks, consent, progress, localWeights });
+    const lamps = computeLamps({ health, vectors, chunksLines, knn: knnLayerInput(knnL), hooks: state.hooks, consent, progress, localWeights, goldenCount: readGolden() });
     if (state.statusLine == null && paths.dataDir != null) state.statusLine = io.readLastStatus(paths.dataDir);
     const stale = isCacheStale(cache?.at ?? null, now());
     const snapshot = {

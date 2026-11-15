@@ -38,7 +38,7 @@
 
   <h2>决策向量 KNN</h2>
   <div class="row"><span class="dot" id="m-knn"></span><span class="name" id="knn-name">决策向量 KNN</span><span class="state" id="t-knn">检测中</span></div>
-  <div class="note" id="knn-note" style="display:none"></div>
+  <div class="bar-row"><div class="bar"><i id="knn-bar"></i></div><span class="pct" id="knn-pct">—</span></div>
   <div class="pct" id="knn-count">base 0 条 / local 0 条</div>
 
   <h2>三端钩子配置</h2>
@@ -74,9 +74,12 @@
     $('embed-pct').textContent = total != null ? `${done}/${total}(${pct ?? 0}%)` : '未选目录';
     setLamp('knn', L.knn, KNN_TEXT);
     $('knn-name').textContent = KNN_NAME[L.knn] || '决策向量 KNN';
-    const kn = L.detail?.knnNotes?.join(';');
-    $('knn-note').style.display = kn ? '' : 'none';
-    if (kn) $('knn-note').textContent = kn;
+    // 2026-11-15 用户裁决:①base 缺失提示文案不显示(安装时已自行选择知晓)②增对齐进度条:
+    // 本地 local 向量条目 / 四票代签黄金集条目,满=绿、不足=黄(与嵌入条同色规则)
+    const kd = p.knnDone ?? 0, kt = p.knnTotal, kpct = p.knnPct;
+    $('knn-bar').style.width = `${kt != null ? (kpct ?? 0) : 0}%`;
+    $('knn-bar').className = kpct != null && kpct >= 100 ? 'full' : '';
+    $('knn-pct').textContent = kt != null ? `${kd}/${kt}(${kpct ?? 0}%)` : '—';
     $('knn-count').textContent = `base ${p.baseEntries ?? 0} 条 / local ${p.localEntries ?? 0} 条`;
     for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
   }

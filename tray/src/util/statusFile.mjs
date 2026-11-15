@@ -57,6 +57,15 @@ export function countChunksLines(dataDir) {
   return txt.length ? txt.trimEnd().split('\n').length : 0;
 }
 
+/** data/routing/golden-set.jsonl 行数(四票代签黄金集条目);缺失返回 null。
+ *  2026-11-15:决策向量「对齐进度」分母——注意 golden 的 pkey 是 promptKey(hash36:len),
+ *  向量层 pkey 是 24-hex 且不带 prompt 原文,逐条交集不可得,故对齐度用数量口径。 */
+export function countGoldenLines(dataDir) {
+  const txt = readTextOnce(path.join(dataDir, 'routing', 'golden-set.jsonl'));
+  if (txt == null) return null;
+  return txt.length ? txt.trimEnd().split('\n').filter(Boolean).length : 0;
+}
+
 /** data/vectors/<local|ollama>/meta.json(镜像 vectorStore.readVectorMeta,纯读按路径)。 */
 export function readVectorMetaAt(dataDir, backend) {
   const txt = readTextOnce(path.join(dataDir, 'vectors', backend === 'local' ? 'local' : 'ollama', 'meta.json'));
