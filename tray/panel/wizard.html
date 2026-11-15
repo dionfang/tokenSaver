@@ -57,9 +57,25 @@ const STEPS = [
 const S = { w: null, progress: null, hooks: null, nodeForm: null };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const act = (name, payload) => window.trayWizard.action(name, payload).then((r) => { render(); return r; });
+// 动作错误可见化(2026-11-15):invoke 失败不再静默——右下角浮条显示原因,避免「按钮点了没反应」无从排查
+const act = (name, payload) => window.trayWizard.action(name, payload)
+  .then((r) => { render(); if (r && r.ok === false && r.message) showErr(r.message); return r; })
+  .catch((e) => { showErr(String((e && e.message) || e)); throw e; });
+function showErr(msg) {
+  let el = document.getElementById('errline');
+  if (!el) { el = document.createElement('div'); el.id = 'errline'; el.style.cssText = 'position:fixed;right:12px;bottom:12px;max-width:70%;background:#7f1d1d;color:#fecaca;padding:8px 12px;border-radius:6px;font-size:12px;z-index:99'; document.body.appendChild(el); }
+  el.textContent = `动作失败:${msg}`;
+  clearTimeout(el._t); el._t = setTimeout(() => el.remove(), 30000);
+}
 
-window.trayWizard.onState((st) => { Object.assign(S, st); render(); });
+window.trayWizard.onState((st) => {
+  // 显式逐字段直赋(2026-11-15 修复):Object.assign(S, st) 在沙箱渲染上下文不生效,曾致 S.w 恒 null、按钮误显「加载中」
+  S.w = st ? st.wizard : null;
+  S.progress = st ? st.progress : null;
+  S.hooks = st ? st.hooks : null;
+  S.nodeForm = st ? st.nodeForm : null;
+  render();
+});
 
 function stepIndex(status) {
   if (status === 'INIT') return -1;
@@ -75,8 +91,9 @@ function render() {
   $('btnBack').disabled = cur <= 0 || w.status === 'DONE';
   $('btnBack').style.visibility = w.status === 'DONE' ? 'hidden' : 'visible';
   const gate = nextGate(w);
-  $('btnNext').disabled = !gate.ok;
-  $('btnNext').textContent = w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步');
+  // 2026-11-15 修复:load 推送到达前按钮禁用(S.w=null 时点击会被旧逻辑静默吞掉——加载竞态)
+  $('btnNext').disabled = !S.w || !gate.ok;
+  $('btnNext').textContent = !S.w ? '加载中…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步'));
   if (w.status === 'INIT') {
     $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型)→ 数据上传同意 → 下载必要组件 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
     return;
@@ -211,7 +228,7 @@ function renderDone(w) {
 $('btnBack').onclick = () => act('back');
 $('btnNext').onclick = () => {
   const w = S.w;
-  if (!w) return;
+  if (!w) { act('load'); return; } // 加载竞态兜底:状态未至则重发 load(按钮正常态下不会走这)
   if (w.status === 'DOWNLOAD' && !(w.items || []).length) { act('start-download'); return; }
   if (w.status === 'DONE') { window.close(); return; }
   act('next');

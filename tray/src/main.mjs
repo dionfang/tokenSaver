@@ -85,7 +85,15 @@ function wizardController() {
     },
     execFile,
   });
-  ipcMain.handle('wizard:action', (_e, name, payload) => wizardCtl.dispatch(name, payload));
+  ipcMain.handle('wizard:action', async (_e, name, payload) => {
+    try {
+      return await wizardCtl.dispatch(name, payload);
+    } catch (e) {
+      // 2026-11-15 修复:主进程异常回传渲染层浮条展示,不再静默(「按钮没反应」无从排查的根源之一)
+      console.error(`[wizard] action=${name} threw: ${e.stack || e}`);
+      return { ok: false, error: 'handler-throw', message: String(e?.message || e).slice(0, 200) };
+    }
+  });
   return wizardCtl;
 }
 

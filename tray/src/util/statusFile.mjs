@@ -80,12 +80,13 @@ export function readKnnLayer(file) {
   } catch { return { exists: true, entries: null }; }
 }
 
-/** data/tray-consent.json(§6 getConsent 契约);缺失=未同意(默认 false)。 */
+/** data/tray-consent.json(§6 getConsent 契约);缺失/损坏=null(未配置≠已拒绝)。
+ * 2026-11-15 用户裁决:缺文件不得伪 false——否则未跑向导的机器面板误显「未同意上传」互惠文案。 */
 export function readConsentFile(dataDir) {
   const txt = readTextOnce(path.join(dataDir, 'tray-consent.json'));
-  if (!txt) return { uploadLocalKnn: false, consentedAt: null };
+  if (!txt) return null;
   try {
     const j = JSON.parse(txt);
     return { uploadLocalKnn: j?.uploadLocalKnn === true, consentedAt: j?.consentedAt ?? null };
-  } catch { return { uploadLocalKnn: false, consentedAt: null }; }
+  } catch { return null; }
 }

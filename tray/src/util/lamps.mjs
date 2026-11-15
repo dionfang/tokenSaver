@@ -74,15 +74,14 @@ export function embedLamp({ health, vectors, chunksLines }) {
   return { lamp: reasons.length ? 'yellow' : 'green', reasons };
 }
 
-/** §5.3.3 决策 KNN 灯:红=缺 local / 黄=缺 base 或未同意(§18-D1 互惠,有意状态) / 绿=齐。 */
-export function knnLamp({ knn, consent }) {
+/** §5.3.3 决策 KNN 灯:红=缺 local / 黄=缺 base / 绿=齐。
+ * 2026-11-15 用户裁决:互惠文案(「未同意上传…」)不再上面板——consent 只影响「更新 base」按钮门禁(§16.3),
+ * 灯色与文案仅由双层文件实际存在性决定。 */
+export function knnLamp({ knn }) {
   const baseEntries = knn?.baseEntries ?? null;
   const localEntries = knn?.localEntries ?? null;
   if (!knn || !knn.localExists) return { lamp: 'red', notes: ['本地 local 向量 KNN 不存在(先完成嵌入)'], baseEntries, localEntries };
-  if (!consent || consent.uploadLocalKnn !== true) {
-    return { lamp: 'yellow', notes: ['未同意上传,仅使用本机 KNN(服务器 base 包不可用)'], baseEntries, localEntries };
-  }
-  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用,可「更新 base 向量」)'], baseEntries, localEntries };
+  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用)'], baseEntries, localEntries };
   return { lamp: 'green', notes: [], baseEntries, localEntries };
 }
 
@@ -96,7 +95,7 @@ export function hooksLamps(hooksResult) {
 export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights } = {}) {
   const models = modelLamps(health, { localWeights });
   const embed = embedLamp({ health, vectors, chunksLines });
-  const knnR = knnLamp({ knn, consent });
+  const knnR = knnLamp({ knn });
   const hooks = hooksLamps(hooksInput);
   const missing = models.embedding === 'red' ? 'embedding'
     : models.reranker === 'red' ? 'reranker'

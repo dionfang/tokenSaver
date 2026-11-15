@@ -96,7 +96,7 @@ export function createPoller(deps) {
     const p = `${paths.dataDir}/tray-consent.json`;
     const key = fileKey(p);
     if (key === state.consent.key && key != null) return state.consent.value;
-    const v = paths.dataDir != null ? io.readConsentFile(paths.dataDir) : { uploadLocalKnn: false, consentedAt: null };
+    const v = paths.dataDir != null ? io.readConsentFile(paths.dataDir) : null;
     state.consent = { key: key ?? '', value: v };
     return v;
   }
