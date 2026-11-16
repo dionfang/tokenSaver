@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { probeOllama, createDownloader } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
 import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
-import { hfWeightCached } from './util/paths.mjs';
+import { hfWeightCached } from '../util/paths.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
