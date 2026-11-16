@@ -7,11 +7,13 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 // manifest/downloader 保留给 M4 base 包更新复用(2026-11-16 拍板 B:向导不再走清单下载);
 import { probeOllama, createDownloader } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
 import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
+import { hfWeightCached } from './util/paths.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,8 +45,51 @@ export function createWizardController(deps) {
   } = deps;
   // fetchText/clientVersion/manifestUrl/pins 已随拍板 B 移除(清单下载撤,M4 base 包复用时再回);
   // downloader 实例保留(manifest+downloader 模块原样保留供 M4)。
-  let envelope = { wizard: null, progress: null, hooks: null, nodeForm: null }; // 发往渲染层的整体状态
+  let envelope = { wizard: null, progress: null, hooks: null, nodeForm: null, installLog: [], installing: null }; // 发往渲染层的整体状态
   const downloader = createDownloader({ onProgress: (p) => { envelope.progress = p; sendState(envelope); sendProgress(p); } });
+
+  /** 软项自动安装(2026-11-16 用户需求:检测到缺失即页面自动激活,CMD 滚动+进度条):
+   *  spawn 长任务,stdout/stderr 逐行推 envelope.installLog(尾部 50 行),完成后重跑 envProbe 刷新自检。
+   *  deps=npm install(npmmirror;需 node 就绪);weights=localResident 常驻(HuggingFace 懒下载,
+   *  cpu 模式下常驻本就保留,完成判定=hfWeightCached 全 true 轮询)。 */
+
+  function pushInstallLine(chunk) {
+    for (const line of String(chunk).split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      envelope.installLog.push(line);
+    }
+    if (envelope.installLog.length > 50) envelope.installLog = envelope.installLog.slice(-50);
+    sendState({ ...envelope });
+  }
+  function startInstall(id, cmd, args, { cwd, pollWeights = false, shell = false } = {}) {
+    if (envelope.installing) return { ok: false, reason: 'in-flight', message: `正在安装:${envelope.installing}` };
+    envelope.installing = id;
+    envelope.installLog = [];
+    const child = spawn(cmd, args, { cwd, windowsHide: true, shell, env: { ...process.env } });
+    child.stdout?.on('data', pushInstallLine);
+    child.stderr?.on('data', pushInstallLine);
+    child.on('error', async (e) => { envelope.installing = null; envelope.installLog.push(`[fail] 启动失败:${e.message}`); await machine.runEnvChecks().catch(() => {}); sendState({ ...envelope }); });
+    const finish = async (note) => {
+      envelope.installing = null;
+      if (note) envelope.installLog.push(note);
+      await machine.runEnvChecks().catch(() => {}); // 重跑自检刷新 envChecks(缺失项转绿)
+      sendState({ ...envelope });
+    };
+    if (pollWeights) {
+      // 权重=localResident 常驻进程不退出;轮询 hf-cache 三项全缓存即判定完成(10min 兜底)
+      const W = ['Xenova/jina-embeddings-v2-base-zh', 'Xenova/bge-reranker-base', 'strands:strands-decider-2B-hobson-v19:q4f16'];
+      const t0 = Date.now();
+      const timer = setInterval(() => {
+        const all = W.every((mid) => hfWeightCached(paths.hfCacheDir, mid) === true);
+        if (all) { clearInterval(timer); finish('[ok] 权重全部缓存完成(hf-cache)'); }
+        else if (Date.now() - t0 > 10 * 60_000) { clearInterval(timer); finish('[warn] 下载超时——可点「重新自检」重试,或由首次使用懒下载补齐'); }
+      }, 5000);
+    } else {
+      child.on('exit', (code) => finish(code === 0 ? '[ok] 依赖安装完成' : `[fail] npm 退出码 ${code}(可点「重新自检」重试)`));
+    }
+    sendState({ ...envelope });
+    return { ok: true };
+  }
 
   const nodeBinForWizard = () => pickNodeBin({ dataDir: paths.dataDir, qualified: nodeQualification });
 
@@ -59,7 +104,7 @@ export function createWizardController(deps) {
     },
     checkOllama: () => probeOllama(ollamaBase ? { base: ollamaBase } : {}),
     // 环境自检(2026-11-16 拍板 B,替代清单下载):node=硬项(缺=接线跑不了,用户自行装);
-    // deps=软项(init 接线时 npm install 自动补);权重/ollama=按模式展示。软项不阻断接线。
+    // deps=软项(init 接线时 npm install 自动补);权重=软项,真实检测 hf-cache 缓存。软项不阻断接线。
     envProbe: async () => {
       const nq = nodeQualification ?? await detectNodeQualification({ execFile });
       const depsOk = fs.existsSync(path.join(paths.codeIndexRoot, 'node_modules', '@huggingface', 'transformers'));
@@ -68,11 +113,21 @@ export function createWizardController(deps) {
         { id: 'node', label: 'Node 运行时(≥20)', ok: nq?.ok === true, hard: true,
           hint: nq?.ok ? `已就绪${nq.version ? `(${nq.version})` : ''}` : '未检测到达标 Node——请自行安装 Node.js 20+ 后点「重新自检」' },
         { id: 'deps', label: '推理依赖(transformers/onnxruntime)', ok: depsOk, hard: false,
-          hint: depsOk ? '已安装' : '尚未安装——点「下一步」接线时由 init 自动安装(npm install)' },
+          hint: depsOk ? '已安装' : '尚未安装——将自动安装(npmmirror),或接线时由 init 自动安装' },
       ];
       // 2026-11-16 用户裁决:Ollama 服务状态不进自检——MODE 步硬门禁已验证过(服务在听才到这步),
-      // 自检页重复检测无信息量;cpu 模式的权重项保留(提示懒下载)。
-      if (mode !== 'gpu') checks.push({ id: 'weights', label: 'cpu 模式权重', ok: true, hard: false, hint: '首次使用时自动下载(HuggingFace)' });
+      // 自检页重复检测无信息量。cpu 模式权重=真实检测 hf-cache(localOnnxCached 镜像,不 import code-index)。
+      if (mode !== 'gpu') {
+        const models = (() => { try { return JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8')).models ?? {}; } catch { return {}; } })();
+        const W = {
+          embedding: models.localEmbedding || 'Xenova/jina-embeddings-v2-base-zh',
+          reranker: models.localReranker || 'Xenova/bge-reranker-base',
+          decision: models.localDecision || 'strands:strands-decider-2B-hobson-v19:q4f16',
+        };
+        const missing = Object.entries(W).filter(([, id]) => hfWeightCached(paths.hfCacheDir, id) !== true).map(([k]) => k);
+        checks.push({ id: 'weights', label: 'cpu 模式权重(嵌入/精排/决策)', ok: missing.length === 0, hard: false,
+          hint: missing.length === 0 ? '全部已缓存(hf-cache)' : `缺失:${missing.join(',')}——将自动下载到 hf-cache` });
+      }
       return { checks };
     },
     runInitCommand: async (cmd) => {
@@ -123,12 +178,26 @@ export function createWizardController(deps) {
         sendState({ ...envelope });
         try {
           const r = await machine.runEnvChecks();
+          // 自检发现缺失软项且 node 就绪 → 自动激活安装(2026-11-16 用户需求:页面自动激活)
+          const env = r.state?.envChecks ?? [];
+          const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
+          const weightsBad = env.some((c) => c.id === 'weights' && c.ok !== true);
+          const nodeOk = env.some((c) => c.id === 'node' && c.ok === true);
+          if (!envelope.installing && nodeOk && (depsBad || weightsBad)) {
+            const id = depsBad ? 'deps' : 'weights';
+            return startInstall(id,
+              id === 'deps' ? 'npm install --ignore-scripts --registry=https://registry.npmmirror.com' : 'node',
+              id === 'deps' ? [] : ['localResident.mjs'],
+              { cwd: paths.codeIndexRoot, pollWeights: id === 'weights', shell: id === 'deps' });
+          }
           return push(r);
         } finally {
           envelope.checking = false;
           sendState({ ...envelope });
         }
       }
+      case 'install-deps': return startInstall('deps', 'npm install --ignore-scripts --registry=https://registry.npmmirror.com', [], { cwd: paths.codeIndexRoot, shell: true });
+      case 'install-weights': return startInstall('weights', 'node', ['localResident.mjs'], { cwd: paths.codeIndexRoot, pollWeights: true });
       case 'run-init': {
         const r = await machine.runInit();
         await refreshHooks();

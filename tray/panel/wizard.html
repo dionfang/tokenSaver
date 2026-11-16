@@ -36,6 +36,9 @@
   .disc { font-size: 12px; color: #555; background: #f8f8f8; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
   .disc b { color: #333; }
   pre.stderr { background: #2d2d2d; color: #f66; padding: 8px; border-radius: 6px; max-height: 110px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+  pre.cmdlog { background: #0d1117; color: #9fd49f; padding: 8px; border-radius: 6px; max-height: 150px; overflow-y: auto; font-size: 11px; white-space: pre-wrap; font-family: Consolas, monospace; }
+  .bar.stripes > i { background: repeating-linear-gradient(45deg, #58a6ff, #58a6ff 8px, #79b8ff 8px, #79b8ff 16px); animation: slide 1s linear infinite; background-size: 32px 100%; }
+  @keyframes slide { from { background-position: 0 0; } to { background-position: 32px 0; } }
   .nav { display: flex; justify-content: space-between; margin-top: 6px; }
 </style>
 </head>
@@ -85,6 +88,8 @@ window.trayWizard.onState((st) => {
   S.nodeForm = st ? st.nodeForm : null;
   S.ollamaVersion = st ? st.ollamaVersion : null;
   S.ollamaSetup = st ? st.ollamaSetup : null;
+  S.installing = st ? st.installing : null;      // 软项自动安装(2026-11-16):deps/weights
+  S.installLog = st ? st.installLog : null;     // CMD 滚动日志(尾部)
   S.downloading = !!(st && st.downloading);
   render();
 });
@@ -190,14 +195,21 @@ function renderEnvCheck(w) {
     <div class="item"><div class="meta"><span>${esc(c.label)}</span>
       <span class="${c.ok ? 'ok' : (c.hard ? 'err' : 'sub')}">${c.ok ? '✔' : (c.hard ? '✘' : '待补')}${c.hint ? ' — ' + esc(c.hint) : ''}</span>
     </div></div>`).join('') : '<div class="sub">正在检测环境…</div>';
+  const installing = S.installing;
+  const log = (S.installLog || []).slice(-30).map(esc).join('\n');
   $('body').innerHTML = `
     <div class="card">
-      <b>环境自检</b><span class="sub">(检测本机是否具备安装条件;缺项会提示补齐方式,软项由接线/首次使用自动补)</span>
+      <b>环境自检</b><span class="sub">(检测本机是否具备安装条件;缺项自动安装,CMD 滚动显示进度)</span>
       ${rows}
       ${hardBad.length ? `<div class="err">请先补齐硬性缺项:${esc(hardBad.map((c) => c.label).join(', '))}</div>` : ''}
-      <div class="row"><button onclick="act('start-env-check')">重新自检</button></div>
-      <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失由接线时 npm install 自动安装,cpu 权重首次使用时自动下载)。</div>
+      ${installing ? `
+      <div class="sub">正在自动安装:${installing === 'deps' ? '推理依赖(npm install)' : 'cpu 模式权重(HuggingFace → hf-cache)'}…</div>
+      <div class="bar stripes"><i style="width:100%"></i></div>
+      <pre class="stderr" id="cmdlog">${log || '等待输出…'}</pre>` : ''}
+      <div class="row"><button onclick="act('start-env-check')" ${installing ? 'disabled' : ''}>重新自检</button>${installing ? '<span class="sub">安装中,完成后自动重新自检</span>' : ''}</div>
+      <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失自动 npm install,cpu 权重缺失自动下载到 hf-cache)。</div>
     </div>`;
+  const cl = $('cmdlog'); if (cl) cl.scrollTop = cl.scrollHeight;
   const btn = $('btnNext'); if (btn) { btn.textContent = checks.length ? '下一步' : '检测中…'; }
   // 进入本步自动跑一次自检(结果到达后 onState 重渲染;S.envChecking 本地标志防重入)
   if (!checks.length && !S.envChecking) { S.envChecking = true; act('start-env-check').finally(() => { S.envChecking = false; }); }

@@ -24,7 +24,7 @@ contextBridge.exposeInMainWorld('trayRoots', {
 // 向导白名单动作(§5.5 五步向导):动作名固定枚举,payload 为纯数据;渲染层不得直接触网/触盘。
 const WIZARD_ACTIONS = new Set([
   'load', 'next', 'back', 'pick-roots', 'set-roots', 'remove-root', 'set-mode',
-  'recheck-ollama', 'set-consent', 'start-env-check',
+  'recheck-ollama', 'set-consent', 'start-env-check', 'install-deps', 'install-weights',
   'run-init', 'reset', 'reset-reload',
 ]);
 
