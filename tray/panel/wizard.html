@@ -112,10 +112,11 @@ function render() {
   $('btnBack').style.visibility = w.status === 'DONE' ? 'hidden' : 'visible';
   const gate = nextGate(w);
   // 2026-11-15 修复:load 推送到达前按钮禁用(S.w=null 时点击会被旧逻辑静默吞掉——加载竞态)
-  $('btnNext').disabled = !!S.installing || !!S.checking || !S.w || !gate.ok; // 2026-11-16:安装/拉取/自检进行中一律禁下一步
-  $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (S.checking ? '检测中…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步'))));
+  // 2026-11-16:安装/拉取/自检/接线进行中一律禁下一步(接线自动驱动,完成自动跳 DONE)
+  const initRunning = w.status === 'INIT_RUN' && !w.lastError;
+  $('btnNext').disabled = !!S.installing || !!S.checking || initRunning || !S.w || !gate.ok;
+  $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (S.checking ? '检测中…' : (initRunning ? '正在接线…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步')))));
   const rc = $('btnRecheck'); if (rc) { rc.style.display = w.status === 'ENVCHECK' ? '' : 'none'; rc.disabled = !!S.installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; } // 重新自检仅 ENVCHECK 步显示于导航
-  $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步')));
   if (w.status === 'INIT') {
     $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 数据上传同意 → 环境自检 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
     return;
@@ -235,14 +236,16 @@ function renderEnvCheck(w) {
 
 function renderInitRun(w) {
   const logs = (w.initLog || []).map((l) => `<li>${esc(l.label)} — ${l.code === 0 ? '<span class="ok">成功</span>' : '<span class="err">失败</span>'}</li>`).join('');
+  const running = !w.initLog?.length && !w.lastError && w.status === 'INIT_RUN';
   $('body').innerHTML = `
     <div class="card">
       <b>安装接线</b>
       <div class="sub">逐目录执行 init 接线(写入 AGENTS.md 工具说明段+配置 IDE 用户级钩子+设置运行模式)。roots 为空时只设置运行模式。</div>
-      <ul>${logs || '<li class="sub">尚未开始</li>'}</ul>
-      <div class="row"><button class="primary" id="btnRunInit" onclick="act('run-init')" ${w.lastError ? '' : ''}>执行安装接线</button></div>
+      <ul>${logs || (running ? '<li class="sub">正在接线…</li>' : '<li class="sub">尚未开始</li>')}</ul>
       ${w.lastError ? `<pre class="stderr">${esc(w.lastError)}</pre><div class="row"><button onclick="act('run-init')">重试接线</button></div>` : ''}
     </div>`;
+  // 2026-11-16 用户裁决:接线自动驱动——进入 INIT_RUN 即自动执行,删除「执行安装接线」按钮(仅失败时保留重试)
+  if (running && !S.initRunning) { S.initRunning = true; act('run-init').finally(() => { S.initRunning = false; }); }
 }
 
 function renderDone(w) {
@@ -255,8 +258,7 @@ function renderDone(w) {
       ${hooks ? `<div class="row">
         <span>${lamp(hooks.zcode)} ZCode 钩子</span><span>${lamp(hooks.cursor)} Cursor 钩子</span><span>${lamp(hooks.qoder)} Qoder 钩子</span>
       </div><div class="sub">钩子灯异常时可用托盘菜单「修复钩子」。若刚接入下载的 Node 运行时,已打开的 IDE 需重启后钩子生效。</div>` : ''}
-      <div class="sub">托盘常驻后台;双击托盘图标可查看状态面板。</div>
-      <div class="row"><button onclick="act('reset-reload')">重新配置(换目录/换模式)</button><span class="sub">回到第 1 步,目录自动载入现有配置,可增删后重新接线</span></div>
+      <div class="sub">托盘常驻后台;双击托盘图标可查看状态面板;需要换目录/换模式时重开安装向导即可(第 1 步自动载入现有配置)。</div>
     </div>`;
   const btn = $('btnNext'); btn.textContent = '完成'; btn.disabled = false;
   btn.onclick = () => window.close();
