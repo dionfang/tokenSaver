@@ -70,8 +70,9 @@ export function createWizardController(deps) {
         { id: 'deps', label: '推理依赖(transformers/onnxruntime)', ok: depsOk, hard: false,
           hint: depsOk ? '已安装' : '尚未安装——点「下一步」接线时由 init 自动安装(npm install)' },
       ];
-      if (mode === 'gpu') checks.push({ id: 'ollama', label: 'Ollama 服务', ok: true, hard: true, hint: '已在运行(MODE 步已验证)' });
-      else checks.push({ id: 'weights', label: 'cpu 模式权重', ok: true, hard: false, hint: '首次使用时自动下载(HuggingFace)' });
+      // 2026-11-16 用户裁决:Ollama 服务状态不进自检——MODE 步硬门禁已验证过(服务在听才到这步),
+      // 自检页重复检测无信息量;cpu 模式的权重项保留(提示懒下载)。
+      if (mode !== 'gpu') checks.push({ id: 'weights', label: 'cpu 模式权重', ok: true, hard: false, hint: '首次使用时自动下载(HuggingFace)' });
       return { checks };
     },
     runInitCommand: async (cmd) => {
