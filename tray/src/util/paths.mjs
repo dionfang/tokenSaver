@@ -54,8 +54,12 @@ export async function resolvePaths({ force = false } = {}) {
 }
 
 /** hf-cache 权重目录存在性(local 模式模型灯红/黄分界,§5.3.1):
- *  transformers.js 缓存布局 <hfCacheDir>/<org>--<name>/;hfCacheDir 未知时返回 null(不判红)。 */
+ *  兼容两种缓存布局(2026-11-16 实测修正):<hfCacheDir>/<org>/<name>/ 或 <hfCacheDir>/<org>--<name>/;
+ *  hfCacheDir 未知时返回 null(不判红)。 */
 export function hfWeightCached(hfCacheDir, modelId) {
   if (!hfCacheDir || typeof modelId !== 'string' || !modelId.includes('/')) return null;
-  try { return fs.existsSync(path.join(hfCacheDir, modelId.replace(/\//g, '--'))); } catch { return null; }
+  const [org, name] = modelId.split('/');
+  try {
+    return fs.existsSync(path.join(hfCacheDir, org, name)) || fs.existsSync(path.join(hfCacheDir, `${org}--${name}`));
+  } catch { return null; }
 }

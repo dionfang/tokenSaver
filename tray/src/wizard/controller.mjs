@@ -137,10 +137,15 @@ export function createWizardController(deps) {
             hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——首次检索/预热时自动拉取,或手动 ollama pull' });
         }
       } else {
-        // strands 权重目录名含前缀且文件名不同(model_quantized.onnx),不走 hfWeightCached 的 org/name 分支
-        const cached = (id) => String(id).startsWith('strands:')
-          ? fs.existsSync(path.join(paths.hfCacheDir ?? '', String(id).split(':')[1] ?? '', 'model_quantized.onnx'))
-          : hfWeightCached(paths.hfCacheDir ?? '', id) === true;
+        // strands 权重:目录名含前缀、文件名带档位后缀(model_<quant>.onnx,实测 model_q4f16.onnx),不走 hfWeightCached 的 org/name 分支
+        const cached = (id) => {
+          if (!String(id).startsWith('strands:')) return hfWeightCached(paths.hfCacheDir ?? '', id) === true;
+          const parts = String(id).split(':'); // [strands, dir, quant?]
+          const dir = parts[1] ?? '';
+          const quant = parts[2] ?? 'quantized';
+          return fs.existsSync(path.join(paths.hfCacheDir ?? '', dir, `model_${quant}.onnx`))
+            || fs.existsSync(path.join(paths.hfCacheDir ?? '', dir, 'model_quantized.onnx'));
+        };
         for (const [label, id] of [['嵌入权重', embId], ['精排权重', rrkId], ['决策权重', decId]]) {
           const ok = cached(id);
           checks.push({ id: `w-${label}`, label: `本地权重 ${label}`, ok, hard: false,
