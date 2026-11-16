@@ -112,6 +112,9 @@ export function createWizard(deps) {
     // 其他未知状态(损坏/未来版本)→ 重置 INIT,防 死锁(不匹配任何分支,next/back 全失效)
     if (j?.status === 'DOWNLOAD') j.status = 'ENVCHECK';
     if (j?.status && !STEP_ORDER.includes(j.status) && j.status !== 'DONE') { j = { status: 'INIT' }; }
+    // 2026-11-16 用户裁决:二次配置会话(曾 DONE 过,secondRun 标志)中途退出 → 草稿作废,
+    // 重开从头(config 为真源重新加载);首装(无 secondRun)断点续跑保持不变。
+    if (j?.secondRun === true && j?.status !== 'DONE') { j = { status: 'INIT', secondRun: true }; }
     state = { ...blank(), ...(j || {}) };
     // 旧版(清单下载)状态字段迁移:items/downloads 已废(2026-11-16 拍板 B),直接丢弃
     delete state.items; delete state.downloads;
@@ -256,7 +259,7 @@ export function createWizard(deps) {
   }
 
   /** 重跑向导(设置入口):清断点从头来;consent 文件不动。 */
-  function reset() { state = blank(); save(); return getState(); }
+  function reset(extra = {}) { state = { ...blank(), ...extra }; save(); return getState(); } // extra:secondRun 等会话标志(2026-11-16)
 
   return { load, getState, next, back, setRoots, addRoot, removeRoot, setRunMode, recheckOllama, setConsent, runEnvChecks, runInit, reset };
 }

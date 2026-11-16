@@ -265,10 +265,10 @@ export function createWizardController(deps) {
       case 'load': {
         const st = await machine.load();
         await refreshNodeForm();
-        // 2026-11-16:重开向导=二次配置——done 状态不再原样恢复 DONE 页(那已无重配入口,死路),
-        // 自动 reset 回第 1 步;load 内以 config 为准重建 roots(每次拉齐,防过期草稿)。
+        // 2026-11-16:重开向导=二次配置——done 态自动 reset 回第 1 步并打 secondRun 标志:
+        // 该会话中途退出后草稿作废(load 见 secondRun+非 done → 从头),config 为真源重新加载。
         let base = st;
-        if (st.status === 'DONE') { base = machine.reset(); base.roots = (await machine.load()).roots ?? []; }
+        if (st.status === 'DONE') { machine.reset({ secondRun: true }); base = await machine.load(); }
         const r = await refreshEnvChecks().catch(() => ({ state: { wizard: base } })); // load 复检同样自动激活(此前漏这条路径)
         return push({ wizard: r.state?.wizard ?? base, ...r });
       }
