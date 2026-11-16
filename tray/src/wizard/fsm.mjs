@@ -116,12 +116,14 @@ export function createWizard(deps) {
     delete state.items; delete state.downloads;
     if (!Array.isArray(state.envChecks)) state.envChecks = null;
     // 2026-11-16(用户需求:向导二次调用换目录/换模式):首次进入且状态里没有目录时,
-    // 自动载入「现有配置」的 roots(data/code-index.config.json),用户可在第 1 步增删后重新接线。
-    if (!state.roots?.length && readConfigRoots) {
+    // 自动载入「现有配置」的 roots(2026-11-16 修正:每次 load 都以 config 为准重建——
+    // 向导 state 只是编辑草稿,重开向导永远从 config 重新拉齐,防过期快照/重复项与 config 脱钩;
+    // 首次安装 config 无 roots 时才保留 state 草稿(空)。
+    if (readConfigRoots) {
       try {
         const cur = readConfigRoots();
-        if (Array.isArray(cur) && cur.length) { state.roots = cur.slice(); save(); }
-      } catch { /* 读不到配置则保持空(首次安装路径) */ }
+        if (Array.isArray(cur) && cur.length) { state.roots = [...new Set(cur)]; save(); }
+      } catch { /* 读不到配置则保持现有(首次安装路径) */ }
     }
     if (state.status !== 'DONE' && state.envChecks) {
       // 2026-11-16 修复:删掉此处的内部 envProbe 复检——controller 的 load case 统一走

@@ -263,7 +263,7 @@ export function createWizardController(deps) {
         const st = await machine.load();
         await refreshNodeForm();
         // 2026-11-16:重开向导=二次配置——done 状态不再原样恢复 DONE 页(那已无重配入口,死路),
-        // 自动 reset 回第 1 步(load 内会载入现有配置 roots),用户可增删目录/换模式后重新接线。
+        // 自动 reset 回第 1 步;load 内以 config 为准重建 roots(每次拉齐,防过期草稿)。
         let base = st;
         if (st.status === 'DONE') { base = machine.reset(); base.roots = (await machine.load()).roots ?? []; }
         const r = await refreshEnvChecks().catch(() => ({ state: { wizard: base } })); // load 复检同样自动激活(此前漏这条路径)
