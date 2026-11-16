@@ -8,10 +8,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fetchComponentsManifest, selectItems, MANIFEST_URL, PINS } from '../manifest.mjs';
-import { createDownloader, probeOllama, sha256File, httpRequest } from '../downloader.mjs';
+// manifest/downloader 保留给 M4 base 包更新复用(2026-11-16 拍板 B:向导不再走清单下载);
+import { probeOllama, createDownloader } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
-import { detectNodeQualification, pickNodeBin, ensureManagedNodeRuntime } from './nodeSetup.mjs';
+import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -37,16 +37,12 @@ export function createWizardController(deps) {
     sendState = () => {},
     sendProgress = () => {},
     pickDirectories,                // async () => string[]|null(注入 dialog.showOpenDialog)
-    fetchText = fetchTextViaHttp,
     execFile,                       // nodeSetup 用(注入 child_process.execFile)
-    clientVersion = defaultClientVersion(),
-    manifestUrl = MANIFEST_URL,
-    pins = PINS,
     ollamaBase,
     openPath = async () => {},
   } = deps;
-
-  const downloadBase = paths.dataDir; // dest 相对 data/(runtime/…、resources/…、weights/…,§16.6)
+  // fetchText/clientVersion/manifestUrl/pins 已随拍板 B 移除(清单下载撤,M4 base 包复用时再回);
+  // downloader 实例保留(manifest+downloader 模块原样保留供 M4)。
   let envelope = { wizard: null, progress: null, hooks: null, nodeForm: null }; // 发往渲染层的整体状态
   const downloader = createDownloader({ onProgress: (p) => { envelope.progress = p; sendState(envelope); sendProgress(p); } });
 
@@ -62,26 +58,22 @@ export function createWizardController(deps) {
       } catch { return []; }
     },
     checkOllama: () => probeOllama(ollamaBase ? { base: ollamaBase } : {}),
-    fetchManifest: async () => {
-      const r = await fetchComponentsManifest(manifestUrl, { fetchText, clientVersion, pins });
-      if (!r.ok) return r; // network/bad-signature/client-too-old(C5:解析即比对,锁向导提示升级)
-      const sel = selectItems(r.manifest, { mode: machine.getState().runMode });
-      if (!sel.ok) return sel;
-      return { ok: true, items: sel.items };
+    // 环境自检(2026-11-16 拍板 B,替代清单下载):node=硬项(缺=接线跑不了,用户自行装);
+    // deps=软项(init 接线时 npm install 自动补);权重/ollama=按模式展示。软项不阻断接线。
+    envProbe: async () => {
+      const nq = nodeQualification ?? await detectNodeQualification({ execFile });
+      const depsOk = fs.existsSync(path.join(paths.codeIndexRoot, 'node_modules', '@huggingface', 'transformers'));
+      const mode = machine.getState().runMode;
+      const checks = [
+        { id: 'node', label: 'Node 运行时(≥20)', ok: nq?.ok === true, hard: true,
+          hint: nq?.ok ? `已就绪${nq.version ? `(${nq.version})` : ''}` : '未检测到达标 Node——请自行安装 Node.js 20+ 后点「重新自检」' },
+        { id: 'deps', label: '推理依赖(transformers/onnxruntime)', ok: depsOk, hard: false,
+          hint: depsOk ? '已安装' : '尚未安装——点「下一步」接线时由 init 自动安装(npm install)' },
+      ];
+      if (mode === 'gpu') checks.push({ id: 'ollama', label: 'Ollama 服务', ok: true, hard: true, hint: '已在运行(MODE 步已验证)' });
+      else checks.push({ id: 'weights', label: 'cpu 模式权重', ok: true, hard: false, hint: '首次使用时自动下载(HuggingFace)' });
+      return { checks };
     },
-    downloadItems: (items, { onProgress }) => downloader.runQueue(items, {
-      baseDir: downloadBase,
-      ...(ollamaBase ? { ollamaBase } : {}),
-      ...(onProgress ? { onProgress: (p) => { onProgress(p); } } : {}), // fsm 层转发(双通道冗余,渲染层只吃 controller 的)
-    }),
-    verifyDownloaded: async (item) => {
-      if (item.type === 'ollama-pull') return true; // 模型在 Ollama 自管库,离线复验不可行,信任完成记录
-      const dest = item.dest?.startsWith('/') || item.dest?.includes('..') ? null : path.join(downloadBase, item.dest);
-      if (!dest || !fs.existsSync(dest)) return false;
-      try { return (await sha256File(dest)) === String(item.sha256).toLowerCase(); } catch { return false; }
-    },
-    nodeQualified: () => nodeQualification,
-    ensureNodeRuntime: async () => ensureManagedNodeRuntime({ dataDir: paths.dataDir, execFile }),
     runInitCommand: async (cmd) => {
       const nb = nodeBinForWizard();
       return cmdRun('init', nb, [path.join(paths.codeIndexRoot, 'init.mjs'), ...cmd.args], { cwd: paths.codeIndexRoot, timeoutMs: 300_000, label: cmd.label });
@@ -123,21 +115,19 @@ export function createWizardController(deps) {
       case 'set-mode': { const r = machine.setRunMode(payload.mode); return push(r); }
       case 'recheck-ollama': { const r = await machine.recheckOllama(); envelope.ollamaVersion = r.version ?? null; return push(r); }
       case 'set-consent': return push(machine.setConsent(payload.checked === true));
-      case 'start-download':
-      case 'retry': {
-        if (envelope.downloading) return push({ ok: false, reason: 'in-flight', message: '下载进行中' });
-        envelope.downloading = true;
+      case 'start-env-check': {
+        // 2026-11-16 拍板 B:环境自检替代清单下载;进行中重复调用静默跳过(fsm 层 in-flight)
+        if (envelope.checking) return push();
+        envelope.checking = true;
         sendState({ ...envelope });
         try {
-          const r = await machine.startDownload({ onProgress: () => {} });
+          const r = await machine.runEnvChecks();
           return push(r);
         } finally {
-          envelope.downloading = false;
+          envelope.checking = false;
           sendState({ ...envelope });
         }
       }
-      case 'pause': downloader.pause(); return push();
-      case 'cancel': downloader.cancel(); return push();
       case 'run-init': {
         const r = await machine.runInit();
         await refreshHooks();

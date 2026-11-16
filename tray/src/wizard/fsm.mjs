@@ -1,20 +1,20 @@
 /**
- * 首次安装向导状态机(tray 方案 §16.4/§18-A1/B1/D1/E4,2026-11-15 M2):
- * 六态 INIT→ROOTS→MODE→CONSENT→DOWNLOAD→INIT_RUN→DONE,断点持久化 data/tray-wizard-state.json,
- * 任意非 DONE 态退出下次续跑;重入跳过已校验下载项。守卫全内联拍板口径:
+ * 首次安装向导状态机(tray 方案 §16.4/§18-A1/B1/D1/E4,2026-11-15 M2;**2026-11-16 拍板 B:撤清单下载**):
+ * 六态 INIT→ROOTS→MODE→CONSENT→ENVCHECK→INIT_RUN→DONE,断点持久化 data/tray-wizard-state.json,
+ * 任意非 DONE 态退出下次续跑。守卫全内联拍板口径:
  *   ROOTS→MODE      目录数不限(0=只装工具与钩子不索引,A1)
  *   MODE→CONSENT    选过 cpu|gpu;gpu 须 Ollama 服务在听(§17.2 硬门禁,未就绪禁用下一步)
- *   CONSENT→DOWNLOAD 总是可过(D1=c 可跳过;跳过=consent false+T4 禁用 local-only)
- *   DOWNLOAD→INIT_RUN common+mode 全部项 sha256 通过且落盘(C2/C3/C4/C5 配套)
- *   INIT_RUN→DONE   逐目录 init --roots + 一次 init --model-in 成功;失败停步显示 stderr
- * §17.1-7 Node 检测准入制:node-runtime 项存在且 PATH 无达标 node → 下载后、INIT_RUN 之前追加用户 PATH。
- * 全 IO 走依赖注入(node 直跑单测,零 electron);不 import code-index/**(§18-E1)。
+ *   CONSENT→ENVCHECK 总是可过(D1=c 可跳过;跳过=consent false+T4 禁用 local-only)
+ *   ENVCHECK→INIT_RUN 环境自检全部硬项通过(node 缺失=硬阻断;deps/权重缺失=软项,由接线/懒加载自动补)
+ *   INIT_RUN→DONE   init --set-roots 逐目录 + --model-in 成功;失败停步显示 stderr
+ * B 案理由:Node/deps/权重在 init 现场组装已走通(npm install+懒下载),清单下载=重复建设;
+ * downloader/manifest 模块保留给 M4 base 包更新复用。全 IO 依赖注入;不 import code-index/**(§18-E1)。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { writeConsent } from '../consent.mjs';
 
-export const STEP_ORDER = ['INIT', 'ROOTS', 'MODE', 'CONSENT', 'DOWNLOAD', 'INIT_RUN', 'DONE'];
+export const STEP_ORDER = ['INIT', 'ROOTS', 'MODE', 'CONSENT', 'ENVCHECK', 'INIT_RUN', 'DONE'];
 export const STATE_FILE = 'tray-wizard-state.json';
 export const MIN_NODE_MAJOR = 20;
 
@@ -42,12 +42,17 @@ export function canLeaveMode({ runMode, ollamaReady }) {
 /** CONSENT→DOWNLOAD:D1=c 总是可过(跳过=consent false+T4 禁用+决策 KNN 仅本机 local 层)。 */
 export function canLeaveConsent() { return { ok: true }; }
 
-/** DOWNLOAD→INIT_RUN:清单内全部项(含 common 与 mode 项)已下载校验通过。 */
-export function isDownloadComplete(items, downloads) {
-  const need = (items ?? []).map((it) => it.id);
-  if (!need.length) return { ok: false, reason: 'no-items', message: '尚未取得下载清单' };
-  const missing = need.filter((id) => downloads?.[id]?.ok !== true);
-  return missing.length ? { ok: false, reason: 'download-incomplete', message: `组件未下载完成:${missing.join(', ')}` } : { ok: true };
+/** ENVCHECK→INIT_RUN(2026-11-16 拍板 B:环境自检替代清单下载):
+ *  硬项=node 就绪(缺失=接线也跑不了,用户自行安装 Node≥20);
+ *  软项=deps/权重(缺失由 init npm install/首次使用懒下载自动补,不阻断);
+ *  ollama 项 gpu 模式必绿(MODE 门禁已保证),此处仅展示。 */
+export function isEnvReady(checks) {
+  const list = checks ?? [];
+  if (!list.length) return { ok: false, reason: 'not-checked', message: '尚未执行环境自检' };
+  const hardFail = list.filter((c) => c.hard && c.ok !== true);
+  return hardFail.length
+    ? { ok: false, reason: 'env-incomplete', message: `环境未就绪:${hardFail.map((c) => c.label).join(', ')}` }
+    : { ok: true };
 }
 
 /** INIT_RUN 命令序列(纯,§16.4/§17.4):roots 非空→逐目录 `--roots <单个绝对路径>`;再 `--model-in <local|ollama>`。
@@ -62,7 +67,7 @@ export function initCommands({ roots = [], runMode }) {
   return cmds;
 }
 
-/** 待下载项(纯):已 ok 的跳过(重入不重下);其余保序。 */
+/** 待重检项(纯):保留给 M4 base 包下载复用。 */
 export function pendingItems(items, downloads) {
   return (items ?? []).filter((it) => downloads?.[it.id]?.ok !== true);
 }
@@ -76,17 +81,13 @@ export function createWizard(deps) {
     now = () => Date.now(),
     persistConsent = (b) => writeConsent(dataDir, b),
     checkOllama,            // async () => ({ok:boolean, version?})
-    fetchManifest,          // async () => ({ok:boolean, items?, error?, message?}) — 已按 mode 选好(common 项先行)
-    downloadItems,          // async (items, {onProgress}) => ({results:[{itemId,status,error?}], stopped})
-    verifyDownloaded,       // async (item) => boolean — 重入时逐项复验 sha(终名在且匹配)
-    nodeQualified,          // () => ({ok:boolean, version?}) — PATH node ≥ MIN_NODE_MAJOR
-    ensureNodeRuntime,      // async () => ({ok:boolean, error?}) — 下载 Node 后追加用户 PATH(HKCU 追加+广播)
     runInitCommand,         // async (cmd:{args,label}) => ({code, stdout, stderr, timedOut})
     readConfigRoots,        // () => string[] — 现有配置里的 roots(第 1 步初值;2026-11-16)
+    envProbe,               // async () => ({checks:[{id,label,ok,hard,hint}]}) — 环境自检(2026-11-16 拍板 B)
   } = deps;
 
   const file = path.join(dataDir, STATE_FILE);
-  const blank = () => ({ status: 'INIT', roots: [], runMode: null, consent: null, ollamaReady: null, ollamaCheckedAt: null, items: null, downloads: {}, initLog: [], lastError: null, savedAt: null, doneAt: null });
+  const blank = () => ({ status: 'INIT', roots: [], runMode: null, consent: null, ollamaReady: null, ollamaCheckedAt: null, envChecks: null, initLog: [], lastError: null, savedAt: null, doneAt: null });
   let state = blank();
 
   function save() {
@@ -101,7 +102,10 @@ export function createWizard(deps) {
     let j = null;
     try { j = JSON.parse(io.readFileSync(file, 'utf8')); } catch { j = null; }
     if (j?.status === 'done') j.status = 'DONE'; // 完成态文件小写 → 内部步骤名
-    state = { ...blank(), ...(j || {}), items: Array.isArray(j?.items) ? j.items : null };
+    state = { ...blank(), ...(j || {}) };
+    // 旧版(清单下载)状态字段迁移:items/downloads 已废(2026-11-16 拍板 B),直接丢弃
+    delete state.items; delete state.downloads;
+    if (!Array.isArray(state.envChecks)) state.envChecks = null;
     // 2026-11-16(用户需求:向导二次调用换目录/换模式):首次进入且状态里没有目录时,
     // 自动载入「现有配置」的 roots(data/code-index.config.json),用户可在第 1 步增删后重新接线。
     if (!state.roots?.length && readConfigRoots) {
@@ -110,13 +114,10 @@ export function createWizard(deps) {
         if (Array.isArray(cur) && cur.length) { state.roots = cur.slice(); save(); }
       } catch { /* 读不到配置则保持空(首次安装路径) */ }
     }
-    if (state.status !== 'DONE' && state.items && verifyDownloaded) {
-      for (const it of state.items) {
-        if (state.downloads?.[it.id]?.ok === true) {
-          const still = await verifyDownloaded(it);
-          if (!still) delete state.downloads[it.id];
-        }
-      }
+    if (state.status !== 'DONE' && state.envChecks && envProbe) {
+      // 自检结果也随时间漂移(node 装了/权重下完):重入时复检一次
+      const fresh = await envProbe();
+      state.envChecks = fresh.checks ?? fresh;
       save();
     }
     return getState();
@@ -126,15 +127,15 @@ export function createWizard(deps) {
 
   function goto(step) { state.status = step; state.lastError = null; save(); return { ok: true, state: getState() }; }
 
-  /** 前进一步(守卫拦截);DOWNLOAD 进入不自动开下(UI 调 startDownload),INIT_RUN 不经 next 完成。 */
+  /** 前进一步(守卫拦截);ENVCHECK 进入后 UI 调 start-env-check;INIT_RUN 不经 next 完成。 */
   function next() {
     const s = state.status;
     if (s === 'INIT') return goto('ROOTS');
     if (s === 'ROOTS') { const g = canLeaveRoots(); return g.ok ? goto('MODE') : { ok: false, ...g }; }
     if (s === 'MODE') { const g = canLeaveMode(state); return g.ok ? goto('CONSENT') : { ok: false, ...g }; }
-    if (s === 'CONSENT') { const g = canLeaveConsent(); return g.ok ? goto('DOWNLOAD') : { ok: false, ...g }; }
-    if (s === 'DOWNLOAD') {
-      const g = isDownloadComplete(state.items, state.downloads);
+    if (s === 'CONSENT') { const g = canLeaveConsent(); return g.ok ? goto('ENVCHECK') : { ok: false, ...g }; }
+    if (s === 'ENVCHECK') {
+      const g = isEnvReady(state.envChecks);
       return g.ok ? goto('INIT_RUN') : { ok: false, ...g };
     }
     if (s === 'INIT_RUN') return { ok: false, reason: 'init-not-run', message: '请先执行安装接线(init)' };
@@ -170,11 +171,10 @@ export function createWizard(deps) {
   // ---------- mode / ollama ----------
   function setRunMode(m) {
     if (m !== 'cpu' && m !== 'gpu') return { ok: false, reason: 'bad-mode', message: '运行模式只能是 cpu 或 gpu' };
-    // 切模式必须作废已缓存清单/下载记录,否则 DOWNLOAD 会带着旧 mode 的 items 完成并 init 错后端
+    // 切模式作废自检结果(不同模式检查项不同:cpu 看权重,gpu 看 Ollama)
     if (state.runMode !== m) {
       state.runMode = m;
-      state.items = null;
-      state.downloads = {};
+      state.envChecks = null;
       state.lastError = null;
     } else {
       state.runMode = m;
@@ -198,52 +198,31 @@ export function createWizard(deps) {
     return { ok: true, state: getState() };
   }
 
-  // ---------- download ----------
-  async function prepareDownload() {
-    if (state.items) return { ok: true, items: state.items };
-    const r = await fetchManifest();
-    if (!r.ok) { state.lastError = r.message || r.error || '清单拉取失败'; save(); return { ok: false, ...r }; }
-    state.items = r.items;
-    state.lastError = null;
-    save();
-    return { ok: true, items: r.items };
-  }
-
-  let downloading = false;
-  async function startDownload({ onProgress = () => {} } = {}) {
-    if (state.status !== 'DOWNLOAD') return { ok: false, reason: 'wrong-step', message: `当前不在下载步(${state.status})` };
-    if (downloading) return { ok: false, reason: 'in-flight', message: '下载进行中,请勿重复开始' };
-    downloading = true; // 必须在任何 await 之前置位,否则并发第二次调用会双写 .part
+  // ---------- 环境自检(2026-11-16 拍板 B,替代清单下载) ----------
+  let checking = false;
+  async function runEnvChecks() {
+    if (state.status !== 'ENVCHECK') return { ok: false, reason: 'wrong-step', message: `当前不在自检步(${state.status})` };
+    if (checking) return { ok: false, reason: 'in-flight', message: '自检进行中' };
+    if (!envProbe) return { ok: false, reason: 'no-probe', message: '自检探针未注入' };
+    checking = true;
     try {
-      const prep = await prepareDownload();
-      if (!prep.ok) return prep;
-      const todo = pendingItems(state.items, state.downloads);
-      if (!todo.length) return { ok: true, results: [], complete: true };
-      const { results } = await downloadItems(todo, { onProgress });
-      for (const r of results) {
-        if (r.status === 'ok') state.downloads[r.itemId] = { ok: true, at: now(), skipped: !!r.skipped };
-        else if (r.status === 'failed') state.lastError = `${r.itemId}:${r.error || '下载失败'}`;
-        save();
-      }
-      return { ok: !results.some((r) => r.status === 'failed'), results, complete: isDownloadComplete(state.items, state.downloads).ok };
-    } finally { downloading = false; }
+      const r = await envProbe();
+      state.envChecks = r.checks ?? r;
+      state.lastError = null;
+      save();
+      return { ok: true, state: getState() };
+    } catch (e) {
+      state.lastError = String(e?.message || e);
+      save();
+      return { ok: false, reason: 'probe-failed', message: state.lastError };
+    } finally { checking = false; }
   }
 
   // ---------- init 接线 ----------
   async function runInit() {
     if (state.status !== 'INIT_RUN') return { ok: false, reason: 'wrong-step', message: `当前不在接线步(${state.status})` };
-    const g = isDownloadComplete(state.items, state.downloads);
+    const g = isEnvReady(state.envChecks);
     if (!g.ok) return { ok: false, ...g };
-    // §17.1-7:node-runtime 项在清单内且 PATH 无达标 node → 追加用户 PATH 必须发生在 init 之前
-    const hasNodeRuntime = (state.items ?? []).some((it) => it.id === 'node-runtime' && state.downloads['node-runtime']?.ok === true);
-    if (hasNodeRuntime && nodeQualified && !nodeQualified().ok) {
-      const nr = await ensureNodeRuntime();
-      if (!nr?.ok) {
-        state.lastError = `Node 运行时接入失败:${nr?.error || '未知'}`;
-        save();
-        return { ok: false, reason: 'node-runtime', message: state.lastError };
-      }
-    }
     state.initLog = [];
     for (const cmd of initCommands({ roots: state.roots, runMode: state.runMode })) {
       const r = await runInitCommand(cmd);
@@ -264,5 +243,5 @@ export function createWizard(deps) {
   /** 重跑向导(设置入口):清断点从头来;consent 文件不动。 */
   function reset() { state = blank(); save(); return getState(); }
 
-  return { load, getState, next, back, setRoots, addRoot, removeRoot, setRunMode, recheckOllama, setConsent, prepareDownload, startDownload, runInit, reset };
+  return { load, getState, next, back, setRoots, addRoot, removeRoot, setRunMode, recheckOllama, setConsent, runEnvChecks, runInit, reset };
 }

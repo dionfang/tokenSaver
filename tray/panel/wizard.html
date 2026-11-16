@@ -52,7 +52,7 @@
 <script>
 const STEPS = [
   ['ROOTS', '索引目录'], ['MODE', '运行模式'], ['CONSENT', '数据上传'],
-  ['DOWNLOAD', '下载组件'], ['INIT_RUN', '安装接线'],
+  ['ENVCHECK', '环境自检'], ['INIT_RUN', '安装接线'],
 ];
 const S = { w: null, progress: null, hooks: null, nodeForm: null };
 const $ = (id) => document.getElementById(id);
@@ -113,7 +113,7 @@ function render() {
   if (w.status === 'ROOTS') renderRoots(w);
   else if (w.status === 'MODE') renderMode(w);
   else if (w.status === 'CONSENT') renderConsent(w);
-  else if (w.status === 'DOWNLOAD') renderDownload(w);
+  else if (w.status === 'ENVCHECK') renderEnvCheck(w);
   else if (w.status === 'INIT_RUN') renderInitRun(w);
   else if (w.status === 'DONE') renderDone(w);
 }
@@ -122,10 +122,9 @@ function render() {
 function nextGate(w) {
   if (w.status === 'INIT' || w.status === 'ROOTS' || w.status === 'CONSENT') return { ok: true };
   if (w.status === 'MODE') return (w.runMode === 'cpu' || (w.runMode === 'gpu' && w.ollamaReady === true)) ? { ok: true } : { ok: false };
-  if (w.status === 'DOWNLOAD') {
-    const items = w.items || [];
-    if (!items.length) return { ok: false };
-    return items.every((it) => w.downloads?.[it.id]?.ok === true) ? { ok: true } : { ok: false };
+  if (w.status === 'ENVCHECK') {
+    const checks = w.envChecks || [];
+    return checks.length && checks.every((c) => c.ok || !c.hard) ? { ok: true } : { ok: false };
   }
   return { ok: false };
 }
@@ -184,30 +183,24 @@ function phaseText(p) {
 }
 function bytes(n) { return n == null ? '' : n >= 1 << 30 ? (n / (1 << 30)).toFixed(2) + ' GB' : n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + ' MB' : Math.ceil(n / 1024) + ' KB'; }
 
-function renderDownload(w) {
-  const items = w.items || [];
-  const prog = S.progress;
-  const rows = items.map((it) => {
-    const d = w.downloads?.[it.id];
-    const cur = prog && prog.itemId === it.id && !d?.ok ? prog : null;
-    const pct = d?.ok ? 100 : cur?.pct ?? 0;
-    const meta = d?.ok ? '<span class="ok">已校验完成</span>'
-      : cur ? `<span>${phaseText(cur)} ${cur.bytesTotal ? Math.round(cur.bytesDone / cur.bytesTotal * 100) + '%(' + bytes(cur.bytesDone) + '/' + bytes(cur.bytesTotal) + ')' : ''}</span>`
-      : '<span class="sub">排队中</span>';
-    return `<div class="item"><div class="meta"><span>${esc(it.label || it.id)}${it.mode === 'common' ? '(公共组件)' : ''}</span>${meta}</div><div class="bar"><i style="width:${pct}%"></i></div></div>`;
-  }).join('');
-  const doneAll = items.length && items.every((it) => w.downloads?.[it.id]?.ok === true);
+function renderEnvCheck(w) {
+  const checks = w.envChecks || [];
+  const hardBad = checks.filter((c) => c.hard && c.ok !== true);
+  const rows = checks.length ? checks.map((c) => `
+    <div class="item"><div class="meta"><span>${esc(c.label)}</span>
+      <span class="${c.ok ? 'ok' : (c.hard ? 'err' : 'sub')}">${c.ok ? '✔' : (c.hard ? '✘' : '待补')}${c.hint ? ' — ' + esc(c.hint) : ''}</span>
+    </div></div>`).join('') : '<div class="sub">正在检测环境…</div>';
   $('body').innerHTML = `
     <div class="card">
-      <b>正在下载必要安装组件…</b><span class="sub">(安装必需步骤,不是可选更新;公共组件先行)</span>
-      ${rows || '<div class="sub">正在获取组件清单…</div>'}
-      ${w.lastError ? `<div class="err">失败:${esc(w.lastError)} <button onclick="act('retry')">重试</button></div>` : ''}
-      <div class="row">
-        ${doneAll ? '<span class="ok">全部组件校验通过,可进入下一步。</span>' : `<button id="dlStart" ${S.downloading ? 'disabled' : ''} onclick="this.disabled=true;act('start-download')">${S.downloading ? '下载中…' : '开始下载'}</button> <button onclick="act('pause')">暂停</button> <button onclick="act('cancel')">取消</button>`}
-      </div>
-      <div class="sub">支持断点续传:暂停/取消都会保留已下载部分,重开向导不重复下载已校验通过项。源不可达会停留本步,不会假装完成。</div>
+      <b>环境自检</b><span class="sub">(检测本机是否具备安装条件;缺项会提示补齐方式,软项由接线/首次使用自动补)</span>
+      ${rows}
+      ${hardBad.length ? `<div class="err">请先补齐硬性缺项:${esc(hardBad.map((c) => c.label).join(', '))}</div>` : ''}
+      <div class="row"><button onclick="act('start-env-check')">重新自检</button></div>
+      <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失由接线时 npm install 自动安装,cpu 权重首次使用时自动下载)。</div>
     </div>`;
-  const btn = $('btnNext'); if (btn) { btn.textContent = doneAll ? '下一步' : '下一步(须先完成下载)'; }
+  const btn = $('btnNext'); if (btn) { btn.textContent = checks.length ? '下一步' : '检测中…'; }
+  // 进入本步自动跑一次自检(结果到达后 onState 重渲染;S.envChecking 本地标志防重入)
+  if (!checks.length && !S.envChecking) { S.envChecking = true; act('start-env-check').finally(() => { S.envChecking = false; }); }
 }
 
 function renderInitRun(w) {
@@ -243,7 +236,6 @@ $('btnBack').onclick = () => act('back');
 $('btnNext').onclick = () => {
   const w = S.w;
   if (!w) { act('load'); return; } // 加载竞态兜底:状态未至则重发 load(按钮正常态下不会走这)
-  if (w.status === 'DOWNLOAD' && !(w.items || []).length) { act('start-download'); return; }
   if (w.status === 'DONE') { window.close(); return; }
   act('next');
 };
