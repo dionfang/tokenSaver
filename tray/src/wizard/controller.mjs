@@ -230,12 +230,39 @@ export function createWizardController(deps) {
     sendState({ ...envelope });
   }
 
+  /** 统一自检入口:跑自检 → 缺失软项自动激活对应安装/pull(2026-11-16 用户需求)。
+   *  load 复检与手动「重新自检」都必须走这里——此前激活逻辑只在 start-env-check case,
+   *  load 复检发现缺模型后不激活(用户删模型进向导等不到自动拉取的根因)。 */
+  async function refreshEnvChecks() {
+    const r = await machine.runEnvChecks();
+    const env = r.state?.envChecks ?? [];
+    const mode = r.state?.runMode;
+    const nodeOk = env.some((c) => c.id === 'node' && c.ok === true);
+    // gpu 模式:缺模型 → 自动 /api/pull(不依赖 node,Ollama 服务已由 MODE 门禁保证)
+    const missingModels = env.filter((c) => c.tag && c.ok !== true).map((c) => c.tag);
+    if (!envelope.installing && mode === 'gpu' && missingModels.length) {
+      pullModels(missingModels); // 异步串行,进度经 sendState 推送
+      return { ...r, ok: true, message: `开始自动拉取 ${missingModels.length} 个 Ollama 模型` };
+    }
+    const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
+    const weightsBad = env.some((c) => c.id === 'weights' && c.ok !== true);
+    if (!envelope.installing && nodeOk && (depsBad || weightsBad)) {
+      const id = depsBad ? 'deps' : 'weights';
+      startInstall(id,
+        id === 'deps' ? 'npm install --ignore-scripts --registry=https://registry.npmmirror.com' : 'node',
+        id === 'deps' ? [] : ['localResident.mjs'],
+        { cwd: paths.codeIndexRoot, pollWeights: id === 'weights', shell: id === 'deps' });
+    }
+    return r;
+  }
+
   async function dispatch(action, payload = {}) {
     switch (action) {
       case 'load': {
         const st = await machine.load();
         await refreshNodeForm();
-        return push({ wizard: st });
+        const r = await refreshEnvChecks().catch(() => st); // load 复检同样自动激活(此前漏这条路径)
+        return push({ wizard: r.state?.wizard ?? st, ...r });
       }
       case 'next': { const r = machine.next(); return push(r); }
       case 'back': { const r = machine.back(); return push(r); }
@@ -255,26 +282,7 @@ export function createWizardController(deps) {
         envelope.checking = true;
         sendState({ ...envelope });
         try {
-          const r = await machine.runEnvChecks();
-          // 自检发现缺失软项 → 自动激活对应安装(2026-11-16 用户需求:页面自动激活)
-          const env = r.state?.envChecks ?? [];
-          const nodeOk = env.some((c) => c.id === 'node' && c.ok === true);
-          // gpu 模式:缺模型 → 自动 /api/pull(不依赖 node,Ollama 服务已由 MODE 门禁保证)
-          const missingModels = env.filter((c) => c.tag && c.ok !== true).map((c) => c.tag);
-          if (!envelope.installing && mode === 'gpu' && missingModels.length) {
-            pullModels(missingModels); // 异步串行,进度经 sendState 推送
-            return push({ ok: true, message: `开始自动拉取 ${missingModels.length} 个 Ollama 模型` });
-          }
-          const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
-          const weightsBad = env.some((c) => c.id === 'weights' && c.ok !== true);
-          if (!envelope.installing && nodeOk && (depsBad || weightsBad)) {
-            const id = depsBad ? 'deps' : 'weights';
-            return startInstall(id,
-              id === 'deps' ? 'npm install --ignore-scripts --registry=https://registry.npmmirror.com' : 'node',
-              id === 'deps' ? [] : ['localResident.mjs'],
-              { cwd: paths.codeIndexRoot, pollWeights: id === 'weights', shell: id === 'deps' });
-          }
-          return push(r);
+          return await refreshEnvChecks();
         } finally {
           envelope.checking = false;
           sendState({ ...envelope });
