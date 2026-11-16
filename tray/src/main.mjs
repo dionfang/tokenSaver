@@ -260,6 +260,7 @@ async function switchRunMode() {
 // ---------- 菜单 ----------
 function buildMenu() {
   return Menu.buildFromTemplate([
+    { label: '安装向导', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '切换运行模式', click: () => { switchRunMode(); } },
