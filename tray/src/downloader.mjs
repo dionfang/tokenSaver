@@ -50,11 +50,16 @@ export function safeDest(baseDir, dest) {
   return p === b || p.startsWith(b + path.sep) ? p : null;
 }
 
-/** 原子落位:先删旧终名再 rename(Windows 对已存在目标 rename 可能 EPERM,重试一次)。 */
+/** 原子落位:优先直接 rename;仅当目标已存在时再删旧重试。禁止「先删终名再失败」导致两头皆空。 */
 function atomicRename(part, final) {
+  try {
+    fs.renameSync(part, final);
+    return;
+  } catch {
+    /* Windows 目标已存在时常 EPERM/EEXIST → 删旧再试 */
+  }
   try { fs.unlinkSync(final); } catch { /* 无旧文件 */ }
-  try { fs.renameSync(part, final); }
-  catch { fs.unlinkSync(final); fs.renameSync(part, final); }
+  fs.renameSync(part, final);
 }
 
 /** Ollama 服务在听探测(§17.2/B1 硬门禁口径:GET /api/version,默认 2s 超时)。 */
@@ -123,12 +128,29 @@ export function createDownloader(deps = {}) {
     return { status: 'failed', error: `全部源重试失败:${String(lastErr?.message || lastErr)}` };
   }
 
+  /** .part 已完整时直接校验改名,避免对「已下满」再发 Range → HTTP 416 死循环。 */
+  async function finalizeIfComplete(item, part, final) {
+    emit({ itemId: item.id, pct: 100, bytesDone: fs.statSync(part).size, bytesTotal: item.bytes ?? null, phase: 'verify' });
+    const got = await sha256File(part);
+    if (got !== item.sha256.toLowerCase()) {
+      try { fs.unlinkSync(part); } catch { /* 尽力 */ }
+      throw new Error(`sha256 校验失败(期望 ${item.sha256.slice(0, 12)}… 实得 ${got.slice(0, 12)}…)`);
+    }
+    atomicRename(part, final);
+    emit({ itemId: item.id, pct: 100, bytesDone: item.bytes ?? null, bytesTotal: item.bytes ?? null, phase: 'done' });
+  }
+
   /** 单次尝试:Range 续传 + 流式落 .part + 校验 + 原子改名。 */
   function fetchOnce(item, url, part, final) {
     return new Promise((resolve, reject) => {
       (async () => {
         let startFrom = 0;
         try { startFrom = fs.existsSync(part) ? fs.statSync(part).size : 0; } catch { startFrom = 0; }
+        // 已知期望大小且 .part 已满(或更大):不再发 Range,直接校验;坏件删掉重下
+        if (startFrom > 0 && item.bytes != null && startFrom >= Number(item.bytes)) {
+          try { await finalizeIfComplete(item, part, final); return resolve(); }
+          catch (e) { startFrom = 0; }
+        }
         const headers = startFrom > 0 ? { Range: `bytes=${startFrom}-` } : {};
         const { status, headers: rh, res, req } = await httpReq(url, { headers });
         active = { req, res };
@@ -145,6 +167,11 @@ export function createDownloader(deps = {}) {
           startFrom = 0; // 源不支持续传(或无 .part):整文件重下
           bytesTotal = Number(rh['content-length']) || item.bytes || null;
           emit({ itemId: item.id, pct: 0, bytesDone: 0, bytesTotal, phase: 'fetching' });
+        } else if (status === 416 && startFrom > 0) {
+          // 服务端认为 Range 越界(= .part 往往已完整);关连接后走本地校验,失败再删 .part 让外层重试整下
+          res.destroy();
+          try { await finalizeIfComplete(item, part, final); return resolve(); }
+          catch (e) { return reject(e); }
         } else {
           res.destroy();
           return reject(new Error(`HTTP ${status}`));
@@ -205,8 +232,11 @@ export function createDownloader(deps = {}) {
     let buf = '';
     res.setEncoding('utf8');
     return new Promise((resolve) => {
-      const finish = (r) => { active = null; resolve(r); };
+      let settled = false;
+      const finish = (r) => { if (settled) return; settled = true; active = null; resolve(r); };
       res.on('data', (d) => {
+        if (settled) return;
+        if (stopped()) { try { res.destroy(); } catch { /* 已断 */ } return finish({ status: stopped() }); }
         buf += d;
         let idx;
         while ((idx = buf.indexOf('\n')) >= 0) {
@@ -224,6 +254,10 @@ export function createDownloader(deps = {}) {
       });
       res.on('error', () => finish(stopped() ? { status: stopped() } : { status: 'failed', error: '流中断' }));
       res.on('end', () => finish(stopped() ? { status: stopped() } : { status: 'failed', error: '流意外结束(未见 success)' }));
+      // pause/cancel 的 destroy() 通常只触发 close、无 error/end → 必须在此收口,否则 Promise 悬挂
+      res.on('close', () => {
+        if (!settled) finish(stopped() ? { status: stopped() } : { status: 'failed', error: 'connection closed' });
+      });
     });
   }
 

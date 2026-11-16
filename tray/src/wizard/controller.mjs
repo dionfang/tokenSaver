@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { fetchComponentsManifest, selectItems, MANIFEST_URL, PINS } from '../manifest.mjs';
 import { createDownloader, probeOllama, sha256File, httpRequest } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
-import { detectNodeQualification, appendDirToUserPath, pickNodeBin } from './nodeSetup.mjs';
+import { detectNodeQualification, pickNodeBin, ensureManagedNodeRuntime } from './nodeSetup.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,6 +43,7 @@ export function createWizardController(deps) {
     manifestUrl = MANIFEST_URL,
     pins = PINS,
     ollamaBase,
+    openPath = async () => {},
   } = deps;
 
   const downloadBase = paths.dataDir; // dest 相对 data/(runtime/…、resources/…、weights/…,§16.6)
@@ -73,11 +74,7 @@ export function createWizardController(deps) {
       try { return (await sha256File(dest)) === String(item.sha256).toLowerCase(); } catch { return false; }
     },
     nodeQualified: () => nodeQualification,
-    ensureNodeRuntime: async () => {
-      const dir = path.join(paths.dataDir, 'runtime', 'node'); // 官方 zip 解压位(真实解压属后续批次,本批只落 zip+接 PATH)
-      const r = await appendDirToUserPath(dir, { execFile });
-      return r.changed || r.error == null ? { ok: true, changed: r.changed } : { ok: false, error: r.error };
-    },
+    ensureNodeRuntime: async () => ensureManagedNodeRuntime({ dataDir: paths.dataDir, execFile }),
     runInitCommand: async (cmd) => {
       const nb = nodeBinForWizard();
       return cmdRun('init', nb, [path.join(paths.codeIndexRoot, 'init.mjs'), ...cmd.args], { cwd: paths.codeIndexRoot, timeoutMs: 300_000, label: cmd.label });
@@ -99,8 +96,13 @@ export function createWizardController(deps) {
 
   /** §17.2 分支①:向导内代下 Ollama 官方安装包(钉版本+sha256,用户手动执行)。 */
   async function downloadOllamaSetup() {
+    // 已检测到 Ollama 在跑 → 无需下载安装包(2026-11-16 用户反馈「点了没反应」后加的语义短路)
+    try {
+      const probe = await probeOllama(ollamaBase ? { base: ollamaBase } : {});
+      if (probe?.ok) return { ok: true, message: `已检测到 Ollama 服务在运行${probe.version ? `(版本 ${probe.version})` : ''},无需下载官方安装包` };
+    } catch { /* 探测失败继续走下载流程 */ }
     const r = await fetchComponentsManifest(manifestUrl, { fetchText, clientVersion, pins });
-    if (!r.ok) return r;
+    if (!r.ok) return { ...r, message: r.message || `清单拉取失败(${r.error || 'unknown'})` };
     const item = r.manifest.items.find((it) => it.id === 'ollama-setup');
     if (!item) return { ok: false, error: 'no-item', message: '清单缺少 ollama-setup 项' };
     const res = await downloader.downloadFileItem(item, { baseDir: downloadBase });
@@ -127,17 +129,34 @@ export function createWizardController(deps) {
       case 'set-mode': { const r = machine.setRunMode(payload.mode); return push(r); }
       case 'recheck-ollama': { const r = await machine.recheckOllama(); envelope.ollamaVersion = r.version ?? null; return push(r); }
       case 'set-consent': return push(machine.setConsent(payload.checked === true));
-      case 'start-download': {
-        const r = await machine.startDownload({ onProgress: () => {} });
-        return push(r);
+      case 'start-download':
+      case 'retry': {
+        if (envelope.downloading) return push({ ok: false, reason: 'in-flight', message: '下载进行中' });
+        envelope.downloading = true;
+        sendState({ ...envelope });
+        try {
+          const r = await machine.startDownload({ onProgress: () => {} });
+          return push(r);
+        } finally {
+          envelope.downloading = false;
+          sendState({ ...envelope });
+        }
       }
       case 'pause': downloader.pause(); return push();
       case 'cancel': downloader.cancel(); return push();
-      case 'retry': { const r = await machine.startDownload({ onProgress: () => {} }); return push(r); }
-      case 'download-ollama-setup': { const r = await downloadOllamaSetup(); return push(r); }
+      case 'download-ollama-setup': {
+        const r = await downloadOllamaSetup();
+        if (r.ok && r.file) {
+          envelope.ollamaSetup = r.file;
+          await openPath(r.file);
+        }
+        return push(r);
+      }
       case 'open-ollama-setup': {
-        const file = path.join(downloadBase, 'runtime', 'OllamaSetup.exe');
-        return { ok: fs.existsSync(file), file };
+        const file = envelope.ollamaSetup || path.join(downloadBase, 'runtime', 'OllamaSetup.exe');
+        const ok = fs.existsSync(file);
+        if (ok) await openPath(file);
+        return { ok, file, message: ok ? '已打开安装包' : '安装包尚未下载,请先点「下载 Ollama 官方安装包」' };
       }
       case 'run-init': {
         const r = await machine.runInit();

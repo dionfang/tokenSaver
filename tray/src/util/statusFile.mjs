@@ -57,13 +57,17 @@ export function countChunksLines(dataDir) {
   return txt.length ? txt.trimEnd().split('\n').length : 0;
 }
 
-/** data/routing/golden-set.jsonl 行数(四票代签黄金集条目);缺失返回 null。
- *  2026-11-15:决策向量「对齐进度」分母——注意 golden 的 pkey 是 promptKey(hash36:len),
- *  向量层 pkey 是 24-hex 且不带 prompt 原文,逐条交集不可得,故对齐度用数量口径。 */
-export function countGoldenLines(dataDir) {
-  const txt = readTextOnce(path.join(dataDir, 'routing', 'golden-set.jsonl'));
+/** data/routing/exemplars.json 样本条数(决策向量装填分母)。缺失或损坏返回 null。
+ *  优先 stats.total(与 exemplars 数组等长);没有该字段时数数组。 */
+export function countExemplars(dataDir) {
+  const txt = readTextOnce(path.join(dataDir, 'routing', 'exemplars.json'));
   if (txt == null) return null;
-  return txt.length ? txt.trimEnd().split('\n').filter(Boolean).length : 0;
+  try {
+    const j = JSON.parse(txt);
+    if (Number.isFinite(j?.stats?.total)) return j.stats.total;
+    if (Array.isArray(j?.exemplars)) return j.exemplars.length;
+    return null;
+  } catch { return null; }
 }
 
 /** data/vectors/<local|ollama>/meta.json(镜像 vectorStore.readVectorMeta,纯读按路径)。 */
@@ -87,6 +91,39 @@ export function readKnnLayer(file) {
     const n = Number.isFinite(j?.ok) ? j.ok : j?.vectors && typeof j.vectors === 'object' ? Object.keys(j.vectors).length : null;
     return { exists: true, entries: n };
   } catch { return { exists: true, entries: null }; }
+}
+
+/** 与 code-index/proc.mjs LOCK_TTL_MS 一致:超 6 小时或进程已死的 .embed.pid 不算在嵌。 */
+const EMBED_LOCK_TTL_MS = 6 * 60 * 60 * 1000;
+
+function pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try { process.kill(n, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+}
+
+/** data/.embed.pid 实时读。快通道不走 health-cache,嵌入一开始按钮就能显示同步中。 */
+export function readLiveEmbedPid(dataDir) {
+  const txt = readTextOnce(path.join(dataDir, '.embed.pid'));
+  if (!txt) return null;
+  try {
+    const j = JSON.parse(txt);
+    if (!pidAlive(j?.pid) || !Number.isFinite(j?.ts) || Date.now() - j.ts >= EMBED_LOCK_TTL_MS) return null;
+    return j.pid;
+  } catch { return null; }
+}
+
+/** data/routing/build-vectors.progress.json。只在 pid 与当前锁一致时由轮询采用。 */
+export function readBuildVectorsProgress(dataDir) {
+  const txt = readTextOnce(path.join(dataDir, 'routing', 'build-vectors.progress.json'));
+  if (!txt) return null;
+  try {
+    const j = JSON.parse(txt);
+    const covered = Number(j?.covered);
+    const pid = Number(j?.pid);
+    if (!Number.isFinite(covered) || covered < 0 || !Number.isInteger(pid)) return null;
+    return { covered, total: Number.isFinite(Number(j?.total)) ? Number(j.total) : null, pid };
+  } catch { return null; }
 }
 
 /** data/tray-consent.json(§6 getConsent 契约);缺失/损坏=null(未配置≠已拒绝)。

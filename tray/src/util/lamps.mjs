@@ -93,7 +93,7 @@ export function hooksLamps(hooksResult) {
 }
 
 /** §6 getLamps 契约总装。progress 仅展示,不参与绿黄判定。 */
-export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights, goldenCount = null } = {}) {
+export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights, exemplarCount = null, knnCovered = null } = {}) {
   const models = modelLamps(health, { localWeights });
   const embed = embedLamp({ health, vectors, chunksLines });
   const knnR = knnLamp({ knn });
@@ -110,12 +110,14 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
   // 向下取整(2026-11-15 修复):四舍五入会把 99.96% 抬成 100%——绿满条与「部分嵌入」黄灯自相矛盾
   // (5214/5216 实测曾显示 100% 绿条)。仅 done≥total 才 100%,不足一律 <100 → 黄条。
   const embedPct = embedTotal > 0 ? (embedDone >= embedTotal ? 100 : Math.floor((embedDone / embedTotal) * 100)) : null;
-  // 决策向量对齐进度(2026-11-15 用户需求):本地 local 层向量条目 vs 四票代签黄金集条目。
-  // 数量口径(golden pkey=promptKey、向量 pkey=24hex 且不带 prompt,逐条交集不可得);满=已对齐。
-  const knnDone = knnR.localEntries ?? 0;
-  const knnTotal = goldenCount ?? null;
+  // 决策向量装填:当前模式 local 向量条数 / exemplars.json 样本条数。
+  // 黄金集是代签量尺,不是嵌入清单,不能当成分母。
+  // 嵌入过程中进度文件的 covered 可能暂时小于磁盘上的旧向量条数,取较大值,避免进度条先掉下去。
+  const fileDone = knnR.localEntries ?? 0;
+  const knnDone = Number.isFinite(knnCovered) ? Math.max(fileDone, knnCovered) : fileDone;
+  const knnTotal = exemplarCount ?? null;
   const knnPct = knnTotal > 0 ? (knnDone >= knnTotal ? 100 : Math.floor((knnDone / knnTotal) * 100)) : null;
-  // 公共决策包(原名 base 向量包)同格式计数:包内条目 / 黄金集条目(2026-11-15 用户裁决)
+  // 公共决策包:已下载时分子=包内条数,分母同样是样本库条数;未下载 done=null
   const knnBaseDone = knnR.baseExists ? (knnR.baseEntries ?? 0) : null;
   const knnBaseTotal = knnTotal;
   const knnBasePct = knnBaseDone != null && knnBaseTotal > 0

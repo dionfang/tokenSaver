@@ -12,13 +12,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCmdRunner } from './cmdRunner.mjs';
 import { createPoller } from './poller.mjs';
-import { resolvePaths } from './util/paths.mjs';
+import { resolvePaths, hfWeightCached } from './util/paths.mjs';
 import { createWizardController } from './wizard/controller.mjs';
+import { probeOllama } from './downloader.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ICON = path.join(here, '..', 'assets', 'tray.png');
 const PANEL_PRELOAD = path.join(here, '..', 'panel', 'preload.cjs');
 const PANEL_HTML = path.join(here, '..', 'panel', 'index.html');
+const ROOTS_HTML = path.join(here, '..', 'panel', 'roots.html');
 const WIZARD_HTML = path.join(here, '..', 'panel', 'wizard.html');
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const RUN_NAME = 'TokenSaver';
@@ -26,6 +28,7 @@ const RUN_NAME = 'TokenSaver';
 const runner = createCmdRunner();
 let tray = null;
 let panel = null;
+let rootsWin = null;
 let poller = null;
 let ctx = { paths: null, snapshot: null, autorunOn: false };
 let quitting = false; // 2026-11-15:退出握手——真退出时放行 close,X 按钮 close 一律改藏托盘(不退出)
@@ -48,10 +51,15 @@ function writeTrayState(patch) {
 
 // ---------- 开机自启(A2 默认开:首跑无键值即写入;用户取消勾选即删除) ----------
 async function queryAutorun() { const r = await sh('reg', ['query', RUN_KEY, '/v', RUN_NAME]); return r.ok && r.stdout.includes(RUN_NAME); }
+function autorunCommand() {
+  const exe = process.execPath;
+  // 打包后 execPath 就是 TokenSaver.exe;开发态 execPath 是裸 electron.exe,必须带上 tray 目录否则登录只打开空 Electron
+  if (app.isPackaged) return `"${exe}"`;
+  return `"${exe}" "${path.resolve(here, '..')}"`;
+}
 async function setAutorun(on) {
-  const exe = process.execPath.replace(/electron\.exe$/i, 'electron.exe');
   const r = on
-    ? await sh('reg', ['add', RUN_KEY, '/v', RUN_NAME, '/t', 'REG_SZ', '/d', `"${exe}"`, '/f'])
+    ? await sh('reg', ['add', RUN_KEY, '/v', RUN_NAME, '/t', 'REG_SZ', '/d', autorunCommand(), '/f'])
     : await sh('reg', ['delete', RUN_KEY, '/v', RUN_NAME, '/f']);
   return r.ok;
 }
@@ -64,8 +72,10 @@ function openPanel() {
   panel = new BrowserWindow({
     title: 'TokenSaver 状态面板',
     width: 460, height: 560, resizable: false, maximizable: false, fullscreenable: false, show: false,
+    autoHideMenuBar: true,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
+  panel.setMenu(null);
   panel.loadFile(PANEL_HTML);
   panel.once('ready-to-show', () => panel.show());
   // 2026-11-15 用户定:X=最小化到托盘(非退出);仅「退出」菜单真退。禁 F11 全屏。
@@ -90,6 +100,7 @@ function wizardController() {
       return r.canceled ? null : r.filePaths;
     },
     execFile,
+    openPath: (p) => shell.openPath(p),
   });
   ipcMain.handle('wizard:action', async (_e, name, payload) => {
     try {
@@ -113,8 +124,10 @@ function openWizard() {
   wizardWin = new BrowserWindow({
     title: 'TokenSaver 安装向导',
     width: 640, height: 720, resizable: false, maximizable: false, fullscreenable: false, show: false,
+    autoHideMenuBar: true,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
+  wizardWin.setMenu(null);
   wizardWin.loadFile(WIZARD_HTML);
   wizardWin.once('ready-to-show', () => wizardWin.show());
   wizardWin.on('close', (e) => { if (!quitting) { e.preventDefault(); wizardWin.hide(); } });
@@ -124,72 +137,139 @@ function openWizard() {
 }
 
 // ---------- 菜单动作 ----------
-async function runKeepFresh() {
+function configFile() {
+  const dataDir = ctx.paths?.dataDir;
+  return dataDir ? path.join(dataDir, 'code-index.config.json') : null;
+}
+
+function readConfig() {
+  const file = configFile();
+  if (!file) throw new Error('无法定位数据目录');
+  return { file, cfg: JSON.parse(fs.readFileSync(file, 'utf8')) };
+}
+
+function writeConfig(file, cfg) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  try { fs.renameSync(tmp, file); } catch { fs.copyFileSync(tmp, file); fs.unlinkSync(tmp); }
+}
+
+function rootNorm(p) {
+  return path.resolve(String(p)).split(path.sep).join('/');
+}
+
+function rootKey(p) {
+  const n = rootNorm(p);
+  return process.platform === 'win32' ? n.toLowerCase() : n;
+}
+
+function currentRoots(cfg) {
+  return Array.isArray(cfg.roots) ? cfg.roots.map((r) => rootNorm(r)) : [];
+}
+
+function checkRoot(p) {
+  if (typeof p !== 'string' || !p.trim()) return '目录路径为空';
+  if (p.includes(',')) return '路径含逗号,不能加入';
+  if (!path.isAbsolute(p)) return '须选择绝对路径目录';
+  if (process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(p)) return '须选择绝对路径目录';
+  if (!fs.existsSync(p)) return '目录不存在';
+  return null;
+}
+
+function listRoots() {
+  const { cfg } = readConfig();
+  return currentRoots(cfg);
+}
+
+function saveRoots(next) {
+  const { file, cfg } = readConfig();
+  cfg.roots = next;
+  writeConfig(file, cfg);
+  return next;
+}
+
+function openRoots() {
+  if (rootsWin && !rootsWin.isDestroyed()) { rootsWin.show(); rootsWin.focus(); return; }
+  rootsWin = new BrowserWindow({
+    title: '管理代码目录',
+    width: 560, height: 420, resizable: false, maximizable: false, fullscreenable: false, show: false,
+    autoHideMenuBar: true,
+    webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  rootsWin.setMenu(null);
+  rootsWin.loadFile(ROOTS_HTML);
+  rootsWin.once('ready-to-show', () => rootsWin.show());
+  rootsWin.webContents.on('before-input-event', (_e, input) => { if (input.key === 'F11') _e.preventDefault(); });
+  rootsWin.on('closed', () => { rootsWin = null; });
+}
+
+async function runRepairHooks(host) {
   const { nodeBin, codeIndexRoot } = ctx.paths || {};
-  if (!nodeBin || !codeIndexRoot) return dialog.showErrorBox('立即保鲜', '无法定位 code-index(paths.mjs 无响应)');
-  const res = await runner.run('auto', nodeBin, [`${codeIndexRoot}/auto.mjs`], { cwd: codeIndexRoot, label: '立即保鲜 auto.mjs' });
-  if (res.skipped) return dialog.showMessageBox({ message: `有任务在跑(${res.busyFamily || '互斥任务'}),稍后再试`, buttons: ['知道了'] });
-  const tail = (res.stderr || '').trim().split('\n').slice(-3).join('\n');
-  if (res.code === 0) dialog.showMessageBox({ message: '保鲜完成', detail: tail || undefined, buttons: ['知道了'] });
-  else dialog.showErrorBox('立即保鲜失败', `${res.timedOut ? '超时被终止\n' : ''}${tail || `exit ${res.code}`}`);
-  poller?.slowRefresh('keep-fresh');
+  if (!nodeBin || !codeIndexRoot) return { ok: false, error: '无法定位 code-index(paths.mjs 无响应)' };
+  const res = await runner.run('init', nodeBin, [`${codeIndexRoot}/init.mjs`, '--hooks', host], { cwd: codeIndexRoot, label: `修复钩子 ${host}` });
+  if (res.skipped) return { ok: false, skipped: true, error: `有任务在跑(${res.busyFamily || '互斥任务'}),稍后再试` };
+  if (res.code !== 0) return { ok: false, error: `${res.timedOut ? '超时被终止\n' : ''}${(res.stderr || res.stdout || `exit ${res.code}`).slice(-400)}` };
+  await poller?.slowRefresh('repair-hooks'); // 修完重跑 hooksStatus 刷新灯(§5.3.4)
+  return { ok: true };
 }
 
 async function repairHooks(host) {
-  const { nodeBin, codeIndexRoot } = ctx.paths || {};
-  if (!nodeBin || !codeIndexRoot) return dialog.showErrorBox('修复钩子', '无法定位 code-index(paths.mjs 无响应)');
-  const res = await runner.run('init', nodeBin, [`${codeIndexRoot}/init.mjs`, '--hooks', host], { cwd: codeIndexRoot, label: `修复钩子 ${host}` });
-  if (res.skipped) return dialog.showMessageBox({ message: `有任务在跑(${res.busyFamily || '互斥任务'}),稍后再试`, buttons: ['知道了'] });
-  if (res.code !== 0) {
-    dialog.showErrorBox(`修复钩子失败(${host})`, `${res.timedOut ? '超时被终止\n' : ''}${(res.stderr || res.stdout || `exit ${res.code}`).slice(-400)}`);
-    return;
-  }
-  dialog.showMessageBox({ message: `钩子修复完成(${host})`, buttons: ['知道了'] });
-  poller?.slowRefresh('repair-hooks'); // 修完重跑 hooksStatus 刷新灯(§5.3.4)
+  const r = await runRepairHooks(host);
+  if (r.ok) dialog.showMessageBox({ message: '钩子修复完成', buttons: ['知道了'] });
+  else if (r.skipped) dialog.showMessageBox({ message: r.error, buttons: ['知道了'] });
+  else dialog.showErrorBox(String(r.error || '').includes('无法定位') ? '修复钩子' : '修复钩子失败', r.error || '失败');
 }
 
-function onUpdateBase() {
-  // M1 壳:consent 门禁在本菜单生效;更新编排属 M4(§16.3),上线前点按只作说明,不发任何网络请求
-  dialog.showMessageBox({ message: '更新 base 向量将在后续版本解锁(更新源服务尚未上线)', buttons: ['知道了'] });
+/** 只改 data/code-index.config.json 的 modelIn。不跑 init,避免顺带重写钩子和启动索引构建。 */
+function writeModelIn(dataDir, modelIn) {
+  const file = path.join(dataDir, 'code-index.config.json');
+  const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  cfg.modelIn = modelIn;
+  writeConfig(file, cfg);
+}
+
+async function switchRunMode() {
+  const cur = ctx.snapshot?.modelIn === 'local' ? 'cpu' : ctx.snapshot?.modelIn ? 'gpu' : null;
+  if (!cur) return dialog.showErrorBox('切换运行模式', '还没有读到当前运行模式,请稍后再试');
+  const next = cur === 'cpu' ? 'gpu' : 'cpu';
+  const nextLabel = next === 'gpu' ? 'gpu模型' : 'cpu模型';
+  if (next === 'gpu') {
+    const ready = await probeOllama({});
+    if (!ready.ok) return dialog.showErrorBox('切换运行模式', 'gpu模型需要本机 Ollama 服务在运行');
+  }
+  const confirm = await dialog.showMessageBox({
+    type: 'question',
+    buttons: ['切换', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    message: `切换到${nextLabel}`,
+    detail: `当前是${cur === 'gpu' ? 'gpu模型' : 'cpu模型'}。确认后写入运行配置。两边的向量文件都会保留。`,
+  });
+  if (confirm.response !== 0) return;
+  const dataDir = ctx.paths?.dataDir;
+  if (!dataDir) return dialog.showErrorBox('切换运行模式', '无法定位数据目录');
+  try {
+    writeModelIn(dataDir, next === 'gpu' ? 'ollama' : 'local');
+  } catch (e) {
+    return dialog.showErrorBox('切换运行模式', String(e?.message || e).slice(0, 200));
+  }
+  await poller?.slowRefresh('switch-mode');
+  dialog.showMessageBox({ message: `已切换到${nextLabel}`, buttons: ['知道了'] });
 }
 
 // ---------- 菜单 ----------
-const lampMark = { green: '🟢', yellow: '🟡', red: '🔴', absent: '⚪', empty: '⚪' };
-const hookText = { green: '接线正确', red: '接线错误', absent: '未安装' };
-
 function buildMenu() {
-  const s = ctx.snapshot;
-  const lamps = s?.lamps;
-  const consent = s?.consent ?? { uploadLocalKnn: false };
-  const mode = s?.modelIn === 'local' ? 'cpu模型' : s?.modelIn ? 'gpu模型' : '运行模式:未知';
-  const summary = (s?.statusLine || '状态获取中…').slice(0, 80);
   return Menu.buildFromTemplate([
-    { label: summary, enabled: false },
-    { type: 'separator' },
-    { label: `运行模式:${mode}`, enabled: false }, // B1 受控切换属 M3,一期只读
-    { label: '立即保鲜', click: () => { runKeepFresh(); } },
-    {
-      label: consent.uploadLocalKnn ? '更新 base 向量' : '更新 base 向量（未同意上传，仅使用本机 KNN）',
-      enabled: consent.uploadLocalKnn,
-      click: onUpdateBase,
-    },
-    { type: 'separator' },
-    { label: `ZCode 钩子:${lampMark[lamps?.hooks?.zcode] || '⚪'}${hookText[lamps?.hooks?.zcode] || '未检测'}`, enabled: false },
-    { label: `Cursor 钩子:${lampMark[lamps?.hooks?.cursor] || '⚪'}${hookText[lamps?.hooks?.cursor] || '未检测'}`, enabled: false },
-    { label: `Qoder 钩子:${lampMark[lamps?.hooks?.qoder] || '⚪'}${hookText[lamps?.hooks?.qoder] || '未检测'}`, enabled: false },
-    {
-      label: '修复钩子',
-      submenu: [
-        { label: 'ZCode', click: () => repairHooks('zcode') },
-        { label: 'Cursor', click: () => repairHooks('cursor') },
-        { label: 'Qoder', click: () => repairHooks('qoder') },
-        { label: '全部', click: () => repairHooks('all') },
-      ],
-    },
-    { type: 'separator' },
-    { label: wizardDone() ? '重新运行安装向导' : '继续安装向导', click: () => openWizard() },
-    { label: '打开 data 目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
-    { type: 'checkbox', label: '开机自启', checked: ctx.autorunOn, click: async (item) => { ctx.autorunOn = await setAutorun(item.checked); writeTrayState({ autoLaunch: ctx.autorunOn ? 'on' : 'off' }); item.checked = ctx.autorunOn; } },
+    { label: '管理代码目录', click: () => { openRoots(); } },
+    { label: '修复钩子', click: () => { repairHooks('all'); } },
+    { label: '切换运行模式', click: () => { switchRunMode(); } },
+    { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
+    { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
+      const next = !ctx.autorunOn;
+      const ok = await setAutorun(next);
+      if (ok) { ctx.autorunOn = next; writeTrayState({ autoLaunch: next ? 'on' : 'off' }); }
+      if (tray) tray.setContextMenu(buildMenu());
+    } },
     { label: '退出', click: () => { runner.killAll(); app.quit(); } },
   ]);
 }
@@ -212,15 +292,150 @@ if (!gotLock) {
 } else {
   app.on('second-instance', () => openPanel()); // 二次启动唤起首实例面板
   app.whenReady().then(async () => {
+    Menu.setApplicationMenu(null); // 不显示 Electron 默认窗口菜单栏
+    ipcMain.handle('tray:refresh', async () => {
+      if (!poller) return { ok: false, error: 'not-ready' };
+      try {
+        const r = await poller.slowRefresh('panel-manual');
+        return { ok: !r?.skipped, skipped: !!r?.skipped };
+      } catch (e) {
+        return { ok: false, error: String(e?.message || e).slice(0, 200) };
+      }
+    });
+    let syncBusy = false;
+    function explainSyncResult(res) {
+      if (res.skipped) {
+        dialog.showMessageBox({ message: `有任务在跑(${res.busyFamily || '互斥任务'}),稍后再试`, buttons: ['知道了'] });
+        return { ok: false, skipped: true };
+      }
+      if (res.timedOut) {
+        dialog.showErrorBox('立即同步', '同步超过 1 小时被终止');
+        return { ok: false, timedOut: true };
+      }
+      if (res.code !== 0) {
+        const tail = (res.stderr || res.stdout || `exit ${res.code}`).slice(-400);
+        dialog.showErrorBox('立即同步失败', tail);
+        return { ok: false, code: res.code };
+      }
+      return { ok: true };
+    }
+    // 代码索引与决策向量共用 data/.embed.pid，且都打同一嵌入服务，必须串行。
+    async function runSyncJob(args, label) {
+      if (syncBusy || ctx.snapshot?.embedPid != null) return { ok: true, busy: true };
+      const { nodeBin, codeIndexRoot } = ctx.paths || {};
+      if (!nodeBin || !codeIndexRoot) {
+        dialog.showErrorBox('立即同步', '无法定位 code-index(paths.mjs 无响应)');
+        return { ok: false, error: 'no-paths' };
+      }
+      syncBusy = true;
+      try {
+        const res = await runner.run('embed', nodeBin, args, {
+          cwd: codeIndexRoot, label, timeoutMs: 60 * 60 * 1000,
+        });
+        await poller?.slowRefresh('sync-embed');
+        return explainSyncResult(res);
+      } catch (e) {
+        const error = String(e?.message || e).slice(0, 200);
+        dialog.showErrorBox('立即同步失败', error);
+        return { ok: false, error };
+      } finally {
+        syncBusy = false;
+      }
+    }
+    ipcMain.handle('tray:sync-embed', () => runSyncJob(
+      [`${ctx.paths?.codeIndexRoot || ''}/embed.mjs`],
+      '立即同步 embed.mjs',
+    ));
+    // 先重写样本库并立刻刷新进度条(旧向量/新样本数),再后台嵌入;嵌入中靠进度文件推进分子。
+    ipcMain.handle('tray:sync-vectors', async () => {
+      if (syncBusy || ctx.snapshot?.embedPid != null) return { ok: true, busy: true };
+      const { nodeBin, codeIndexRoot } = ctx.paths || {};
+      if (!nodeBin || !codeIndexRoot) {
+        dialog.showErrorBox('立即同步', '无法定位 code-index(paths.mjs 无响应)');
+        return { ok: false, error: 'no-paths' };
+      }
+      syncBusy = true;
+      const run = (args, label) => runner.run('embed', nodeBin, args, {
+        cwd: codeIndexRoot, label, timeoutMs: 60 * 60 * 1000,
+      });
+      try {
+        const grown = await run([`${codeIndexRoot}/autoExemplars.mjs`, '--grow-now'], '立即同步 更新样本库');
+        const growOut = explainSyncResult(grown);
+        if (!growOut.ok) return growOut;
+        await poller?.fastTick(false);
+        const embedded = await run([`${codeIndexRoot}/modelRoute.mjs`, '--build-vectors'], '立即同步 重嵌决策向量');
+        const embedOut = explainSyncResult(embedded);
+        await poller?.fastTick(false);
+        return embedOut;
+      } catch (e) {
+        const error = String(e?.message || e).slice(0, 200);
+        dialog.showErrorBox('立即同步失败', error);
+        return { ok: false, error };
+      } finally {
+        syncBusy = false;
+      }
+    });
+    ipcMain.handle('tray:roots-list', () => {
+      try { return { ok: true, roots: listRoots() }; }
+      catch (e) { return { ok: false, error: String(e?.message || e).slice(0, 200), roots: [] }; }
+    });
+    ipcMain.handle('tray:roots-add', async () => {
+      try {
+        const picked = await dialog.showOpenDialog(rootsWin && !rootsWin.isDestroyed() ? rootsWin : undefined, {
+          title: '添加代码目录', properties: ['openDirectory', 'multiSelections'],
+        });
+        const roots = listRoots();
+        if (picked.canceled) return { ok: true, roots, messages: [] };
+        const have = new Set(roots.map(rootKey));
+        const messages = [];
+        const next = roots.slice();
+        for (const raw of picked.filePaths || []) {
+          const err = checkRoot(raw);
+          if (err) { messages.push(`${raw}: ${err}`); continue; }
+          const norm = rootNorm(raw);
+          if (have.has(rootKey(norm))) { messages.push(`${norm} 已在列表中`); continue; }
+          have.add(rootKey(norm));
+          next.push(norm);
+        }
+        const saved = next.length === roots.length ? roots : saveRoots(next);
+        return { ok: true, roots: saved, messages };
+      } catch (e) { return { ok: false, error: String(e?.message || e).slice(0, 200), roots: [] }; }
+    });
+    ipcMain.handle('tray:roots-remove', (_e, target) => {
+      try {
+        const key = rootKey(String(target || ''));
+        const roots = listRoots().filter((r) => rootKey(r) !== key);
+        return { ok: true, roots: saveRoots(roots), messages: [] };
+      } catch (e) { return { ok: false, error: String(e?.message || e).slice(0, 200), roots: [] }; }
+    });
+    ipcMain.handle('tray:repair-hooks', async () => {
+      try {
+        const r = await runRepairHooks('all');
+        if (!r.ok) {
+          if (r.skipped) dialog.showMessageBox({ message: r.error, buttons: ['知道了'] });
+          else dialog.showErrorBox(String(r.error || '').includes('无法定位') ? '修复钩子' : '修复钩子失败', r.error || '失败');
+        }
+        return { ok: !!r.ok, skipped: !!r.skipped };
+      } catch (e) {
+        const error = String(e?.message || e).slice(0, 200);
+        dialog.showErrorBox('修复钩子失败', error);
+        return { ok: false, error };
+      }
+    });
     ctx.paths = await resolvePaths();
     if (ctx.paths.degraded) dialog.showErrorBox('TokenSaver', '无法定位 code-index 数据目录(paths.mjs 无响应),状态展示可能不完整');
     ctx.autorunOn = await queryAutorun();
-    const choice = readTrayState().autoLaunch; // A2 默认开:仅首跑(用户未做过选择)自动写入;用户关过就尊重
-    if (choice == null) { if (!ctx.autorunOn) ctx.autorunOn = await setAutorun(true); writeTrayState({ autoLaunch: ctx.autorunOn ? 'on' : 'off' }); }
+    const choice = readTrayState().autoLaunch; // A2 默认开;用户显式关过(off)才保持关。on/未记录都会重写 Run 命令(修开发态裸 electron.exe)
+    const choiceOff = choice === 'off';
+    if (!choiceOff) {
+      ctx.autorunOn = await setAutorun(true);
+      if (choice == null) writeTrayState({ autoLaunch: ctx.autorunOn ? 'on' : 'off' });
+    }
     poller = createPoller({
       paths: ctx.paths,
       cmdRun: runner.run.bind(runner),
       onSnapshot: applySnapshot,
+      hfWeightCached,
     });
     poller.fastTick();
     const loop = () => {

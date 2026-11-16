@@ -158,7 +158,15 @@ export function createWizard(deps) {
   // ---------- mode / ollama ----------
   function setRunMode(m) {
     if (m !== 'cpu' && m !== 'gpu') return { ok: false, reason: 'bad-mode', message: '运行模式只能是 cpu 或 gpu' };
-    state.runMode = m;
+    // 切模式必须作废已缓存清单/下载记录,否则 DOWNLOAD 会带着旧 mode 的 items 完成并 init 错后端
+    if (state.runMode !== m) {
+      state.runMode = m;
+      state.items = null;
+      state.downloads = {};
+      state.lastError = null;
+    } else {
+      state.runMode = m;
+    }
     save();
     return { ok: true, state: getState() };
   }
@@ -189,19 +197,24 @@ export function createWizard(deps) {
     return { ok: true, items: r.items };
   }
 
+  let downloading = false;
   async function startDownload({ onProgress = () => {} } = {}) {
     if (state.status !== 'DOWNLOAD') return { ok: false, reason: 'wrong-step', message: `当前不在下载步(${state.status})` };
-    const prep = await prepareDownload();
-    if (!prep.ok) return prep;
-    const todo = pendingItems(state.items, state.downloads);
-    if (!todo.length) return { ok: true, results: [], complete: true };
-    const { results } = await downloadItems(todo, { onProgress });
-    for (const r of results) {
-      if (r.status === 'ok') state.downloads[r.itemId] = { ok: true, at: now(), skipped: !!r.skipped };
-      else if (r.status === 'failed') state.lastError = `${r.itemId}:${r.error || '下载失败'}`;
-      save();
-    }
-    return { ok: !results.some((r) => r.status === 'failed'), results, complete: isDownloadComplete(state.items, state.downloads).ok };
+    if (downloading) return { ok: false, reason: 'in-flight', message: '下载进行中,请勿重复开始' };
+    downloading = true; // 必须在任何 await 之前置位,否则并发第二次调用会双写 .part
+    try {
+      const prep = await prepareDownload();
+      if (!prep.ok) return prep;
+      const todo = pendingItems(state.items, state.downloads);
+      if (!todo.length) return { ok: true, results: [], complete: true };
+      const { results } = await downloadItems(todo, { onProgress });
+      for (const r of results) {
+        if (r.status === 'ok') state.downloads[r.itemId] = { ok: true, at: now(), skipped: !!r.skipped };
+        else if (r.status === 'failed') state.lastError = `${r.itemId}:${r.error || '下载失败'}`;
+        save();
+      }
+      return { ok: !results.some((r) => r.status === 'failed'), results, complete: isDownloadComplete(state.items, state.downloads).ok };
+    } finally { downloading = false; }
   }
 
   // ---------- init 接线 ----------

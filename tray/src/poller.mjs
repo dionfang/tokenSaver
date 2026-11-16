@@ -1,19 +1,18 @@
 /**
  * 轮询双通道(tray 方案 §16.2/§18-E2):快通道读数据文件(mtime 变才重解析),慢通道 spawn status.mjs。
- * 节奏:空闲 5s / 嵌入中(embedPid)1s / 慢刷新 ≥60s / 缓存 >10min 进 stale 立即慢刷 /
- * powerMonitor resume 由壳层调 slowRefresh('resume')。不替钩子补 warm(只有菜单「立即保鲜」才触发)。
+ * 节奏:快通道一律 5s(代码索引嵌入与决策向量嵌入都不缩短) / 慢刷新 ≥60s / 缓存 >10min 进 stale 立即慢刷 /
+ * powerMonitor resume 由壳层调 slowRefresh('resume')。壳层不替钩子补 warm。
  * IO 与 spawn 全部依赖注入(node 直跑单测,零 electron 依赖);读侧失败回退上次值(§20.2-P3-3)。
  */
 import * as defaultIo from './util/statusFile.mjs';
 import { computeLamps, knnLayerPaths } from './util/lamps.mjs';
 
 export const FAST_IDLE_MS = 5_000;
-export const FAST_EMBEDDING_MS = 1_000;
 export const SLOW_INTERVAL_MS = 60_000;
 export const STALE_AFTER_MS = 10 * 60_000;
 
-/** 快通道间隔(纯函数):嵌入中 1s,空闲 5s。 */
-export function nextDelayMs(health) { return health?.embedPid != null ? FAST_EMBEDDING_MS : FAST_IDLE_MS; }
+/** 快通道间隔(纯函数):有没有嵌入都是 5 秒。进度条跟着这次读文件一起更新。 */
+export function nextDelayMs() { return FAST_IDLE_MS; }
 
 /** 缓存陈旧判定(纯函数):>10min(或从未拿到过)即 stale → 立即慢刷。 */
 export function isCacheStale(cachedAtMs, nowMs = Date.now()) { return cachedAtMs == null || nowMs - cachedAtMs > STALE_AFTER_MS; }
@@ -49,13 +48,15 @@ export function createPoller(deps) {
     chunks: { key: '', lines: null },
     meta: { key: '', value: null },
     knn: { key: '', base: null, local: null },
-    golden: { key: '', value: null },   // 黄金集行数(决策向量对齐进度分母,2026-11-15)
+    exemplars: { key: '', value: null }, // exemplars.json 样本条数(决策向量装填分母)
     consent: { key: '', value: { uploadLocalKnn: false, consentedAt: null } },
     hooks: null,
     statusLine: null,
     lastSlowAt: 0,
     slowInFlight: false,
     lastFailReason: null,
+    liveEmbedPid: null, // 快通道读到的 .embed.pid,不依赖 60s 健康缓存
+    decisionEmbed: false, // 决策向量嵌入:用进度文件抬分子,不改代码索引灯
   };
 
   const fileKey = (p) => { const s = io.statOf(p); return s ? `${s.mtimeMs}:${s.size}` : null; };
@@ -103,13 +104,13 @@ export function createPoller(deps) {
     return state.knn;
   }
 
-  /** 黄金集行数(对齐进度分母);mtime 门控缓存。 */
-  function readGolden() {
-    const p = `${paths.dataDir}/routing/golden-set.jsonl`;
+  /** 样本库条数(装填分母);mtime 门控缓存。 */
+  function readExemplars() {
+    const p = `${paths.dataDir}/routing/exemplars.json`;
     const key = fileKey(p);
-    if (key === state.golden.key && key != null) return state.golden.value;
-    const v = paths.dataDir != null ? io.countGoldenLines(paths.dataDir) : null;
-    state.golden = { key: key ?? '', value: v };
+    if (key === state.exemplars.key && key != null) return state.exemplars.value;
+    const v = paths.dataDir != null ? io.countExemplars(paths.dataDir) : null;
+    state.exemplars = { key: key ?? '', value: v };
     return v;
   }
 
@@ -128,15 +129,26 @@ export function createPoller(deps) {
   function fastTick(allowSlow = true) {
     const cache = readCache();
     const health = cache?.health ?? null;
-    const backend = health?.modelIn === 'local' ? 'local' : 'ollama';
+    const livePid = paths.dataDir != null && typeof io.readLiveEmbedPid === 'function' ? io.readLiveEmbedPid(paths.dataDir) : null;
+    const embedPid = livePid ?? health?.embedPid ?? null;
+    const vectorProgress = embedPid != null && paths.dataDir != null && typeof io.readBuildVectorsProgress === 'function'
+      ? io.readBuildVectorsProgress(paths.dataDir) : null;
+    const decisionEmbed = !!(vectorProgress && vectorProgress.pid === embedPid);
+    // 决策向量嵌入不把代码索引灯打成「部分嵌入」;代码索引嵌入没有这份进度文件,仍用活 pid。
+    const healthForLamps = health
+      ? { ...health, embedPid: decisionEmbed ? (health.embedPid ?? null) : embedPid }
+      : health;
+    state.liveEmbedPid = embedPid;
+    state.decisionEmbed = decisionEmbed;
+    const backend = (healthForLamps?.modelIn === 'local' ? 'local' : 'ollama');
     const chunksLines = readChunks();
     const vectors = {
       embExists: paths.dataDir != null ? io.embeddingsExists(paths.dataDir, backend) : false,
       meta: readMeta(backend),
     };
-    const knnL = readKnn(health);
+    const knnL = readKnn(healthForLamps);
     const consent = readConsent();
-    const progress = health?.embedPid != null && paths.dataDir != null
+    const progress = !decisionEmbed && embedPid != null && paths.dataDir != null
       ? io.readEmbedProgress(`${paths.dataDir}/embed.log`)
       : null;
     const localWeights = backend === 'local'
@@ -146,7 +158,11 @@ export function createPoller(deps) {
         decision: hfWeightCached(paths.hfCacheDir, health?.models?.localDecision),
       }
       : {};
-    const lamps = computeLamps({ health, vectors, chunksLines, knn: knnLayerInput(knnL), hooks: state.hooks, consent, progress, localWeights, goldenCount: readGolden() });
+    const lamps = computeLamps({
+      health: healthForLamps, vectors, chunksLines, knn: knnLayerInput(knnL), hooks: state.hooks, consent, progress, localWeights,
+      exemplarCount: readExemplars(),
+      knnCovered: decisionEmbed ? vectorProgress.covered : null,
+    });
     if (state.statusLine == null && paths.dataDir != null) state.statusLine = io.readLastStatus(paths.dataDir);
     const stale = isCacheStale(cache?.at ?? null, now());
     const snapshot = {
@@ -157,7 +173,7 @@ export function createPoller(deps) {
       healthAt: cache?.at ?? null,
       stale,
       degraded: !paths.dataDir,
-      embedPid: health?.embedPid ?? null,
+      embedPid,
       modelIn: health?.modelIn ?? null,
       consent,
     };
@@ -211,5 +227,9 @@ export function createPoller(deps) {
     return fastTick(false);
   }
 
-  return { fastTick, slowRefresh, nextDelayMs: () => nextDelayMs(state.cache?.health), get state() { return state; } };
+  return {
+    fastTick, slowRefresh,
+    nextDelayMs: () => nextDelayMs(),
+    get state() { return state; },
+  };
 }

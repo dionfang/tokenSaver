@@ -59,7 +59,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 // 动作错误可见化(2026-11-15):invoke 失败不再静默——右下角浮条显示原因,避免「按钮点了没反应」无从排查
 const act = (name, payload) => window.trayWizard.action(name, payload)
-  .then((r) => { render(); if (r && r.ok === false && r.message) showErr(r.message); return r; })
+  .then((r) => { render(); if (r && r.ok === false) showErr(r.message || r.error || '未知错误'); else if (r && r.ok === true && r.message) showOk(r.message); return r; })
   .catch((e) => { showErr(String((e && e.message) || e)); throw e; });
 function showErr(msg) {
   let el = document.getElementById('errline');
@@ -67,6 +67,15 @@ function showErr(msg) {
   el.textContent = `动作失败:${msg}`;
   clearTimeout(el._t); el._t = setTimeout(() => el.remove(), 30000);
 }
+function showOk(msg) {
+  let el = document.getElementById('okline');
+  if (!el) { el = document.createElement('div'); el.id = 'okline'; el.style.cssText = 'position:fixed;right:12px;bottom:12px;max-width:70%;background:#14532d;color:#bbf7d0;padding:8px 12px;border-radius:6px;font-size:12px;z-index:99'; document.body.appendChild(el); }
+  el.textContent = msg;
+  clearTimeout(el._t); el._t = setTimeout(() => el.remove(), 8000);
+}
+// 2026-11-16 修复:模板内联 onclick="act(...)" 只能在 window 作用域解析,而 act 是 const(全局词法绑定不挂 window)
+// → 向导内所有内联按钮静默失效(ReferenceError,点了毫无反应)。显式挂 window.act 修复(勿改回 const-only)。
+window.act = act;
 
 window.trayWizard.onState((st) => {
   // 显式逐字段直赋(2026-11-15 修复):Object.assign(S, st) 在沙箱渲染上下文不生效,曾致 S.w 恒 null、按钮误显「加载中」
@@ -74,6 +83,9 @@ window.trayWizard.onState((st) => {
   S.progress = st ? st.progress : null;
   S.hooks = st ? st.hooks : null;
   S.nodeForm = st ? st.nodeForm : null;
+  S.ollamaVersion = st ? st.ollamaVersion : null;
+  S.ollamaSetup = st ? st.ollamaSetup : null;
+  S.downloading = !!(st && st.downloading);
   render();
 });
 
@@ -143,8 +155,10 @@ function renderMode(w) {
         <div class="row">
           <button onclick="act('download-ollama-setup')">下载 Ollama 官方安装包</button>
           <button onclick="act('recheck-ollama')">我已装好,重新检测</button>
+          ${S.ollamaSetup ? '<button onclick="act(\'open-ollama-setup\')">打开安装包</button>' : ''}
         </div>
-        <div class="sub">安装包为官方版本且经 sha256 校验;下载后请手动执行安装并启动 Ollama,再点「重新检测」。不想装 Ollama 可返回改选 cpu模型。</div>
+        ${S.progress && S.progress.itemId === 'ollama-setup' ? `<div class="sub">${esc(phaseText(S.progress))} ${S.progress.pct != null ? S.progress.pct + '%' : ''}</div>` : ''}
+        <div class="sub">安装包为官方版本且经 sha256 校验;下载完成后会尝试打开安装包,装好并启动 Ollama 后再点「重新检测」。不想装可返回改选 cpu模型。</div>
       </div>` : ''}
     </div>`;
 }
@@ -190,7 +204,7 @@ function renderDownload(w) {
       ${rows || '<div class="sub">正在获取组件清单…</div>'}
       ${w.lastError ? `<div class="err">失败:${esc(w.lastError)} <button onclick="act('retry')">重试</button></div>` : ''}
       <div class="row">
-        ${doneAll ? '<span class="ok">全部组件校验通过,可进入下一步。</span>' : '<button id="dlStart" onclick="act(\'start-download\')">开始下载</button> <button onclick="act(\'pause\')">暂停</button> <button onclick="act(\'cancel\')">取消</button>'}
+        ${doneAll ? '<span class="ok">全部组件校验通过,可进入下一步。</span>' : `<button id="dlStart" ${S.downloading ? 'disabled' : ''} onclick="this.disabled=true;act('start-download')">${S.downloading ? '下载中…' : '开始下载'}</button> <button onclick="act('pause')">暂停</button> <button onclick="act('cancel')">取消</button>`}
       </div>
       <div class="sub">支持断点续传:暂停/取消都会保留已下载部分,重开向导不重复下载已校验通过项。源不可达会停留本步,不会假装完成。</div>
     </div>`;
@@ -211,7 +225,7 @@ function renderInitRun(w) {
 
 function renderDone(w) {
   const hooks = S.hooks;
-  const lamp = (s) => `<span class="lamp ${s || 'absent'}"></span>`;
+  const lamp = (h) => `<span class="lamp ${(h && h.state) || 'absent'}"></span>`;
   $('body').innerHTML = `
     <div class="card">
       <b class="ok">✔ 安装完成!</b>

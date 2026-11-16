@@ -8,6 +8,7 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; background: #161b22; color: #c9d1d9; padding: 14px 16px; overflow: hidden; }
   h2 { font-size: 12px; color: #8b949e; font-weight: 600; margin: 14px 0 6px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+  h2.section-title:first-of-type { margin-top: 0; }
   .row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
   .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
   .green { background: #3fb950; box-shadow: 0 0 6px #3fb95088; }
@@ -25,25 +26,33 @@
   .pct { font-size: 12px; color: #8b949e; flex: none; min-width: 34px; text-align: right; }
   .lbl { font-size: 12px; color: #8b949e; flex: none; min-width: 88px; }
   #mode { color: #58a6ff; }
+  .section-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .head-btn {
+    appearance: none; font: 12px/20px "Microsoft YaHei", system-ui, sans-serif;
+    color: #c9d1d9; background: #21262d; border: 1px solid #30363d; border-radius: 4px;
+    padding: 0 10px; cursor: pointer;
+  }
+  .head-btn:hover:not(:disabled) { border-color: #58a6ff; color: #58a6ff; }
+  .head-btn:disabled { opacity: 0.55; cursor: default; }
 </style>
 </head>
 <body>
-  <h2>模型启动状态 <span class="pct" id="snap-age" style="float:right;font-weight:400"></span></h2>
+  <h2 class="section-title">模型启动状态 <button type="button" id="snap-refresh" class="head-btn">刷新</button></h2>
   <div class="row"><span class="name">运行模式</span><span id="mode">检测中</span></div>
   <div class="row"><span class="dot" id="m-embedding"></span><span class="name">嵌入模型</span><span class="state" id="t-embedding">检测中</span></div>
   <div class="row"><span class="dot" id="m-reranker"></span><span class="name">精排模型</span><span class="state" id="t-reranker">检测中</span></div>
   <div class="row"><span class="dot" id="m-decision"></span><span class="name">决策模型</span><span class="state" id="t-decision">检测中</span></div>
 
-  <h2>代码索引向量嵌入</h2>
+  <h2 class="section-title">代码索引状态 <button type="button" id="embed-sync" class="head-btn">立即同步</button></h2>
   <div class="row"><span class="dot" id="m-embed"></span><span class="name">向量嵌入</span><span class="state" id="t-embed">检测中</span></div>
   <div class="bar-row"><div class="bar"><i id="embed-bar"></i></div><span class="pct" id="embed-pct">100%</span></div>
 
-  <h2>决策向量 KNN</h2>
-  <div class="row"><span class="dot" id="m-knn"></span><span class="name" id="knn-name">决策向量 KNN</span><span class="state" id="t-knn">检测中</span></div>
+  <h2 class="section-title">模型决策状态 <button type="button" id="knn-sync" class="head-btn">立即同步</button></h2>
+  <div class="row"><span class="dot" id="m-knn"></span><span class="name" id="knn-name">模型决策状态</span><span class="state" id="t-knn">检测中</span></div>
   <div class="bar-row"><span class="lbl">本地决策包</span><div class="bar"><i id="knn-bar"></i></div><span class="pct" id="knn-pct">—</span></div>
   <div class="bar-row"><span class="lbl">公共决策包</span><div class="bar"><i id="knn-base-bar"></i></div><span class="pct" id="knn-base-pct"></span></div>
 
-  <h2>三端钩子配置</h2>
+  <h2 class="section-title">三端钩子配置 <button type="button" id="hook-repair" class="head-btn">修复</button></h2>
   <div class="row"><span class="dot" id="m-zcode"></span><span class="name">ZCode</span><span class="state" id="t-zcode">检测中</span></div>
   <div class="row"><span class="dot" id="m-cursor"></span><span class="name">Cursor</span><span class="state" id="t-cursor">检测中</span></div>
   <div class="row"><span class="dot" id="m-qoder"></span><span class="name">Qoder</span><span class="state" id="t-qoder">检测中</span></div>
@@ -55,7 +64,7 @@
   const EMBED_TEXT = { green: '全量嵌入', yellow: '部分嵌入', red: '无嵌入', empty: '未选目录' };
   // 2026-11-15 用户裁决:启用 base+local=「在线模式」;仅 local=「离线模式」(原名中的 local/base+local 前缀去掉)
   const KNN_TEXT = { green: '在线模式', yellow: '离线模式', red: '离线模式', absent: '未检测' };
-  const KNN_NAME = { green: '在线模式', yellow: '离线模式', red: '离线模式', absent: '决策向量 KNN' };
+  const KNN_NAME = { green: '在线模式', yellow: '离线模式', red: '离线模式', absent: '模型决策状态' };
   const $ = (id) => document.getElementById(id);
 
   function setLamp(id, lamp, textMap) {
@@ -70,9 +79,6 @@
       // 2026-11-15:未运行=未驻留显存(Ollama 空闲卸载/未预热),非故障——悬停说明,避免误判
       $(`t-${k}`).title = '「未运行」= 该模型当前未驻留显存:Ollama keep_alive 到期空闲卸载或尚未预热;检索/预热时会自动拉起';
     }
-    // 快照新鲜度(用户两次误判「检测错误」的根因是不知道这是快照):显示健康缓存龄
-    const ageS = s.healthAt ? Math.max(0, Math.round((Date.now() - s.healthAt) / 1000)) : (s.at ? Math.max(0, Math.round((Date.now() - s.at) / 1000)) : null);
-    $('snap-age').textContent = ageS != null ? `快照 ${ageS}s 前` : '';
     $('mode').textContent = s.modelIn === 'local' ? 'cpu模型' : s.modelIn ? 'gpu模型' : '未知';
     setLamp('embed', L.embed, EMBED_TEXT);
     const p = L.detail || {};
@@ -82,9 +88,8 @@
     // 2026-11-15 用户裁决:总体状态——已嵌/总索引块+总比例;100%=绿条,不足=黄条;下方不显示状态原因文案
     $('embed-pct').textContent = total != null ? `${done}/${total}(${pct ?? 0}%)` : '未选目录';
     setLamp('knn', L.knn, KNN_TEXT);
-    $('knn-name').textContent = KNN_NAME[L.knn] || '决策向量 KNN';
-    // 2026-11-15 用户裁决:①base 缺失提示文案不显示(安装时已自行选择知晓)②增对齐进度条:
-    // 本地 local 向量条目 / 四票代签黄金集条目,满=绿、不足=黄(与嵌入条同色规则)
+    $('knn-name').textContent = KNN_NAME[L.knn] || '模型决策状态';
+    // 本地决策包:当前模式已写向量条数 / exemplars.json 样本条数。满=绿、不足=黄。
     const kd = p.knnDone ?? 0, kt = p.knnTotal, kpct = p.knnPct;
     $('knn-bar').style.width = `${kt != null ? (kpct ?? 0) : 0}%`;
     $('knn-bar').className = kpct != null && kpct >= 100 ? 'full' : '';
@@ -95,9 +100,56 @@
     $('knn-base-bar').className = bd == null ? 'grey' : (bpct != null && bpct >= 100 ? 'full' : '');
     $('knn-base-pct').textContent = bd != null && bt != null ? `${bd}/${bt}(${bpct ?? 0}%)` : '';
     for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
+    embedRunning = s.embedPid != null;
+    paintSyncBtn();
+  }
+
+  let embedRunning = false;
+  let embedHold = false;
+  let knnHold = false;
+  function paintSyncBtn() {
+    const busy = embedRunning || embedHold || knnHold;
+    for (const id of ['embed-sync', 'knn-sync']) {
+      const btn = $(id);
+      if (!btn) continue;
+      btn.disabled = busy;
+      btn.textContent = busy ? '同步中' : '立即同步';
+    }
   }
 
   window.trayPanel?.onSnapshot(render);
+  $('snap-refresh').addEventListener('click', async () => {
+    const btn = $('snap-refresh');
+    if (!window.trayPanel?.refresh || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '刷新中';
+    try { await window.trayPanel.refresh(); }
+    finally { btn.disabled = false; btn.textContent = '刷新'; }
+  });
+  $('embed-sync').addEventListener('click', async () => {
+    const btn = $('embed-sync');
+    if (!window.trayPanel?.syncEmbed || btn.disabled) return;
+    embedHold = true;
+    paintSyncBtn();
+    try { await window.trayPanel.syncEmbed(); }
+    finally { embedHold = false; paintSyncBtn(); }
+  });
+  $('knn-sync').addEventListener('click', async () => {
+    const btn = $('knn-sync');
+    if (!window.trayPanel?.syncVectors || btn.disabled) return;
+    knnHold = true;
+    paintSyncBtn();
+    try { await window.trayPanel.syncVectors(); }
+    finally { knnHold = false; paintSyncBtn(); }
+  });
+  $('hook-repair').addEventListener('click', async () => {
+    const btn = $('hook-repair');
+    if (!window.trayPanel?.repairHooks || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '修复中';
+    try { await window.trayPanel.repairHooks(); }
+    finally { btn.disabled = false; btn.textContent = '修复'; }
+  });
 </script>
 </body>
 </html>

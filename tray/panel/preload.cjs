@@ -9,6 +9,16 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('trayPanel', {
   onSnapshot: (cb) => ipcRenderer.on('tray:snapshot', (_e, snapshot) => cb(snapshot)),
+  refresh: () => ipcRenderer.invoke('tray:refresh'),
+  repairHooks: () => ipcRenderer.invoke('tray:repair-hooks'),
+  syncEmbed: () => ipcRenderer.invoke('tray:sync-embed'),
+  syncVectors: () => ipcRenderer.invoke('tray:sync-vectors'),
+});
+
+contextBridge.exposeInMainWorld('trayRoots', {
+  list: () => ipcRenderer.invoke('tray:roots-list'),
+  add: () => ipcRenderer.invoke('tray:roots-add'),
+  remove: (target) => ipcRenderer.invoke('tray:roots-remove', target),
 });
 
 // 向导白名单动作(§5.5 五步向导):动作名固定枚举,payload 为纯数据;渲染层不得直接触网/触盘。

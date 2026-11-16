@@ -58,3 +58,73 @@ export function pickNodeBin({ dataDir, qualified, exists = fs.existsSync }) {
   try { if (exists(managed)) return managed; } catch { /* 尽力 */ }
   return 'node';
 }
+
+/** 在目录树中找 node.exe(官方 zip 顶层常为 node-vXX-win-x64/)。 */
+export function findNodeExe(dir, { readdirSync = fs.readdirSync } = {}) {
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  for (const ent of entries) {
+    const p = path.join(dir, ent.name);
+    if (ent.isFile() && ent.name.toLowerCase() === 'node.exe') return p;
+    if (ent.isDirectory()) {
+      const hit = findNodeExe(p, { readdirSync });
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+/**
+ * 把官方 Node zip 解到 data/runtime/node/(内含 node.exe)。
+ * Windows 用 Expand-Archive;解压后若 exe 在子目录则把该子目录挪成 destDir。
+ * 无 zip / 无 exe → ok:false(禁止「只改 PATH、实际没有 node.exe」假就绪)。
+ */
+export async function extractNodeZip(zipPath, destDir, {
+  execFile,
+  existsSync = fs.existsSync,
+  mkdirSync = fs.mkdirSync,
+  rmSync = fs.rmSync,
+  renameSync = fs.renameSync,
+  readdirSync = fs.readdirSync,
+} = {}) {
+  if (!existsSync(zipPath)) return { ok: false, error: `缺少 Node zip:${zipPath}` };
+  const staging = `${destDir}.extracting`;
+  try { rmSync(staging, { recursive: true, force: true }); } catch { /* 尽力 */ }
+  mkdirSync(staging, { recursive: true });
+  const esc = (s) => String(s).replace(/'/g, "''");
+  const exp = await sh(execFile, 'powershell', ['-NoProfile', '-Command',
+    `Expand-Archive -LiteralPath '${esc(zipPath)}' -DestinationPath '${esc(staging)}' -Force`]);
+  if (!exp.ok) return { ok: false, error: exp.stderr.slice(-200) || 'Expand-Archive 失败' };
+  const exe = findNodeExe(staging, { readdirSync });
+  if (!exe) {
+    try { rmSync(staging, { recursive: true, force: true }); } catch { /* 尽力 */ }
+    return { ok: false, error: 'Node zip 内未找到 node.exe' };
+  }
+  const root = path.dirname(exe);
+  try { rmSync(destDir, { recursive: true, force: true }); } catch { /* 尽力 */ }
+  try {
+    renameSync(root, destDir);
+  } catch (e) {
+    try { rmSync(staging, { recursive: true, force: true }); } catch { /* 尽力 */ }
+    return { ok: false, error: `解压落位失败:${String(e.message || e).slice(0, 120)}` };
+  }
+  try { rmSync(staging, { recursive: true, force: true }); } catch { /* 尽力 */ }
+  const finalExe = path.join(destDir, 'node.exe');
+  if (!existsSync(finalExe)) return { ok: false, error: '解压后 runtime/node/node.exe 仍不存在' };
+  return { ok: true, bin: finalExe };
+}
+
+/** 确保托管 Node 可用:已有 node.exe → 追加 PATH;仅有 zip → 先解压;都没有 → 失败。 */
+export async function ensureManagedNodeRuntime({ dataDir, execFile, zipRel = path.join('runtime', 'node.zip') } = {}) {
+  const dir = path.join(dataDir || '', 'runtime', 'node');
+  const exe = path.join(dir, 'node.exe');
+  if (!fs.existsSync(exe)) {
+    const zip = path.join(dataDir || '', zipRel);
+    const er = await extractNodeZip(zip, dir, { execFile });
+    if (!er.ok) return er;
+  }
+  if (!fs.existsSync(exe)) return { ok: false, error: '托管 Node 未就绪(无 node.exe)' };
+  const r = await appendDirToUserPath(dir, { execFile });
+  if (r.error) return { ok: false, error: r.error };
+  return { ok: true, changed: r.changed, bin: exe };
+}
