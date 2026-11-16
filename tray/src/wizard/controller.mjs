@@ -10,7 +10,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 // manifest/downloader 保留给 M4 base 包更新复用(2026-11-16 拍板 B:向导不再走清单下载);
-import { probeOllama, createDownloader } from '../downloader.mjs';
+import { probeOllama, createDownloader, httpRequest } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
 import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
 import { hfWeightCached } from '../util/paths.mjs';
@@ -109,24 +109,43 @@ export function createWizardController(deps) {
       const nq = nodeQualification ?? await detectNodeQualification({ execFile });
       const depsOk = fs.existsSync(path.join(paths.codeIndexRoot, 'node_modules', '@huggingface', 'transformers'));
       const mode = machine.getState().runMode;
+      const cfgModels = (() => { try { return JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8')).models ?? {}; } catch { return {}; } })();
       const checks = [
         { id: 'node', label: 'Node 运行时(≥20)', ok: nq?.ok === true, hard: true,
           hint: nq?.ok ? `已就绪${nq.version ? `(${nq.version})` : ''}` : '未检测到达标 Node——请自行安装 Node.js 20+ 后点「重新自检」' },
         { id: 'deps', label: '推理依赖(transformers/onnxruntime)', ok: depsOk, hard: false,
           hint: depsOk ? '已安装' : '尚未安装——将自动安装(npmmirror),或接线时由 init 自动安装' },
       ];
-      // 2026-11-16 用户裁决:Ollama 服务状态不进自检——MODE 步硬门禁已验证过(服务在听才到这步),
-      // 自检页重复检测无信息量。cpu 模式权重=真实检测 hf-cache(localOnnxCached 镜像,不 import code-index)。
-      if (mode !== 'gpu') {
-        const models = (() => { try { return JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8')).models ?? {}; } catch { return {}; } })();
-        const W = {
-          embedding: models.localEmbedding || 'Xenova/jina-embeddings-v2-base-zh',
-          reranker: models.localReranker || 'Xenova/bge-reranker-base',
-          decision: models.localDecision || 'strands:strands-decider-2B-hobson-v19:q4f16',
-        };
-        const missing = Object.entries(W).filter(([, id]) => hfWeightCached(paths.hfCacheDir, id) !== true).map(([k]) => k);
-        checks.push({ id: 'weights', label: 'cpu 模式权重(嵌入/精排/决策)', ok: missing.length === 0, hard: false,
-          hint: missing.length === 0 ? '全部已缓存(hf-cache)' : `缺失:${missing.join(',')}——将自动下载到 hf-cache` });
+      // 三个模型的安装状态(2026-11-16 用户需求:始终显示,按模式分源):
+      // gpu=Ollama /api/tags 已安装检测(未安装→检索/预热懒拉取或手动 pull);cpu=hf-cache 权重缓存。
+      // 模型名 fallback 与 code-index/config.mjs models 同步(勿漂移)。
+      const EMB = cfgModels.embedding || 'qwen3-embedding:0.6b';
+      const RRK = cfgModels.reranker || 'sam860/qwen3-reranker:0.6b-F16';
+      const DEC = cfgModels.decision || 'tev1:0.8b';
+      const embId = cfgModels.localEmbedding || 'Xenova/jina-embeddings-v2-base-zh';
+      const rrkId = cfgModels.localReranker || 'Xenova/bge-reranker-base';
+      const decId = cfgModels.localDecision || 'strands:strands-decider-2B-hobson-v19:q4f16';
+      if (mode === 'gpu') {
+        let installed = null;
+        try {
+          const { status, res } = await httpRequest(`${ollamaBase || 'http://127.0.0.1:11434'}/api/tags`, { timeoutMs: 3000 });
+          if (status === 200) { let txt = ''; res.setEncoding('utf8'); for await (const c of res) txt += c; installed = (JSON.parse(txt).models || []).map((m) => m.name); }
+        } catch { /* 服务不在听 → 三项显示未知(不判红,MODE 门禁已过) */ }
+        for (const [label, name] of [['嵌入模型', EMB], ['精排模型', RRK], ['决策模型', DEC]]) {
+          const ok = installed == null ? false : installed.includes(name);
+          checks.push({ id: `m-${name}`, label: `Ollama ${label} ${name}`, ok, hard: false,
+            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——首次检索/预热时自动拉取,或手动 ollama pull' });
+        }
+      } else {
+        // strands 权重目录名含前缀且文件名不同(model_quantized.onnx),不走 hfWeightCached 的 org/name 分支
+        const cached = (id) => String(id).startsWith('strands:')
+          ? fs.existsSync(path.join(paths.hfCacheDir ?? '', String(id).split(':')[1] ?? '', 'model_quantized.onnx'))
+          : hfWeightCached(paths.hfCacheDir ?? '', id) === true;
+        for (const [label, id] of [['嵌入权重', embId], ['精排权重', rrkId], ['决策权重', decId]]) {
+          const ok = cached(id);
+          checks.push({ id: `w-${label}`, label: `本地权重 ${label}`, ok, hard: false,
+            hint: ok ? '已缓存(hf-cache)' : '未缓存——首次使用时自动下载(HuggingFace)' });
+        }
       }
       return { checks };
     },
