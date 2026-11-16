@@ -102,6 +102,10 @@ export function createWizard(deps) {
     let j = null;
     try { j = JSON.parse(io.readFileSync(file, 'utf8')); } catch { j = null; }
     if (j?.status === 'done') j.status = 'DONE'; // 完成态文件小写 → 内部步骤名
+    // 旧版状态名迁移(2026-11-16 拍板 B 后):DOWNLOAD 语义等价 ENVCHECK(都在接线前);
+    // 其他未知状态(损坏/未来版本)→ 重置 INIT,防 死锁(不匹配任何分支,next/back 全失效)
+    if (j?.status === 'DOWNLOAD') j.status = 'ENVCHECK';
+    if (j?.status && !STEP_ORDER.includes(j.status) && j.status !== 'DONE') { j = { status: 'INIT' }; }
     state = { ...blank(), ...(j || {}) };
     // 旧版(清单下载)状态字段迁移:items/downloads 已废(2026-11-16 拍板 B),直接丢弃
     delete state.items; delete state.downloads;

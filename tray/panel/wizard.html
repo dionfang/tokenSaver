@@ -107,7 +107,7 @@ function render() {
   $('btnNext').disabled = !S.w || !gate.ok;
   $('btnNext').textContent = !S.w ? '加载中…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步'));
   if (w.status === 'INIT') {
-    $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型)→ 数据上传同意 → 下载必要组件 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
+    $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 数据上传同意 → 环境自检 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
     return;
   }
   if (w.status === 'ROOTS') renderRoots(w);
