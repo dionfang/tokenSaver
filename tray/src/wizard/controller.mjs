@@ -113,9 +113,12 @@ export function createWizardController(deps) {
       const checks = [
         { id: 'node', label: 'Node 运行时(≥20)', ok: nq?.ok === true, hard: true,
           hint: nq?.ok ? `已就绪${nq.version ? `(${nq.version})` : ''}` : '未检测到达标 Node——请自行安装 Node.js 20+ 后点「重新自检」' },
-        { id: 'deps', label: '推理依赖(transformers/onnxruntime)', ok: depsOk, hard: false,
-          hint: depsOk ? '已安装' : '尚未安装——将自动安装(npmmirror),或接线时由 init 自动安装' },
       ];
+      // 2026-11-16 用户裁决:推理依赖(transformers/onnxruntime)仅 cpu 模式显示——gpu 推理走 Ollama,不需要它
+      if (mode !== 'gpu') {
+        checks.push({ id: 'deps', label: '推理依赖(transformers/onnxruntime)', ok: depsOk, hard: false,
+          hint: depsOk ? '已安装' : '尚未安装——将自动安装(npmmirror),或接线时由 init 自动安装' });
+      }
       // 三个模型的安装状态(2026-11-16 用户需求:始终显示,按模式分源):
       // gpu=Ollama /api/tags 已安装检测(未安装→检索/预热懒拉取或手动 pull);cpu=hf-cache 权重缓存。
       // 模型名 fallback 与 code-index/config.mjs models 同步(勿漂移)。
