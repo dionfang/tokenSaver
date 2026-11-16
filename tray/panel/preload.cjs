@@ -25,7 +25,7 @@ contextBridge.exposeInMainWorld('trayRoots', {
 const WIZARD_ACTIONS = new Set([
   'load', 'next', 'back', 'pick-roots', 'set-roots', 'remove-root', 'set-mode',
   'recheck-ollama', 'set-consent', 'start-download', 'pause', 'cancel', 'retry',
-  'download-ollama-setup', 'open-ollama-setup', 'run-init', 'reset', 'reset-reload',
+  'run-init', 'reset', 'reset-reload',
 ]);
 
 contextBridge.exposeInMainWorld('trayWizard', {

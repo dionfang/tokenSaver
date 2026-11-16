@@ -150,17 +150,14 @@ function renderMode(w) {
     <div class="card">
       <b>运行模式</b>
       <label class="mode"><input type="radio" name="mode" ${w.runMode === 'cpu' ? 'checked' : ''} onchange="act('set-mode',{mode:'cpu'})"> cpu模型<span class="sub">—— 本机常驻推理,不依赖 Ollama(权重由向导下载)</span></label>
-      <label class="mode"><input type="radio" name="mode" ${w.runMode === 'gpu' ? 'checked' : ''} onchange="act('set-mode',{mode:'gpu'})"> gpu模型<span class="sub">—— 使用本机 Ollama(可走 GPU)。需要本机 Ollama(向导可代下载其官方安装包)</span></label>
+      <label class="mode"><input type="radio" name="mode" ${w.runMode === 'gpu' ? 'checked' : ''} onchange="act('set-mode',{mode:'gpu'})"> gpu模型<span class="sub">—— 使用本机 Ollama(可走 GPU)。需要本机 Ollama(请自行下载安装)</span></label>
       ${w.runMode === 'gpu' ? `
       <div class="disc">
         <div id="ollamaState">${gpuReady ? '<span class="ok">✔ 已检测到 Ollama 服务' + (S.ollamaVersion ? '(版本 ' + esc(S.ollamaVersion) + ')' : '') + '</span>' : '<span class="err">✘ 未检测到 Ollama 服务在运行(gpu模型 必须先就绪才能继续)</span>'}</div>
         <div class="row">
-          <button onclick="act('download-ollama-setup')">下载 Ollama 官方安装包</button>
           <button onclick="act('recheck-ollama')">我已装好,重新检测</button>
-          ${S.ollamaSetup ? '<button onclick="act(\'open-ollama-setup\')">打开安装包</button>' : ''}
         </div>
-        ${S.progress && S.progress.itemId === 'ollama-setup' ? `<div class="sub">${esc(phaseText(S.progress))} ${S.progress.pct != null ? S.progress.pct + '%' : ''}</div>` : ''}
-        <div class="sub">安装包为官方版本且经 sha256 校验;下载完成后会尝试打开安装包,装好并启动 Ollama 后再点「重新检测」。不想装可返回改选 cpu模型。</div>
+        <div class="sub">请下载并安装启动 Ollama 服务后再点「重新检测」,推荐安装 Ollama 0.40.15。</div>
       </div>` : ''}
     </div>`;
 }

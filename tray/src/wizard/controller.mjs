@@ -101,21 +101,8 @@ export function createWizardController(deps) {
     } catch { /* 灯失败不阻断向导 */ }
   }
 
-  /** §17.2 分支①:向导内代下 Ollama 官方安装包(钉版本+sha256,用户手动执行)。 */
-  async function downloadOllamaSetup() {
-    // 已检测到 Ollama 在跑 → 无需下载安装包(2026-11-16 用户反馈「点了没反应」后加的语义短路)
-    try {
-      const probe = await probeOllama(ollamaBase ? { base: ollamaBase } : {});
-      if (probe?.ok) return { ok: true, message: `已检测到 Ollama 服务在运行${probe.version ? `(版本 ${probe.version})` : ''},无需下载官方安装包` };
-    } catch { /* 探测失败继续走下载流程 */ }
-    const r = await fetchComponentsManifest(manifestUrl, { fetchText, clientVersion, pins });
-    if (!r.ok) return { ...r, message: r.message || `清单拉取失败(${r.error || 'unknown'})` };
-    const item = r.manifest.items.find((it) => it.id === 'ollama-setup');
-    if (!item) return { ok: false, error: 'no-item', message: '清单缺少 ollama-setup 项' };
-    const res = await downloader.downloadFileItem(item, { baseDir: downloadBase });
-    if (res.status === 'ok') return { ok: true, file: path.join(downloadBase, item.dest) };
-    return { ok: false, error: res.status, message: res.error || 'Ollama 安装包下载失败' };
-  }
+  /** 2026-11-16 用户裁决:不再代下载 Ollama 官方安装包——用户自行下载安装启动后点「重新检测」。
+   *  原分支①(代下官方安装包)整体移除;probe 短路逻辑保留在 MODE 步 UI 文案层(§17.2 口径修订)。 */
 
   async function dispatch(action, payload = {}) {
     switch (action) {
@@ -151,20 +138,6 @@ export function createWizardController(deps) {
       }
       case 'pause': downloader.pause(); return push();
       case 'cancel': downloader.cancel(); return push();
-      case 'download-ollama-setup': {
-        const r = await downloadOllamaSetup();
-        if (r.ok && r.file) {
-          envelope.ollamaSetup = r.file;
-          await openPath(r.file);
-        }
-        return push(r);
-      }
-      case 'open-ollama-setup': {
-        const file = envelope.ollamaSetup || path.join(downloadBase, 'runtime', 'OllamaSetup.exe');
-        const ok = fs.existsSync(file);
-        if (ok) await openPath(file);
-        return { ok, file, message: ok ? '已打开安装包' : '安装包尚未下载,请先点「下载 Ollama 官方安装包」' };
-      }
       case 'run-init': {
         const r = await machine.runInit();
         await refreshHooks();
