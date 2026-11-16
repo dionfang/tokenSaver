@@ -59,10 +59,15 @@ export function isEnvReady(checks) {
  *  roots=0 只跑 --model-in(A1:只装工具与钩子,不索引)。等号写法 init 也认,这里统一空格写法。 */
 export function initCommands({ roots = [], runMode }) {
   const cmds = [];
-  // 2026-11-16(用户需求:向导二次运行换目录):接线用 --set-roots 替换语义(整表替换,可移除旧目录);
-  // 逐目录各传一次(规避逗号路径陷阱,R4)。roots 为空=清空(传一次空值)。
-  if (roots.length) for (const r of roots) cmds.push({ args: ['--set-roots', r], label: `接线目录 ${r}` });
-  else cmds.push({ args: ['--set-roots', ''], label: '清空索引目录(不索引任何项目)' });
+  // 2026-11-16 修复:替换语义下逐目录多次 spawn=每次整表覆盖,最后一次赢(只接入最后一个目录的根因)。
+  // 改单次 spawn 携带多个 --set-roots 参数——init 单进程内解析累积后整表替换一次,无逗号陷阱(R4)。
+  if (roots.length) {
+    const args = [];
+    for (const r of roots) args.push('--set-roots', r);
+    cmds.push({ args, label: `接线目录 ×${roots.length}` });
+  } else {
+    cmds.push({ args: ['--set-roots', ''], label: '清空索引目录(不索引任何项目)' });
+  }
   cmds.push({ args: ['--model-in', runMode === 'gpu' ? 'ollama' : 'local'], label: '设置运行模式' });
   return cmds;
 }
