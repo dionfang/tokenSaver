@@ -54,6 +54,13 @@ export function createWizardController(deps) {
 
   const machine = createWizard({
     dataDir: paths.dataDir,
+    // 现有配置的 roots(2026-11-16 用户需求:第 1 步自动载入当前 roots,可增删后重新接线)
+    readConfigRoots: () => {
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8'));
+        return Array.isArray(j.roots) ? j.roots.filter((r) => typeof r === 'string' && r) : [];
+      } catch { return []; }
+    },
     checkOllama: () => probeOllama(ollamaBase ? { base: ollamaBase } : {}),
     fetchManifest: async () => {
       const r = await fetchComponentsManifest(manifestUrl, { fetchText, clientVersion, pins });
@@ -164,6 +171,12 @@ export function createWizardController(deps) {
         return push(r);
       }
       case 'reset': return push({ wizard: machine.reset() });
+      // 2026-11-16:二次配置(换目录/换模式)——已完成过的向导重开时状态为 DONE,需重置回流程起点再载入现有配置
+      case 'reset-reload': {
+        machine.reset();
+        const st = await machine.load();
+        return push({ wizard: st });
+      }
       default: return { ok: false, error: 'unknown-action', message: `未知向导动作:${action}` };
     }
   }

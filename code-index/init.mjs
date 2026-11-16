@@ -60,7 +60,7 @@ import { spawnLogged } from './proc.mjs';
 const here = fs.realpathSync.native(path.dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 export const HOOK_TOOLS = ['cursor', 'zcode', 'qoder'];
-const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"  --model-in ollama|local  --hooks all|cursor|zcode|qoder。等号写法也认。';
+const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"(并入,可重复)  --set-roots "D:/a,D:/b"(整表替换,可重复;传空=清空)  --model-in ollama|local  --hooks all|cursor|zcode|qoder。等号写法也认。';
 
 /**
  * 从进程环境判断当前是哪个 agent。认不出返回 null。
@@ -103,19 +103,35 @@ export function parseInitArgs(argv) {
       name = token.slice(0, eq);
       value = token.slice(eq + 1);
     }
-    if (name !== '--roots' && name !== '--model-in' && name !== '--hooks') {
+    if (name !== '--roots' && name !== '--set-roots' && name !== '--model-in' && name !== '--hooks') {
       unknown.push(name);
       continue;
     }
     if (value === undefined) {
       const next = argv[i + 1];
-      if (!next || next.startsWith('--')) return { error: `${name} 需要取值。${INIT_USAGE}` };
-      value = next;
-      i++;
+      if (name === '--set-roots') {
+        // 2026-11-16(用户需求:向导二次运行换目录):--set-roots 允许空值(=清空所有 roots);
+        // 后随其他 -- 参数时视为空;否则取 next(可为空串)。
+        if (next === undefined || String(next).startsWith('--')) value = '';
+        else { value = next; i++; }
+      } else {
+        if (!next || next.startsWith('--')) return { error: `${name} 需要取值。${INIT_USAGE}` };
+        value = next;
+        i++;
+      }
     }
-    if (!String(value).trim()) return { error: `${name} 需要取值。${INIT_USAGE}` };
-    if (name === '--roots') out.roots = value;
-    else if (name === '--model-in') out.modelIn = value;
+    if (!String(value).trim() && name !== '--set-roots') return { error: `${name} 需要取值。${INIT_USAGE}` };
+    if (name === '--roots') {
+      // 可重复(逗号分隔亦可);合并语义(并入现有)
+      out.roots = [...(out.roots || []), ...splitRoots(value)];
+    } else if (name === '--set-roots') {
+      // 替换语义:最终 roots = 本次给出的集合(整表替换,可移除旧目录);可重复传多个路径;
+      // 任一次给空串 → 整体清空(语义:--set-roots "" = 不保留任何 root)
+      out.setRootsGiven = true;
+      const parts = splitRoots(value);
+      if (!parts.length) out.setRootsClear = true;
+      out.setRoots = [...(out.setRoots || []), ...parts];
+    } else if (name === '--model-in') out.modelIn = value;
     else {
       const v = String(value).trim().toLowerCase();
       if (v !== 'all' && !HOOK_TOOLS.includes(v)) {
@@ -128,7 +144,10 @@ export function parseInitArgs(argv) {
   if (out.modelIn && out.modelIn !== 'ollama' && out.modelIn !== 'local') {
     return { error: `--model-in 只能是 ollama 或 local,收到 ${out.modelIn}` };
   }
-  if (out.roots != null && !out.roots.split(',').map(s => s.trim()).filter(Boolean).length) {
+  if (out.roots != null && out.setRootsGiven) {
+    return { error: `--roots 与 --set-roots 不可同时使用(前者并入,后者整表替换)。${INIT_USAGE}` };
+  }
+  if (out.roots != null && !out.roots.length) {
     return { error: `--roots 需要至少一个路径。${INIT_USAGE}` };
   }
   return out;
@@ -385,6 +404,7 @@ if (parsedArgs.error) {
   process.exit(1);
 }
 const rootsArg = parsedArgs.roots;
+const setRootsArg = parsedArgs.setRootsGiven ? (parsedArgs.setRootsClear ? [] : (parsedArgs.setRoots || [])) : null;
 const modelInArg = parsedArgs.modelIn;
 log(`\n[1/5] 生成配置`);
 const configPath = path.join(DATA_DIR, 'code-index.config.json');
@@ -392,15 +412,15 @@ fs.mkdirSync(DATA_DIR, { recursive: true }); // 新项目首装:平行 data/ 目
 ok(`数据目录 ${DATA_DIR}`);
 const hostRoot = repoRoot.split(path.sep).join('/');
 const siblingOf = path.dirname(repoRoot);
-const takeExistingRoots = (raw) => {
-  const wanted = splitRoots(raw);
-  const present = [];
-  for (const r of wanted) {
-    if (fs.existsSync(r)) present.push(r);
-    else console.error(`  [warn] --roots 跳过不存在的路径: ${r}`);
-  }
-  return present;
-};
+  const takeExistingRoots = (list) => {
+    const wanted = Array.isArray(list) ? list : splitRoots(list);
+    const present = [];
+    for (const r of wanted) {
+      if (fs.existsSync(r)) present.push(r);
+      else console.error(`  [warn] roots 跳过不存在的路径: ${r}`);
+    }
+    return present;
+  };
 let roots;
 const configExisted = fs.existsSync(configPath);
 const chosenBackend = modelInArg || 'local';
@@ -414,7 +434,30 @@ if (configExisted) {
     dirty = true;
     ok(`knownAnnotations 已迁出 config → data/known-annotations.json(并入 ${annMig.migrated} 条,库内共 ${annMig.total ?? 0} 条)`);
   }
-  if (rootsArg) {
+  if (setRootsArg != null) {
+    // 替换语义(2026-11-16 用户需求:向导二次运行换目录/移除目录):最终 roots = 本次集合
+    const next = takeExistingRoots(setRootsArg);
+    if (setRootsArg.length && !next.length) {
+      console.error('[err] --set-roots 没有可用路径,未改配置');
+      process.exit(1);
+    }
+    roots = next;
+    if (JSON.stringify(roots) !== JSON.stringify(cfgOld.roots || [])) {
+      cfgOld.roots = roots;
+      // roots 变化 ⇒ 注解库整表重置(与 --roots 并入语义同源:旧注解只对原 roots 有效)
+      const prevAnn = loadKnownAnnotations();
+      const rolled = rollKnownAnnotations(prevAnn, true);
+      if (Object.keys(prevAnn).length) {
+        fs.writeFileSync(KNOWN_ANNOTATIONS_PATH, JSON.stringify(rolled, null, 2) + '\n');
+        ok(`roots 已变化,known-annotations.json 整表重置(${Object.keys(prevAnn).length} 条旧注解只对原 roots 有效)`);
+      }
+      dirty = true;
+      ok(`roots 已整表替换 = ${JSON.stringify(roots)}`);
+    } else {
+      roots = cfgOld.roots || [];
+      ok(`roots 未变化,known-annotations.json 增量保留 ${JSON.stringify(roots)}`);
+    }
+  } else if (rootsArg) {
     const added = takeExistingRoots(rootsArg);
     if (!added.length && !(cfgOld.roots || []).length) {
       console.error('[err] --roots 没有可用路径,未改配置');
@@ -476,7 +519,14 @@ if (configExisted) {
   }
   if (dirty) fs.writeFileSync(configPath, JSON.stringify(cfgOld, null, 2));
 } else {
-  if (rootsArg) {
+  if (setRootsArg != null) {
+    const next = takeExistingRoots(setRootsArg);
+    if (setRootsArg.length && !next.length) {
+      console.error('[err] --set-roots 没有可用路径,未写配置');
+      process.exit(1);
+    }
+    roots = next;
+  } else if (rootsArg) {
     roots = mergeRoots([], takeExistingRoots(rootsArg));
     if (!roots.length) {
       console.error('[err] --roots 没有可用路径,未写配置');

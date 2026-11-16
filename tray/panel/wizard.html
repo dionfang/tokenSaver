@@ -133,12 +133,14 @@ function nextGate(w) {
 function renderRoots(w) {
   const rows = (w.roots || []).map((r) =>
     `<li><span>${esc(r)}</span><button class="link" onclick="act('remove-root',{dir:${JSON.stringify(r).replace(/"/g, '&quot;')}})">移除</button></li>`).join('');
+  const n = (w.roots || []).length;
   $('body').innerHTML = `
     <div class="card">
       <b>要语义索引哪些目录?</b>
       <div class="row"><button onclick="act('pick-roots')">选择目录…</button><span class="sub">可反复添加,不设个数上限</span></div>
       <ul class="roots">${rows || '<li class="sub">尚未选择目录</li>'}</ul>
-      ${(w.roots || []).length === 0 ? '<div class="hint">未选目录:语义检索暂不可用,可稍后在托盘添加。不索引也可完成安装(只装工具与钩子)。</div>' : ''}
+      ${n ? `<div class="hint">已载入 ${n} 个目录(来自现有配置,可增删);点「下一步」后重新接线时将<b>整表替换</b>索引目录(移除即生效)。</div>` : ''}
+      ${n === 0 ? '<div class="hint">未选目录:语义检索暂不可用,可稍后在托盘添加。不索引也可完成安装(只装工具与钩子)。</div>' : ''}
     </div>`;
 }
 
@@ -234,6 +236,7 @@ function renderDone(w) {
         <span>${lamp(hooks.zcode)} ZCode 钩子</span><span>${lamp(hooks.cursor)} Cursor 钩子</span><span>${lamp(hooks.qoder)} Qoder 钩子</span>
       </div><div class="sub">钩子灯异常时可用托盘菜单「修复钩子」。若刚接入下载的 Node 运行时,已打开的 IDE 需重启后钩子生效。</div>` : ''}
       <div class="sub">托盘常驻后台;双击托盘图标可查看状态面板。</div>
+      <div class="row"><button onclick="act('reset-reload')">重新配置(换目录/换模式)</button><span class="sub">回到第 1 步,目录自动载入现有配置,可增删后重新接线</span></div>
     </div>`;
   const btn = $('btnNext'); btn.textContent = '完成'; btn.disabled = false;
   btn.onclick = () => window.close();

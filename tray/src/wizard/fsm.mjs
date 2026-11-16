@@ -54,7 +54,10 @@ export function isDownloadComplete(items, downloads) {
  *  roots=0 只跑 --model-in(A1:只装工具与钩子,不索引)。等号写法 init 也认,这里统一空格写法。 */
 export function initCommands({ roots = [], runMode }) {
   const cmds = [];
-  for (const r of roots) cmds.push({ args: ['--roots', r], label: `接线目录 ${r}` });
+  // 2026-11-16(用户需求:向导二次运行换目录):接线用 --set-roots 替换语义(整表替换,可移除旧目录);
+  // 逐目录各传一次(规避逗号路径陷阱,R4)。roots 为空=清空(传一次空值)。
+  if (roots.length) for (const r of roots) cmds.push({ args: ['--set-roots', r], label: `接线目录 ${r}` });
+  else cmds.push({ args: ['--set-roots', ''], label: '清空索引目录(不索引任何项目)' });
   cmds.push({ args: ['--model-in', runMode === 'gpu' ? 'ollama' : 'local'], label: '设置运行模式' });
   return cmds;
 }
@@ -79,6 +82,7 @@ export function createWizard(deps) {
     nodeQualified,          // () => ({ok:boolean, version?}) — PATH node ≥ MIN_NODE_MAJOR
     ensureNodeRuntime,      // async () => ({ok:boolean, error?}) — 下载 Node 后追加用户 PATH(HKCU 追加+广播)
     runInitCommand,         // async (cmd:{args,label}) => ({code, stdout, stderr, timedOut})
+    readConfigRoots,        // () => string[] — 现有配置里的 roots(第 1 步初值;2026-11-16)
   } = deps;
 
   const file = path.join(dataDir, STATE_FILE);
@@ -98,6 +102,14 @@ export function createWizard(deps) {
     try { j = JSON.parse(io.readFileSync(file, 'utf8')); } catch { j = null; }
     if (j?.status === 'done') j.status = 'DONE'; // 完成态文件小写 → 内部步骤名
     state = { ...blank(), ...(j || {}), items: Array.isArray(j?.items) ? j.items : null };
+    // 2026-11-16(用户需求:向导二次调用换目录/换模式):首次进入且状态里没有目录时,
+    // 自动载入「现有配置」的 roots(data/code-index.config.json),用户可在第 1 步增删后重新接线。
+    if (!state.roots?.length && readConfigRoots) {
+      try {
+        const cur = readConfigRoots();
+        if (Array.isArray(cur) && cur.length) { state.roots = cur.slice(); save(); }
+      } catch { /* 读不到配置则保持空(首次安装路径) */ }
+    }
     if (state.status !== 'DONE' && state.items && verifyDownloaded) {
       for (const it of state.items) {
         if (state.downloads?.[it.id]?.ok === true) {
