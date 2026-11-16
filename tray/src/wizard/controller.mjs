@@ -136,8 +136,8 @@ export function createWizardController(deps) {
         } catch { /* 服务不在听 → 三项显示未知(不判红,MODE 门禁已过) */ }
         for (const [label, name] of [['嵌入模型', EMB], ['精排模型', RRK], ['决策模型', DEC]]) {
           const ok = installed == null ? false : installed.includes(name);
-          checks.push({ id: `m-${name}`, label: `Ollama ${label} ${name}`, ok, hard: false,
-            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——首次检索/预热时自动拉取,或手动 ollama pull' });
+          checks.push({ id: `m-${name}`, label: `Ollama ${label} ${name}`, ok, hard: false, tag: name,
+            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——将自动 ollama pull(或手动执行)' });
         }
       } else {
         // strands 权重:目录名含前缀、文件名带档位后缀(model_<quant>.onnx,实测 model_q4f16.onnx),不走 hfWeightCached 的 org/name 分支
@@ -182,7 +182,53 @@ export function createWizardController(deps) {
   }
 
   /** 2026-11-16 用户裁决:不再代下载 Ollama 官方安装包——用户自行下载安装启动后点「重新检测」。
-   *  原分支①(代下官方安装包)整体移除;probe 短路逻辑保留在 MODE 步 UI 文案层(§17.2 口径修订)。 */
+   *  原分支①(代下官方安装包)整体移除;probe 短路逻辑保留在 MODE 步 UI 文案层(§17.2 口径修订)。
+   *  2026-11-16 新增(B2/M3 能力提前落自检页):gpu 模式检出模型未安装 → 自动 /api/pull 流式拉取(真百分比)。 */
+
+  /** 串行 pull 缺失模型:/api/pull NDJSON 流(status/completed/total→进度),失败继续下一个(单模型失败不阻断)。 */
+  async function pullModels(models) {
+    const base = ollamaBase || 'http://127.0.0.1:11434';
+    for (const name of models) {
+      envelope.installing = `pull:${name}`;
+      envelope.installLog.push(`[pull] ollama pull ${name}`);
+      sendState({ ...envelope });
+      try {
+        const resp = await fetch(`${base}/api/pull`, { method: 'POST', body: JSON.stringify({ model: name, stream: true }) });
+        if (!resp.ok || !resp.body) { envelope.installLog.push(`[fail] HTTP ${resp.status}`); continue; }
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = ''; let lastPct = -1; let okLine = false;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const j = JSON.parse(line);
+              if (j.error) { envelope.installLog.push(`[fail] ${name}: ${j.error}`); continue; }
+              if (j.total && j.completed != null) {
+                const pct = Math.floor((j.completed / j.total) * 100);
+                if (pct !== lastPct) { lastPct = pct; envelope.pullProgress = { model: name, pct }; envelope.installLog.push(`[pull] ${name} ${pct}%`); sendState({ ...envelope }); }
+              } else if (j.status) {
+                envelope.installLog.push(`[pull] ${name}: ${j.status}`);
+                if (j.status === 'success') okLine = true;
+                sendState({ ...envelope });
+              }
+            } catch { /* 半行,等下一段 */ }
+          }
+        }
+        envelope.installLog.push(okLine ? `[ok] ${name} 拉取完成` : `[fail] ${name} 拉取未确认成功`);
+      } catch (e) {
+        envelope.installLog.push(`[fail] ${name}: ${e?.message || e}`);
+      }
+    }
+    envelope.installing = null;
+    envelope.pullProgress = null;
+    await machine.runEnvChecks().catch(() => {}); // 重跑自检(tags 检测转绿)
+    sendState({ ...envelope });
+  }
 
   async function dispatch(action, payload = {}) {
     switch (action) {
@@ -210,11 +256,17 @@ export function createWizardController(deps) {
         sendState({ ...envelope });
         try {
           const r = await machine.runEnvChecks();
-          // 自检发现缺失软项且 node 就绪 → 自动激活安装(2026-11-16 用户需求:页面自动激活)
+          // 自检发现缺失软项 → 自动激活对应安装(2026-11-16 用户需求:页面自动激活)
           const env = r.state?.envChecks ?? [];
+          const nodeOk = env.some((c) => c.id === 'node' && c.ok === true);
+          // gpu 模式:缺模型 → 自动 /api/pull(不依赖 node,Ollama 服务已由 MODE 门禁保证)
+          const missingModels = env.filter((c) => c.tag && c.ok !== true).map((c) => c.tag);
+          if (!envelope.installing && mode === 'gpu' && missingModels.length) {
+            pullModels(missingModels); // 异步串行,进度经 sendState 推送
+            return push({ ok: true, message: `开始自动拉取 ${missingModels.length} 个 Ollama 模型` });
+          }
           const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
           const weightsBad = env.some((c) => c.id === 'weights' && c.ok !== true);
-          const nodeOk = env.some((c) => c.id === 'node' && c.ok === true);
           if (!envelope.installing && nodeOk && (depsBad || weightsBad)) {
             const id = depsBad ? 'deps' : 'weights';
             return startInstall(id,

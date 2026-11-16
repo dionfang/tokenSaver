@@ -203,8 +203,12 @@ function renderEnvCheck(w) {
       ${rows}
       ${hardBad.length ? `<div class="err">请先补齐硬性缺项:${esc(hardBad.map((c) => c.label).join(', '))}</div>` : ''}
       ${installing ? `
-      <div class="sub">正在自动安装:${installing === 'deps' ? '推理依赖(npm install)' : 'cpu 模式权重(HuggingFace → hf-cache)'}…</div>
-      <div class="bar stripes"><i style="width:100%"></i></div>
+      <div class="sub">${installing === 'pull' && S.pullProgress
+        ? `正在自动拉取 Ollama 模型:${esc(S.pullProgress.model)}(${S.pullProgress.pct}%)`
+        : installing === 'pull' ? '正在自动拉取 Ollama 模型…'
+        : installing === 'deps' ? '正在自动安装:推理依赖(npm install)…'
+        : '正在自动安装:cpu 模式权重(HuggingFace → hf-cache)…'}</div>
+      <div class="bar"><i class="${installing === 'pull' && S.pullProgress ? 'full' : ''}" style="width:${installing === 'pull' && S.pullProgress ? S.pullProgress.pct : 100}%"></i></div>
       <pre class="stderr" id="cmdlog">${log || '等待输出…'}</pre>` : ''}
       <div class="row"><button onclick="act('start-env-check')" ${installing ? 'disabled' : ''}>重新自检</button>${installing ? '<span class="sub">安装中,完成后自动重新自检</span>' : ''}</div>
       <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失自动 npm install,cpu 权重缺失自动下载到 hf-cache)。</div>
