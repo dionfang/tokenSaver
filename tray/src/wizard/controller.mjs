@@ -146,9 +146,14 @@ export function createWizardController(deps) {
           return fs.existsSync(path.join(paths.hfCacheDir ?? '', dir, `model_${quant}.onnx`))
             || fs.existsSync(path.join(paths.hfCacheDir ?? '', dir, 'model_quantized.onnx'));
         };
-        for (const [label, id] of [['嵌入权重', embId], ['精排权重', rrkId], ['决策权重', decId]]) {
+        // 2026-11-16 用户裁决:cpu 三行与 gpu 同格式显示具体模型名(本地 嵌入模型/精排模型/决策模型 <id>)
+        for (const [label, id, pretty] of [
+          ['嵌入模型', embId, embId],
+          ['精排模型', rrkId, rrkId],
+          ['决策模型', decId, `strands-${(decId.split(':')[1] || '').replace(/^strands-/, '')}(${decId.split(':')[2] || 'quantized'})`],
+        ]) {
           const ok = cached(id);
-          checks.push({ id: `w-${label}`, label: `本地权重 ${label}`, ok, hard: false,
+          checks.push({ id: `w-${label}`, label: `本地${label} ${pretty}`, ok, hard: false,
             hint: ok ? '已缓存(hf-cache)' : '未缓存——首次使用时自动下载(HuggingFace)' });
         }
       }
