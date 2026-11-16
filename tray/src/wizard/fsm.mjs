@@ -1,6 +1,6 @@
 /**
  * 首次安装向导状态机(tray 方案 §16.4/§18-A1/B1/D1/E4,2026-11-15 M2;**2026-11-16 拍板 B:撤清单下载**):
- * 六态 INIT→ROOTS→MODE→CONSENT→ENVCHECK→INIT_RUN→DONE,断点持久化 data/tray-wizard-state.json,
+ * 六态 INIT→ROOTS→MODE→ENVCHECK→CONSENT→INIT_RUN→DONE(2026-11-16 用户裁决:自检在数据上传前),断点持久化 data/tray-wizard-state.json,
  * 任意非 DONE 态退出下次续跑。守卫全内联拍板口径:
  *   ROOTS→MODE      目录数不限(0=只装工具与钩子不索引,A1)
  *   MODE→CONSENT    选过 cpu|gpu;gpu 须 Ollama 服务在听(§17.2 硬门禁,未就绪禁用下一步)
@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { writeConsent } from '../consent.mjs';
 
-export const STEP_ORDER = ['INIT', 'ROOTS', 'MODE', 'CONSENT', 'ENVCHECK', 'INIT_RUN', 'DONE'];
+export const STEP_ORDER = ['INIT', 'ROOTS', 'MODE', 'ENVCHECK', 'CONSENT', 'INIT_RUN', 'DONE'];
 export const STATE_FILE = 'tray-wizard-state.json';
 export const MIN_NODE_MAJOR = 20;
 
@@ -131,17 +131,18 @@ export function createWizard(deps) {
 
   function goto(step) { state.status = step; state.lastError = null; save(); return { ok: true, state: getState() }; }
 
-  /** 前进一步(守卫拦截);ENVCHECK 进入后 UI 调 start-env-check;INIT_RUN 不经 next 完成。 */
+  /** 前进一步(守卫拦截);ENVCHECK 进入后 UI 调 start-env-check;INIT_RUN 不经 next 完成。
+   *  2026-11-16 用户裁决:ENVCHECK 移到 CONSENT 之前(先确认环境能装,再谈数据上传)。 */
   function next() {
     const s = state.status;
     if (s === 'INIT') return goto('ROOTS');
     if (s === 'ROOTS') { const g = canLeaveRoots(); return g.ok ? goto('MODE') : { ok: false, ...g }; }
-    if (s === 'MODE') { const g = canLeaveMode(state); return g.ok ? goto('CONSENT') : { ok: false, ...g }; }
-    if (s === 'CONSENT') { const g = canLeaveConsent(); return g.ok ? goto('ENVCHECK') : { ok: false, ...g }; }
+    if (s === 'MODE') { const g = canLeaveMode(state); return g.ok ? goto('ENVCHECK') : { ok: false, ...g }; }
     if (s === 'ENVCHECK') {
       const g = isEnvReady(state.envChecks);
-      return g.ok ? goto('INIT_RUN') : { ok: false, ...g };
+      return g.ok ? goto('CONSENT') : { ok: false, ...g };
     }
+    if (s === 'CONSENT') { const g = canLeaveConsent(); return g.ok ? goto('INIT_RUN') : { ok: false, ...g }; }
     if (s === 'INIT_RUN') return { ok: false, reason: 'init-not-run', message: '请先执行安装接线(init)' };
     return { ok: false, reason: 'already-done', message: '向导已完成' };
   }
