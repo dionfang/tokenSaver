@@ -278,12 +278,13 @@ export function createWizardController(deps) {
       case 'recheck-ollama': { const r = await machine.recheckOllama(); envelope.ollamaVersion = r.version ?? null; return push(r); }
       case 'set-consent': return push(machine.setConsent(payload.checked === true));
       case 'start-env-check': {
-        // 2026-11-16 拍板 B:环境自检替代清单下载;进行中重复调用静默跳过(fsm 层 in-flight)
-        if (envelope.checking) return push();
+        // 2026-11-16 拍板 B:环境自检替代清单下载;进行中重复调用给可见反馈(不再静默吞——用户实测「没反应」)
+        if (envelope.checking) { sendState({ ...envelope }); return push({ ok: false, reason: 'in-flight', message: '自检进行中,请稍候…' }); }
         envelope.checking = true;
-        sendState({ ...envelope });
+        sendState({ ...envelope }); // 立即推 checking 态(渲染层按钮禁用+「检测中…」)
         try {
-          return await refreshEnvChecks();
+          const r = await refreshEnvChecks();
+          return push(r);
         } finally {
           envelope.checking = false;
           sendState({ ...envelope });

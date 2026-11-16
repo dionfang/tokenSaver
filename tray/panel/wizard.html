@@ -91,6 +91,8 @@ window.trayWizard.onState((st) => {
   S.ollamaSetup = st ? st.ollamaSetup : null;
   S.installing = st ? st.installing : null;      // 软项自动安装(2026-11-16):deps/weights
   S.installLog = st ? st.installLog : null;     // CMD 滚动日志(尾部)
+  S.checking = st ? st.checking : null;         // 自检进行中(2026-11-16):按钮禁用+检测中反馈
+  S.pullProgress = st ? st.pullProgress : null; // pull 真百分比
   S.downloading = !!(st && st.downloading);
   render();
 });
@@ -110,8 +112,9 @@ function render() {
   $('btnBack').style.visibility = w.status === 'DONE' ? 'hidden' : 'visible';
   const gate = nextGate(w);
   // 2026-11-15 修复:load 推送到达前按钮禁用(S.w=null 时点击会被旧逻辑静默吞掉——加载竞态)
-  $('btnNext').disabled = !!S.installing || !S.w || !gate.ok; // 2026-11-16:安装/拉取进行中一律禁下一步(完成自检刷新后自动放行)
-  const rc = $('btnRecheck'); if (rc) { rc.style.display = w.status === 'ENVCHECK' ? '' : 'none'; rc.disabled = !!S.installing; } // 重新自检仅 ENVCHECK 步显示于导航
+  $('btnNext').disabled = !!S.installing || !!S.checking || !S.w || !gate.ok; // 2026-11-16:安装/拉取/自检进行中一律禁下一步
+  $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (S.checking ? '检测中…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步'))));
+  const rc = $('btnRecheck'); if (rc) { rc.style.display = w.status === 'ENVCHECK' ? '' : 'none'; rc.disabled = !!S.installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; } // 重新自检仅 ENVCHECK 步显示于导航
   $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步')));
   if (w.status === 'INIT') {
     $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 数据上传同意 → 环境自检 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
@@ -221,11 +224,11 @@ function renderEnvCheck(w) {
       ${installing ? '<div class="sub">安装中,完成后自动重新自检</div>' : ''}
       <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失自动 npm install,cpu 权重缺失自动下载到 hf-cache)。</div>
     </div>`;
-  // 2026-11-16 用户裁决:「重新自检」挪到底部导航(上一步|重新自检|下一步),安装中禁用
+  // 2026-11-16 用户裁决:「重新自检」挪到底部导航(上一步|重新自检|下一步);checking/installing 均禁用
   const rc = $('btnRecheck');
-  if (rc) { rc.style.display = ''; rc.disabled = !!installing; }
+  if (rc) { rc.style.display = ''; rc.disabled = !!installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; }
   const cl = $('cmdlog'); if (cl) cl.scrollTop = cl.scrollHeight;
-  const btn = $('btnNext'); if (btn) { btn.textContent = checks.length ? '下一步' : '检测中…'; }
+  // renderEnvCheck 局部不再覆盖按钮(统一走 render() 的 checking/installing 状态,防文案打架)
   // 进入本步自动跑一次自检(结果到达后 onState 重渲染;S.envChecking 本地标志防重入)
   if (!checks.length && !S.envChecking) { S.envChecking = true; act('start-env-check').finally(() => { S.envChecking = false; }); }
 }

@@ -118,11 +118,10 @@ export function createWizard(deps) {
         if (Array.isArray(cur) && cur.length) { state.roots = cur.slice(); save(); }
       } catch { /* 读不到配置则保持空(首次安装路径) */ }
     }
-    if (state.status !== 'DONE' && state.envChecks && envProbe) {
-      // 自检结果也随时间漂移(node 装了/权重下完):重入时复检一次
-      const fresh = await envProbe();
-      state.envChecks = fresh.checks ?? fresh;
-      save();
+    if (state.status !== 'DONE' && state.envChecks) {
+      // 2026-11-16 修复:删掉此处的内部 envProbe 复检——controller 的 load case 统一走
+      // refreshEnvChecks(持锁+自动激活)。此前 load 内 probe(不持 checking 锁)与 runEnvChecks
+      // 并发竞态,双跑 5-10s 是「卡在检测中」与「重新自检没反应」的主因。
     }
     return getState();
   }
