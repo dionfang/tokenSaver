@@ -136,8 +136,9 @@ export function createWizardController(deps) {
         } catch { /* 服务不在听 → 三项显示未知(不判红,MODE 门禁已过) */ }
         for (const [label, name] of [['嵌入模型', EMB], ['精排模型', RRK], ['决策模型', DEC]]) {
           const ok = installed == null ? false : installed.includes(name);
-          checks.push({ id: `m-${name}`, label: `Ollama ${label} ${name}`, ok, hard: false, tag: name,
-            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——将自动 ollama pull(或手动执行)' });
+          // 2026-11-16 用户裁决:gpu 三模型行收紧为硬项——自动 pull 有出路(拉完自动放行),缺模型不放行
+          checks.push({ id: `m-${name}`, label: `Ollama ${label} ${name}`, ok, hard: true, tag: name,
+            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——正在自动 ollama pull(或手动执行)' });
         }
       } else {
         // strands 权重:目录名含前缀、文件名带档位后缀(model_<quant>.onnx,实测 model_q4f16.onnx),不走 hfWeightCached 的 org/name 分支
