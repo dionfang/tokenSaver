@@ -97,9 +97,12 @@ export function createWizardController(deps) {
     dataDir: paths.dataDir,
     // 现有配置的 roots(2026-11-16 用户需求:第 1 步自动载入当前 roots,可增删后重新接线)
     readConfigRoots: () => {
+      // 2026-11-16:返回数组但附带 modelIn(Array 是数组,附加属性仅在同源对象上可读;fsm 侧 cur.modelIn)
       try {
         const j = JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8'));
-        return Array.isArray(j.roots) ? j.roots.filter((r) => typeof r === 'string' && r) : [];
+        const arr = Array.isArray(j.roots) ? j.roots.filter((r) => typeof r === 'string' && r) : [];
+        arr.modelIn = typeof j.modelIn === 'string' ? j.modelIn : null;
+        return arr;
       } catch { return []; }
     },
     checkOllama: () => probeOllama(ollamaBase ? { base: ollamaBase } : {}),

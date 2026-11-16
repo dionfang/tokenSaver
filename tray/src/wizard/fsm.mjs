@@ -92,7 +92,8 @@ export function createWizard(deps) {
   } = deps;
 
   const file = path.join(dataDir, STATE_FILE);
-  const blank = () => ({ status: 'INIT', roots: [], runMode: null, consent: null, ollamaReady: null, ollamaCheckedAt: null, envChecks: null, initLog: [], lastError: null, savedAt: null, doneAt: null });
+  // 2026-11-16 用户裁决:运行模式默认选中 cpu模型(runMode 初值 null→'cpu';重开向导有 config 时以 config.modelIn 为准)
+  const blank = () => ({ status: 'INIT', roots: [], runMode: 'cpu', consent: null, ollamaReady: null, ollamaCheckedAt: null, envChecks: null, initLog: [], lastError: null, savedAt: null, doneAt: null });
   let state = blank();
 
   function save() {
@@ -123,6 +124,9 @@ export function createWizard(deps) {
       try {
         const cur = readConfigRoots();
         if (Array.isArray(cur) && cur.length) { state.roots = [...new Set(cur)]; save(); }
+        // 2026-11-16:已装过时运行模式同样以 config 为准(cpu/ollama → 内部 cpu/gpu)
+        const cfgMode = cur && cur.modelIn;
+        if (cfgMode === 'local' || cfgMode === 'ollama') { state.runMode = cfgMode === 'local' ? 'cpu' : 'gpu'; save(); }
       } catch { /* 读不到配置则保持现有(首次安装路径) */ }
     }
     if (state.status !== 'DONE' && state.envChecks) {
