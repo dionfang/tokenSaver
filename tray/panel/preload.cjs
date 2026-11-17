@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld('trayPanel', {
   updateBase: () => ipcRenderer.invoke('tray:update-base'),
   setConsent: (on) => ipcRenderer.invoke('tray:set-consent', on === true),
   onBaseEvent: (cb) => ipcRenderer.on('tray:base-update', (_e, ev) => cb(ev)),
+  // M5(2026-11-17):T6 上传本地向量(已签条目/信封/分片/回执游标)
+  uploadKnn: () => ipcRenderer.invoke('tray:upload-knn'),
+  onUploadEvent: (cb) => ipcRenderer.on('tray:upload-event', (_e, ev) => cb(ev)),
 });
 
 contextBridge.exposeInMainWorld('trayRoots', {

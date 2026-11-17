@@ -16,6 +16,7 @@ import { resolvePaths, hfWeightCached } from './util/paths.mjs';
 import { modelTooltip } from './util/lamps.mjs';
 import { createWizardController } from './wizard/controller.mjs';
 import { createUpdateBase } from './updateBase.mjs';
+import { createUploadKnn } from './uploadKnn.mjs';
 import { createDownloader, httpRequest } from './downloader.mjs';
 import { readConsent, writeConsent, t4Allowed } from './consent.mjs';
 
@@ -296,6 +297,30 @@ async function runUpdateBase(fromMenu) {
   }
   return r;
 }
+// ---------- T6 上传本地向量(M5,§5.6/§19.6):面板入口,进度/回执经 tray:upload-event 推面板 ----------
+let uploadKnn = null;
+function pushUpload(ev) { if (panel && !panel.isDestroyed()) panel.webContents.send('tray:upload-event', ev); }
+function getUploadKnn() {
+  if (uploadKnn) return uploadKnn;
+  uploadKnn = createUploadKnn({
+    paths: ctx.paths,
+    cmdRun: runner.run.bind(runner),
+    readState: readTrayState,
+    writeState: writeTrayState,
+    onEvent: pushUpload,
+  });
+  return uploadKnn;
+}
+async function runUploadKnn(fromMenu) {
+  const r = await getUploadKnn().run();
+  pushUpload({ phase: 'result', ...r });
+  if (fromMenu) {
+    if (['updated', 'nothing-new', 'consent-required', 'busy'].includes(r.outcome)) dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
+    else dialog.showErrorBox('上传本地向量', r.message || r.outcome);
+  }
+  return r;
+}
+
 /** 同意开关(D5 撤回/补同意解锁 T4):写 consent 文件→重建菜单(门禁联动)→推面板→快刷快照。 */
 function setConsent(on) {
   const dataDir = ctx.paths?.dataDir;
@@ -317,6 +342,7 @@ function buildMenu() {
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
     { label: '更新公共决策包', enabled: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
+    { label: '上传本地向量', enabled: t4Allowed(ctx.consent), click: () => { openPanel(); runUploadKnn(true); } },
     { label: `上传本地向量(互惠)    ${t4Allowed(ctx.consent) ? '━●' : '○━'}`, click: () => { setConsent(!t4Allowed(ctx.consent)); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
@@ -437,6 +463,10 @@ if (!gotLock) {
     });
     ipcMain.handle('tray:update-base', async () => {
       try { return await runUpdateBase(false); }
+      catch (e) { return { ok: false, outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
+    });
+    ipcMain.handle('tray:upload-knn', async () => {
+      try { return await runUploadKnn(false); }
       catch (e) { return { ok: false, outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
     });
     ipcMain.handle('tray:set-consent', (_e, on) => {
