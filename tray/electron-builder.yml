@@ -49,4 +49,8 @@ nsis:
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
   include: build/installer.nsh
+  # 2026-11-17 用户裁决:安装完成前不启动托盘——结束页不自动运行(runAfterFinish 默认 true 会让
+  # 托盘从安装器进程立即拉起,继承不到刚广播的用户级 env → 数据落点分裂/向导回初始态的诱因之一)。
+  # 装完后由用户从开始菜单/桌面快捷方式手动启动(新进程继承 env)。
+  runAfterFinish: false
 artifactName: TokenSaver-Setup-${version}.${ext}
