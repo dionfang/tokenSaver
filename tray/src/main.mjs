@@ -288,9 +288,11 @@ function getBaseUpdater() {
   return baseUpdater;
 }
 async function runUpdateBase(fromMenu) {
-  const r = await getBaseUpdater().run();
+  let r;
+  try { r = await getBaseUpdater().run(); }
+  catch (e) { r = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; } // 菜单路径兜底:意外异常不再裸抛(未处理 rejection)
   pushBase({ phase: 'result', ...r });
-  if (r.outcome === 'updated' || r.outcome === 'already-latest') await poller?.slowRefresh('update-base');
+  if (r.outcome === 'updated' || r.outcome === 'already-latest') await poller?.slowRefresh('update-base').catch(() => {});
   if (fromMenu) {
     if (r.outcome === 'updated' || r.outcome === 'already-latest' || r.outcome === 'consent-required' || r.outcome === 'busy') dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
     else dialog.showErrorBox('更新公共决策包', r.message || r.outcome);
@@ -312,8 +314,11 @@ function getUploadKnn() {
   return uploadKnn;
 }
 async function runUploadKnn(fromMenu) {
-  const r = await getUploadKnn().run();
+  let r;
+  try { r = await getUploadKnn().run(); }
+  catch (e) { r = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; } // 菜单路径兜底:意外异常不再裸抛
   pushUpload({ phase: 'result', ...r });
+  if (r.outcome === 'updated') await poller?.slowRefresh('upload-knn').catch(() => {});
   if (fromMenu) {
     if (['updated', 'nothing-new', 'consent-required', 'busy'].includes(r.outcome)) dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
     else dialog.showErrorBox('上传本地向量', r.message || r.outcome);

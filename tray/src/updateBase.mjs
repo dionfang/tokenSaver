@@ -32,14 +32,16 @@ export function createUpdateBase(deps = {}) {
   let busy = false;
   const emit = (phase, extra = {}) => { try { onEvent({ phase, ...extra }); } catch { /* 回调异常不影响编排 */ } };
 
-  /** 清过期 .part(§16.3);目录不存在/不可读静默跳过。 */
+  /** 清过期临时件(§16.3):>7 天的 .part 与 basepack-*.json(下载成功但导入失败的遗留包);
+   *  目录不存在/不可读静默跳过。 */
   function cleanOldParts(tmpDir) {
     let names = [];
     try { names = io.readdirSync(tmpDir); } catch { return; }
+    const tryUnlink = (q) => { try { if (now() - io.statSync(q).mtimeMs > PART_MAX_AGE_MS) io.unlinkSync(q); } catch { /* 尽力 */ } };
     for (const f of names) {
-      if (!f.endsWith('.part')) continue;
-      const p = path.join(tmpDir, f);
-      try { if (now() - io.statSync(p).mtimeMs > PART_MAX_AGE_MS) io.unlinkSync(p); } catch { /* 尽力 */ }
+      if (!f.endsWith('.part') && !/^basepack-.*\.json$/.test(f)) continue;
+      tryUnlink(path.join(tmpDir, f));
+      tryUnlink(path.join(tmpDir, f + '.part')); // 下载中断遗留的 .json.part 同窗清理
     }
   }
 

@@ -9,6 +9,7 @@
  * 纯函数 pullMissing 依赖注入 fetchFn/onLine,可单测(假 http 源);不 import tray/**。
  */
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, decisionLocalWanted } from './config.mjs';
 import { resolveBase, sameOllamaName } from './ollamaGuard.mjs';
 
@@ -64,7 +65,8 @@ export async function pullMissing({ models, base = resolveBase(), fetchFn = fetc
   return { ok: results.every((r) => r.status !== 'failed'), results };
 }
 
-const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+// S14-P3:fileURLToPath 自带解码——pathname 手法遇空格/中文安装路径恒 false → CLI 静默 no-op(exit 0 无输出)
+const directRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (directRun) {
   const cfg = loadConfig();
   const models = process.argv.slice(2).length ? process.argv.slice(2)

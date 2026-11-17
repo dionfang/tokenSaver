@@ -273,6 +273,13 @@ export function createWizardController(deps) {
 
   /** 全在线权重下载(串行模型×文件;进度经 downloader onProgress → envelope.progress)。 */
   async function startWeightsOnline(models) {
+    if (!paths?.hfCacheDir) { // degraded paths:baseDir=null 会让 downloader safeDest 抛 TypeError(fire-and-forget 无人接)
+      envelope.installLog.push('[fail] 无法定位 hf-cache 目录(paths.mjs 无响应),权重下载跳过');
+      sendState({ ...envelope });
+      await machine.runEnvChecks().catch(() => {});
+      sendState({ ...envelope });
+      return { ok: false };
+    }
     envelope.installing = 'weights-online';
     envelope.installLog = [];
     sendState({ ...envelope });

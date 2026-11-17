@@ -3,7 +3,8 @@
  * 同意门禁 → 钉扎自检(pinFacts 微 CLI + pinlock) → 只取已签条目(rule 前缀 ensemble:=四票合议代签;
  * 行为形态/词法弱标签不上传,置信闸前移 §19.5-2) → 游标过滤(accepted/rejected 均不重传) →
  * 分片(≤2000 条且明文≤8MB) → gzip+AES-256-GCM+RSA-OAEP(sha256) 信封 → 逐片 POST → 回执游标推进。
- * 加密口径与 TSServer src/lib/receive.mjs sealEnvelope 逐字段同口径(iv12/tag16/oaepHash sha256)。
+ * 回执语义在 body.code(code=6 随 HTTP 500,仍解析回执);code9 与 code5+retryAfterSec(全局 QPS 瞬时限流)
+ * 重试≤3 次,永久配额(code5 且 retryAfterSec=null)不重试。加密口径与 TSServer src/lib/receive.mjs sealEnvelope 逐字段同口径(iv12/tag16/oaepHash sha256)。
  * 零 electron、零 code-index import(§18-E1):事实走 spawn 微 CLI,路径经 util/lamps 镜像单源。
  */
 import crypto from 'node:crypto';
@@ -61,19 +62,22 @@ export function selectUploadEntries(vectors, cursor = {}) {
   return out;
 }
 
-/** 分片(纯):≤2000 条且 gzip 前明文≤8MB(贪心累加 JSON 字节)。 */
+/** 分片(纯):≤2000 条且 gzip 前明文≤8MB(贪心累加 JSON 字节)。单条超过明文上限的直接丢弃
+ *  (无法分片装下;硬上传必被服务端拒收并阻断全片,丢弃不影响其余条目)。返回 {chunks,dropped}。 */
 export function chunkEntries(entries, { maxEntries = MAX_ENTRIES_PER_PART, maxPlainBytes = MAX_PLAIN_BYTES } = {}) {
   const chunks = [];
   let cur = [];
   let bytes = 16; // {"entries":[]} 骨架
+  let dropped = 0;
   for (const e of entries) {
     const add = Buffer.byteLength(JSON.stringify(e)) + 1;
+    if (add > maxPlainBytes - 1024) { dropped += 1; continue; } // 单条超限:丢弃不阻断其余
     if (cur.length && (cur.length >= maxEntries || bytes + add > maxPlainBytes)) { chunks.push(cur); cur = []; bytes = 16; }
     cur.push(e);
     bytes += add;
   }
   if (cur.length) chunks.push(cur);
-  return chunks;
+  return { chunks, dropped };
 }
 
 export function createUploadKnn(deps = {}) {
@@ -99,8 +103,10 @@ export function createUploadKnn(deps = {}) {
     let txt = '';
     res.setEncoding('utf8');
     for await (const c of res) txt += c;
-    if (status !== 200) throw new Error(`HTTP ${status}`);
-    return JSON.parse(txt);
+    let receipt = null;
+    try { receipt = JSON.parse(txt); } catch { /* 非 JSON 体 */ }
+    if (receipt && Number.isFinite(receipt.code)) return receipt; // 语义在 body.code:code6 随 HTTP 500,不得按状态丢回执
+    throw new Error(`HTTP ${status}`);
   });
 
   async function run() {
@@ -130,7 +136,8 @@ export function createUploadKnn(deps = {}) {
       const cursor = state.uploadCursor || { accepted: [], rejected: [] };
       const entries = selectUploadEntries(doc.vectors, cursor);
       if (!entries.length) return { outcome: 'nothing-new', message: '无新增已签条目可上传(已签/已拒收键均不重传)' };
-      const chunks = chunkEntries(entries);
+      const { chunks, dropped } = chunkEntries(entries);
+      if (!chunks.length) return { outcome: 'nothing-sendable', message: '待传条目全部单条超限被丢弃,无法上传' };
       const uploadId = state.uploadId || crypto.randomUUID();
       writeState({ uploadId });
       let accepted = 0, rejected = 0, duplicate = 0;
@@ -149,13 +156,16 @@ export function createUploadKnn(deps = {}) {
         let receipt = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
           try { receipt = await post(url, env); } catch (e) { return { outcome: 'upload-failed', message: `上传网络失败:${String(e?.message || e).slice(-160)}`, part: i + 1 }; }
-          if (receipt?.code === 9 && attempt < 3) { await sleep(Math.min(30, Number(receipt.retryAfterSec) || 2) * 1000); continue; }
+          // code9=并发锁可重试;code5+retryAfterSec=全局 QPS 瞬时限流(永久配额 retryAfterSec=null,不重试)
+          const retryable = receipt?.code === 9 || (receipt?.code === 5 && receipt?.retryAfterSec != null);
+          if (retryable && attempt < 3) { await sleep(Math.min(30, Number(receipt.retryAfterSec) || 2) * 1000); continue; }
           break;
         }
         const code = Number(receipt?.code);
         if (code !== 0) {
           const map = { 1: 'rejected', 2: 'version-mismatch', 3: 'rejected', 4: 'rejected', 5: 'quota', 6: 'server-error', 9: 'retryable-exhausted' };
-          return { outcome: map[code] || 'rejected', message: `服务端拒收(code=${code}):${receipt?.message || ''}`, part: i + 1, code };
+          const outcome = code === 5 && receipt?.retryAfterSec != null ? 'retryable-exhausted' : (map[code] || 'rejected');
+          return { outcome, message: `服务端拒收(code=${code}):${receipt?.message || ''}`, part: i + 1, code };
         }
         accepted += Number(receipt.accepted) || 0;
         rejected += Number(receipt.rejected) || 0;
@@ -166,7 +176,7 @@ export function createUploadKnn(deps = {}) {
         writeState({ uploadCursor: { accepted: [...(cursor.accepted || []), ...newAccepted], rejected: [...(cursor.rejected || []), ...newRejected] } });
       }
       emit('done', { message: `上传完成:${accepted} 条接收` });
-      return { outcome: 'updated', message: `上传完成:${accepted} 条接收,${duplicate} 条重复,${rejected} 条拒收(${chunks.length} 片)`, accepted, rejected, duplicate, parts: chunks.length };
+      return { outcome: 'updated', message: `上传完成:${accepted} 条接收,${duplicate} 条重复,${rejected} 条拒收(${chunks.length} 片${dropped ? `,单条超限丢弃 ${dropped} 条` : ''})`, accepted, rejected, duplicate, parts: chunks.length, dropped };
     } finally {
       busy = false;
     }
