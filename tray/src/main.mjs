@@ -123,7 +123,7 @@ function openWizard() {
   if (!ctx.paths?.dataDir) { dialog.showErrorBox('安装向导', '无法定位 code-index 数据目录(paths.mjs 无响应),暂无法运行向导'); return; }
   wizardWin = new BrowserWindow({
     title: 'TokenSaver 安装向导',
-    width: 640, height: 720, resizable: false, maximizable: false, fullscreenable: false, show: false,
+    width: 640, height: 560, resizable: false, maximizable: false, fullscreenable: false, show: false, // 2026-11-17 用户裁决:降高度,中间信息框固定高+内滚,按钮位置恒定
     autoHideMenuBar: true,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });

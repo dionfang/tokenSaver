@@ -193,6 +193,7 @@ export function createWizardController(deps) {
   async function pullModels(models) {
     const base = ollamaBase || 'http://127.0.0.1:11434';
     for (const name of models) {
+      if (envelope.installLog.length > 200) envelope.installLog = envelope.installLog.slice(-100); // 2026-11-17 审查:pull 日志封顶(防长拉取无限增长)
       envelope.installing = `pull:${name}`;
       envelope.installLog.push(`[pull] ollama pull ${name}`);
       sendState({ ...envelope });
@@ -255,7 +256,8 @@ export function createWizardController(deps) {
       return { ...r, ok: true, message: `开始自动拉取 ${missingModels.length} 个 Ollama 模型` };
     }
     const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
-    const weightsBad = env.some((c) => c.id === 'weights' && c.ok !== true);
+    // 2026-11-17 审查修复:权重行 id 已改 w-*(嵌入/精排/决策),旧匹配 id==='weights' 恒 false→cpu 缺权重不再自动装
+    const weightsBad = env.some((c) => String(c.id).startsWith('w-') && c.ok !== true);
     if (!envelope.installing && nodeOk && (depsBad || weightsBad)) {
       const id = depsBad ? 'deps' : 'weights';
       startInstall(id,

@@ -8,14 +8,17 @@
 <style>
   :root { --line: #d8d8d8; --ok: #1a7f37; --warn: #b58900; --err: #c0392b; }
   * { box-sizing: border-box; }
-  body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; margin: 0; padding: 14px 18px 18px; color: #222; overflow: hidden; }
+  html, body { height: 100%; }
+  body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; margin: 0; padding: 14px 18px 12px; color: #222; overflow: hidden; display: flex; flex-direction: column; }
   h1 { font-size: 16px; margin: 0 0 4px; }
   .sub { color: #666; font-size: 12px; margin-bottom: 10px; }
-  .steps { display: flex; gap: 6px; margin-bottom: 12px; }
+  .steps { display: flex; gap: 6px; margin-bottom: 10px; flex: none; }
   .steps span { flex: 1; text-align: center; padding: 4px 0; border-bottom: 3px solid #eee; color: #999; font-size: 12px; }
   .steps span.on { border-color: #2f6fdf; color: #2f6fdf; font-weight: bold; }
   .steps span.done { border-color: var(--ok); color: var(--ok); }
   .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  /* 2026-11-17 用户裁决:中间信息框固定高度(不随内容撑高),内容超出内部滚动,底部按钮位置恒定 */
+  #body { flex: 1; min-height: 0; overflow-y: auto; }
   .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
   button { padding: 6px 16px; border: 1px solid #bbb; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
   button.primary { background: #2f6fdf; border-color: #2f6fdf; color: #fff; }
@@ -31,15 +34,16 @@
   label.mode input { margin-right: 8px; }
   .bar { height: 14px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: #f6f6f6; }
   .bar > i { display: block; height: 100%; background: #2f6fdf; width: 0; transition: width .2s; }
+  .bar > i.full { background: var(--ok); }
+  .stage { font-size: 12px; color: #555; margin-top: 6px; min-height: 19px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .item { margin: 8px 0; }
   .item .meta { display: flex; justify-content: space-between; font-size: 12px; color: #555; }
   .disc { font-size: 12px; color: #555; background: #f8f8f8; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
   .disc b { color: #333; }
   pre.stderr { background: #2d2d2d; color: #f66; padding: 8px; border-radius: 6px; max-height: 110px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
-  pre.cmdlog { background: #0d1117; color: #9fd49f; padding: 8px; border-radius: 6px; max-height: 150px; overflow-y: auto; font-size: 11px; white-space: pre-wrap; font-family: Consolas, monospace; }
   .bar.stripes > i { background: repeating-linear-gradient(45deg, #58a6ff, #58a6ff 8px, #79b8ff 8px, #79b8ff 16px); animation: slide 1s linear infinite; background-size: 32px 100%; }
   @keyframes slide { from { background-position: 0 0; } to { background-position: 32px 0; } }
-  .nav { display: flex; justify-content: space-between; margin-top: 6px; }
+  .nav { display: flex; justify-content: space-between; margin-top: 8px; flex: none; }
 </style>
 </head>
 <body>
@@ -118,13 +122,14 @@ function render() {
   $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (S.checking ? '检测中…' : (initRunning ? '正在接线…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步')))));
   const rc = $('btnRecheck'); if (rc) { rc.style.display = w.status === 'ENVCHECK' ? '' : 'none'; rc.disabled = !!S.installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; } // 重新自检仅 ENVCHECK 步显示于导航
   if (w.status === 'INIT') {
-    $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 数据上传同意 → 环境自检 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
+    $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 环境自检(缺项自动安装/拉取) → 数据上传同意 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
     return;
   }
+  // 分支顺序与 STEPS 一致(2026-11-17 审查整理,防误导)
   if (w.status === 'ROOTS') renderRoots(w);
   else if (w.status === 'MODE') renderMode(w);
-  else if (w.status === 'CONSENT') renderConsent(w);
   else if (w.status === 'ENVCHECK') renderEnvCheck(w);
+  else if (w.status === 'CONSENT') renderConsent(w);
   else if (w.status === 'INIT_RUN') renderInitRun(w);
   else if (w.status === 'DONE') renderDone(w);
 }
@@ -202,36 +207,37 @@ function renderEnvCheck(w) {
       <span class="${c.ok ? 'ok' : (c.hard ? 'err' : 'sub')}">${c.ok ? '✔' : (c.hard ? '✘' : '待补')}${c.hint ? ' — ' + esc(c.hint) : ''}</span>
     </div></div>`).join('') : '<div class="sub">正在检测环境…</div>';
   const installing = S.installing;
-  const log = (S.installLog || []).slice(-30).map(esc).join('\n');
+  // 2026-11-17 用户裁决:不再显示 CMD 滚动文字——进度条 + 条下一行动态文字说明当前在做什么
+  const lastLine = (S.installLog || []).slice(-1)[0] || '';
+  const failLine = !installing && lastLine.startsWith('[fail]') ? lastLine : '';
+  let installBlock = '';
+  if (installing) {
+    const isPull = String(installing).startsWith('pull');
+    const pp = S.pullProgress;
+    const width = isPull ? (pp ? pp.pct : 0) : 100;
+    const cls = isPull ? (pp && pp.pct >= 100 ? 'full' : '') : 'stripes';
+    const stage = isPull
+      ? (pp ? `正在拉取 Ollama 模型 ${pp.model}(${pp.pct}%)` : `正在拉取 Ollama 模型 ${String(installing).slice(5)}…`)
+      : (lastLine ? lastLine.replace(/^\[(pull|info)\]\s*/, '') : (installing === 'deps' ? '正在安装推理依赖(npm install)…' : '正在下载 cpu 模式权重(HuggingFace → hf-cache)…'));
+    installBlock = `<div class="bar ${isPull ? '' : 'stripes'}"><i class="${isPull ? cls : ''}" style="width:${width}%"></i></div>
+      <div class="stage">${esc(stage)}</div>`;
+  } else if (failLine) {
+    installBlock = `<div class="err">${esc(failLine)}(点「重新自检」重试)</div>`;
+  }
   $('body').innerHTML = `
     <div class="card">
-      <b>环境自检</b><span class="sub">(检测本机是否具备安装条件;缺项自动安装,CMD 滚动显示进度)</span>
+      <b>环境自检</b><span class="sub">(检测本机是否具备安装条件;缺项自动安装/拉取)</span>
       ${rows}
       ${hardBad.length ? `<div class="err">请先补齐硬性缺项:${esc(hardBad.map((c) => c.label).join(', '))}</div>` : ''}
-      ${installing ? (() => {
-        // 2026-11-16 修复:controller 写入的是 installing='pull:<模型名>'(带名字),字面 'pull' 判断恒 false→误显 cpu 文案
-        const isPull = String(installing).startsWith('pull');
-        const pp = S.pullProgress;
-        const title = isPull
-          ? (pp ? `正在自动拉取 Ollama 模型:${esc(pp.model)}(${pp.pct}%)` : '正在自动拉取 Ollama 模型…')
-          : installing === 'deps' ? '正在自动安装:推理依赖(npm install)…'
-          : '正在自动安装:cpu 模式权重(HuggingFace → hf-cache)…';
-        const width = isPull ? (pp ? pp.pct : 100) : 100;
-        const full = isPull ? (pp != null && pp.pct >= 100) : true;
-        return `<div class="sub">${title}</div>
-      <div class="bar"><i class="${full ? 'full' : ''}" style="width:${width}%"></i></div>
-      <pre class="stderr" id="cmdlog">${log || '等待输出…'}</pre>`;
-      })() : ''}
+      ${installBlock}
       ${installing ? '<div class="sub">安装中,完成后自动重新自检</div>' : ''}
       <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失自动 npm install,cpu 权重缺失自动下载到 hf-cache)。</div>
     </div>`;
   // 2026-11-16 用户裁决:「重新自检」挪到底部导航(上一步|重新自检|下一步);checking/installing 均禁用
   const rc = $('btnRecheck');
   if (rc) { rc.style.display = ''; rc.disabled = !!installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; }
-  const cl = $('cmdlog'); if (cl) cl.scrollTop = cl.scrollHeight;
-  // renderEnvCheck 局部不再覆盖按钮(统一走 render() 的 checking/installing 状态,防文案打架)
-  // 进入本步自动跑一次自检(结果到达后 onState 重渲染;S.envChecking 本地标志防重入)
-  if (!checks.length && !S.envChecking) { S.envChecking = true; act('start-env-check').finally(() => { S.envChecking = false; }); }
+  // 进入本步自动跑一次自检;2026-11-17 审查修复:load 复检在跑(S.checking)时不再重复触发(撞 in-flight 弹假错误)
+  if (!checks.length && !S.envChecking && !S.checking) { S.envChecking = true; act('start-env-check').finally(() => { S.envChecking = false; }); }
 }
 
 function renderInitRun(w) {
@@ -260,8 +266,9 @@ function renderDone(w) {
       </div><div class="sub">钩子灯异常时可用托盘菜单「修复钩子」。若刚接入下载的 Node 运行时,已打开的 IDE 需重启后钩子生效。</div>` : ''}
       <div class="sub">托盘常驻后台;双击托盘图标可查看状态面板;需要换目录/换模式时重开安装向导即可(第 1 步自动载入现有配置)。</div>
     </div>`;
+  // 2026-11-17 审查修复:不再覆盖 btnNext.onclick(旧覆盖在 X 关窗=hide 后重开二配时残留,
+  // 点「下一步」会误关窗)。统一走底部唯一 handler(其内已按 status==='DONE' 分流关窗)。
   const btn = $('btnNext'); btn.textContent = '完成'; btn.disabled = false;
-  btn.onclick = () => window.close();
 }
 
 $('btnBack').onclick = () => act('back');
