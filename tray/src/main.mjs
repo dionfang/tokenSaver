@@ -13,8 +13,8 @@ import { fileURLToPath } from 'node:url';
 import { createCmdRunner } from './cmdRunner.mjs';
 import { createPoller } from './poller.mjs';
 import { resolvePaths, hfWeightCached } from './util/paths.mjs';
+import { modelTooltip } from './util/lamps.mjs';
 import { createWizardController } from './wizard/controller.mjs';
-import { probeOllama } from './downloader.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ICON = path.join(here, '..', 'assets', 'tray.png');
@@ -32,6 +32,7 @@ let rootsWin = null;
 let poller = null;
 let ctx = { paths: null, snapshot: null, autorunOn: false };
 let quitting = false; // 2026-11-15:退出握手——真退出时放行 close,X 按钮 close 一律改藏托盘(不退出)
+let wizardOnly = false; // 2026-11-17 用户裁决:未完成向导时双击只跑向导(无托盘/轮询/自启);DONE 后转托盘模式
 
 const sh = (cmd, args) => new Promise((resolve) => {
   execFile(cmd, args, { windowsHide: true, encoding: 'utf8' }, (e, stdout) => resolve({ ok: !e, stdout: String(stdout || '') }));
@@ -94,7 +95,11 @@ function wizardController() {
   wizardCtl = createWizardController({
     paths: ctx.paths,
     cmdRun: runner.run.bind(runner),
-    sendState: (st) => { if (wizardWin && !wizardWin.isDestroyed()) wizardWin.webContents.send('wizard:state', st); },
+    sendState: (st) => {
+      if (wizardWin && !wizardWin.isDestroyed()) wizardWin.webContents.send('wizard:state', st);
+      // 2026-11-17:向导-only 模式下向导完成 → 立即转托盘模式(同会话无缝衔接)
+      if (wizardOnly && st?.wizard?.status === 'DONE') { wizardOnly = false; activateTray(); }
+    },
     pickDirectories: async () => {
       const r = await dialog.showOpenDialog(wizardWin, { title: '选择要语义索引的目录', properties: ['openDirectory', 'multiSelections'] });
       return r.canceled ? null : r.filePaths;
@@ -130,10 +135,44 @@ function openWizard() {
   wizardWin.setMenu(null);
   wizardWin.loadFile(WIZARD_HTML);
   wizardWin.once('ready-to-show', () => wizardWin.show());
-  wizardWin.on('close', (e) => { if (!quitting) { e.preventDefault(); wizardWin.hide(); } });
+  wizardWin.on('close', (e) => {
+    // 向导-only 模式:无托盘可藏,关向导=退出程序;托盘模式:藏向导不退出
+    if (!quitting && !wizardOnly) { e.preventDefault(); wizardWin.hide(); }
+  });
   wizardWin.webContents.on('before-input-event', (_e, input) => { if (input.key === 'F11') _e.preventDefault(); });
-  wizardWin.on('closed', () => { wizardWin = null; });
+  wizardWin.on('closed', () => { wizardWin = null; if (wizardOnly) app.quit(); });
   wizardController(); // IPC 注册与控制器就绪先于渲染层首问
+}
+
+/** 托盘模式激活(幂等):自启+轮询+托盘图标。仅向导完成后调用(2026-11-17 用户裁决)。 */
+function activateTray() {
+  if (tray) return;
+  (async () => {
+    ctx.autorunOn = await queryAutorun();
+    const choice = readTrayState().autoLaunch; // A2 默认开;用户显式关过(off)才保持关
+    const choiceOff = choice === 'off';
+    if (!choiceOff) {
+      ctx.autorunOn = await setAutorun(true);
+      if (choice == null) writeTrayState({ autoLaunch: ctx.autorunOn ? 'on' : 'off' });
+    }
+    poller = createPoller({
+      paths: ctx.paths,
+      cmdRun: runner.run.bind(runner),
+      onSnapshot: applySnapshot,
+      hfWeightCached,
+    });
+    poller.fastTick();
+    const loop = () => {
+      const d = poller.nextDelayMs();
+      setTimeout(() => { poller.fastTick(); loop(); }, d);
+    };
+    loop();
+    powerMonitor.on('resume', () => poller.slowRefresh('resume'));
+    tray = new Tray(nativeImage.createFromPath(ICON));
+    tray.setToolTip('TokenSaver');
+    tray.setContextMenu(buildMenu());
+    tray.on('double-click', () => openPanel());
+  })();
 }
 
 // ---------- 菜单动作 ----------
@@ -220,81 +259,15 @@ async function repairHooks(host) {
   else dialog.showErrorBox(String(r.error || '').includes('无法定位') ? '修复钩子' : '修复钩子失败', r.error || '失败');
 }
 
-/** 只改 data/code-index.config.json 的 modelIn。不跑 init,避免顺带重写钩子和启动索引构建。 */
-function writeModelIn(dataDir, modelIn) {
-  const file = path.join(dataDir, 'code-index.config.json');
-  const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-  cfg.modelIn = modelIn;
-  writeConfig(file, cfg);
-}
-
-let switchingMode = false; // M3 防重入:流水线在跑时拒绝再次切换
-/** M3 完整切换流水线(2026-11-17,B2 口径):门禁→确认→写配置→(gpu)自动拉缺失模型→全量重嵌→预热;
- *  任一步失败回滚 modelIn。进度经托盘 Tooltip 实时展示(pull 真百分比来自 ollamaPull.mjs 行契约)。 */
-async function switchRunMode() {
-  if (switchingMode) return dialog.showMessageBox({ message: '切换进行中,请等待当前流水线完成', buttons: ['知道了'] });
-  const cur = ctx.snapshot?.modelIn === 'local' ? 'cpu' : ctx.snapshot?.modelIn ? 'gpu' : null;
-  if (!cur) return dialog.showErrorBox('切换运行模式', '还没有读到当前运行模式,请稍后再试');
-  const next = cur === 'cpu' ? 'gpu' : 'cpu';
-  const nextLabel = next === 'gpu' ? 'gpu模型' : 'cpu模型';
-  if (next === 'gpu') {
-    const ready = await probeOllama({});
-    if (!ready.ok) return dialog.showErrorBox('切换运行模式', 'gpu模型需要本机 Ollama 服务在运行');
-  }
-  const confirm = await dialog.showMessageBox({
-    type: 'question',
-    buttons: ['切换', '取消'],
-    defaultId: 1,
-    cancelId: 1,
-    message: `切换到${nextLabel}`,
-    detail: `当前是${cur === 'gpu' ? 'gpu模型' : 'cpu模型'}。确认后将自动:${next === 'gpu' ? '拉取缺失的 Ollama 模型 → ' : ''}全量重新嵌入向量 → 预热模型。两边的向量文件都会保留。`,
-  });
-  if (confirm.response !== 0) return;
-  const { dataDir, nodeBin, codeIndexRoot } = ctx.paths || {};
-  if (!dataDir || !nodeBin || !codeIndexRoot) return dialog.showErrorBox('切换运行模式', '无法定位数据目录/Node/code-index');
-  const setTip = (s) => { try { tray?.setToolTip(`TokenSaver 切换运行模式:${s}`); } catch { /* 托盘未就绪 */ } };
-  const tail = (r) => String(r.stderr || r.stdout || `exit ${r.code}`).trim().split('\n').slice(-3).join('\n').slice(0, 400);
-  switchingMode = true;
-  try {
-    setTip('写入运行配置…');
-    writeModelIn(dataDir, next === 'gpu' ? 'ollama' : 'local');
-    if (next === 'gpu') {
-      setTip('拉取 Ollama 模型…');
-      const r = await runner.run('pull', nodeBin, [`${codeIndexRoot}/ollamaPull.mjs`], {
-        cwd: codeIndexRoot, label: '切换:拉取模型',
-        onLine: (l) => { if (l.startsWith('[progress]')) setTip(l.replace('[progress] ', '')); },
-      });
-      if (r.skipped) throw new Error(`有任务在跑(${r.busyFamily}),稍后再试`);
-      if (r.code !== 0) throw new Error(`模型拉取失败:${tail(r)}`);
-    }
-    const roots = readConfig().cfg?.roots || [];
-    if (roots.length) {
-      setTip('全量重新嵌入向量(耗时取决于索引规模)…');
-      const r = await runner.run('embed', nodeBin, [`${codeIndexRoot}/embed.mjs`], { cwd: codeIndexRoot, label: '切换:重嵌向量' });
-      if (r.code !== 0) throw new Error(`向量重嵌失败:${tail(r)}`);
-    }
-    setTip('预热模型…');
-    const r = await runner.run('warm', nodeBin, [`${codeIndexRoot}/warm.mjs`], { cwd: codeIndexRoot, label: '切换:预热' });
-    if (r.skipped) throw new Error(`有任务在跑(${r.busyFamily}),稍后再试`);
-    if (r.code !== 0) throw new Error(`预热失败:${tail(r)}`);
-    await poller?.slowRefresh('switch-mode');
-    dialog.showMessageBox({ message: `已切换到${nextLabel}${next === 'gpu' ? '(模型已拉取)' : ''}${roots.length ? ',向量已重嵌' : ''},模型已预热`, buttons: ['知道了'] });
-  } catch (e) {
-    try { writeModelIn(dataDir, cur === 'gpu' ? 'ollama' : 'local'); } catch { /* 回滚尽力而为 */ }
-    await poller?.slowRefresh('switch-rollback');
-    dialog.showErrorBox('切换运行模式失败(已回滚原模式)', String(e?.message || e).slice(0, 400));
-  } finally {
-    switchingMode = false;
-  }
-}
-
 // ---------- 菜单 ----------
+// 2026-11-17 用户裁决:删菜单一键「切换运行模式」(M3 流水线整体移除)——切模式可能需自检安装
+// 依赖项与手工安装项,无法一键完成;模式切换统一走安装向导(菜单名改为「切换运行模式」,
+// 向导 secondRun 以 config 为真源,ENVCHECK 自动补装软项、硬项给手工指引)。
 function buildMenu() {
   return Menu.buildFromTemplate([
-    { label: '安装向导', click: () => { openWizard(); } },
+    { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
-    { label: '切换运行模式', click: () => { switchRunMode(); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
     { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
       const next = !ctx.autorunOn;
@@ -311,8 +284,8 @@ function applySnapshot(snapshot) {
   ctx.consent = snapshot.consent;
   if (tray) {
     tray.setContextMenu(buildMenu());
-    const age = snapshot.healthAt ? Math.max(0, Math.round((snapshot.at - snapshot.healthAt) / 1000)) : null;
-    tray.setToolTip(`${(snapshot.statusLine || '状态获取中…').slice(0, 120)}${age != null ? `\n(${age} 秒前)` : ''}`);
+    // 2026-11-17 用户裁决:悬浮提示改模型拉起状态(灯+类型+名,一行一模型),不再显示 ⚙ 状态句
+    tray.setToolTip(modelTooltip(snapshot));
   }
   if (panel && !panel.isDestroyed()) panel.webContents.send('tray:snapshot', snapshot);
 }
@@ -322,7 +295,11 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => openPanel()); // 二次启动唤起首实例面板
+  app.on('second-instance', () => { // 二次启动:托盘模式唤面板;向导-only 模式唤向导
+    if (tray) openPanel();
+    else if (wizardWin && !wizardWin.isDestroyed()) { wizardWin.show(); wizardWin.focus(); }
+    else openWizard();
+  });
   app.whenReady().then(async () => {
     Menu.setApplicationMenu(null); // 不显示 Electron 默认窗口菜单栏
     ipcMain.handle('tray:refresh', async () => {
@@ -456,31 +433,10 @@ if (!gotLock) {
     });
     ctx.paths = await resolvePaths();
     if (ctx.paths.degraded) dialog.showErrorBox('TokenSaver', '无法定位 code-index 数据目录(paths.mjs 无响应),状态展示可能不完整');
-    ctx.autorunOn = await queryAutorun();
-    const choice = readTrayState().autoLaunch; // A2 默认开;用户显式关过(off)才保持关。on/未记录都会重写 Run 命令(修开发态裸 electron.exe)
-    const choiceOff = choice === 'off';
-    if (!choiceOff) {
-      ctx.autorunOn = await setAutorun(true);
-      if (choice == null) writeTrayState({ autoLaunch: ctx.autorunOn ? 'on' : 'off' });
-    }
-    poller = createPoller({
-      paths: ctx.paths,
-      cmdRun: runner.run.bind(runner),
-      onSnapshot: applySnapshot,
-      hfWeightCached,
-    });
-    poller.fastTick();
-    const loop = () => {
-      const d = poller.nextDelayMs();
-      setTimeout(() => { poller.fastTick(); loop(); }, d);
-    };
-    loop();
-    powerMonitor.on('resume', () => poller.slowRefresh('resume'));
-    tray = new Tray(nativeImage.createFromPath(ICON));
-    tray.setToolTip('TokenSaver');
-    tray.setContextMenu(buildMenu());
-    tray.on('double-click', () => openPanel());
-    if (ctx.paths?.dataDir && !wizardDone()) openWizard(); // M2:无 done 记录=未完成向导,自动弹窗续引导(§5.5)
+    // 2026-11-17 用户裁决:未完成向导 → 只启动安装向导(无托盘/轮询/自启,关向导=退出);
+    // 已完成 → 直接托盘模式。向导 DONE 时 sendState 钩子自动 activateTray 衔接。
+    if (wizardDone()) activateTray();
+    else { wizardOnly = true; openWizard(); }
   });
   app.on('window-all-closed', (e) => { /* 托盘常驻:面板关了不退 */ });
   // 2026-11-15 退出握手:菜单「退出」→ app.quit() 触发 before-quit 置真,close 拦截放行(hide 兜底不拦真退)
