@@ -1,0 +1,52 @@
+# TokenSaver 安装包构建(2026-11-17 发行链落地,方案 R1/§3-6b/C6)
+# 主包=Electron 壳+code-index 源码+production 依赖(packed 布局);权重不打包(首用懒下载 hf-cache)。
+# 构建:cd tray && npm run dist(需 ELECTRON_MIRROR/ELECTRON_BUILDER_BINARIES_MIRROR 指 npmmirror)
+appId: com.tokensaver.tray
+productName: TokenSaver
+copyright: Copyright © 2026 dionfang
+directories:
+  output: release
+  buildResources: build
+files:
+  - src/**/*
+  - panel/**/*
+  - assets/tray.png
+  - package.json
+# code-index 以 packed 布局进 resources/node_modules/code-index:
+# config.mjs isInsideNodeModules=true → hf-cache 归 ~/.tokensaver/hf-cache(升级不清);
+# data 由安装器写用户级 CODE_INDEX_DATA_DIR 指向 %LOCALAPPDATA%\TokenSaver\data(升级不清)。
+extraResources:
+  - from: ../code-index
+    to: node_modules/code-index
+    filter:
+      - "**/*"
+      - "!hf-cache/**"
+      - "!bin/**"
+      - "!data/**"
+      - "!*.log"
+      - "!node_modules/.cache/**"
+# 2026-11-17:asar=false——本机有长驻进程持久锁新生成的 app.asar(持有者不明,Defender 历史无关),
+# 且产品源码本就「轻度混淆」口径(§3-13),asar 封装非必需;解包目录形态规避锁并便于现场排查。
+asar: false
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.png
+  # C6=b:electron-updater 全自动,feed=crisvado.com(服务端未上线前主进程不主动 checkForUpdates)
+  publish:
+    provider: generic
+    url: https://crisvado.com/tokensaver/updates/
+nsis:
+  oneClick: false
+  perMachine: false # R1:per-user 安装(%LOCALAPPDATA%\Programs),默认布局可写兜底
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: TokenSaver
+  uninstallDisplayName: TokenSaver
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  include: build/installer.nsh
+artifactName: TokenSaver-Setup-${version}.${ext}

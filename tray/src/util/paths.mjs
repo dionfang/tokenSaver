@@ -5,11 +5,16 @@
  */
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEV_CODE_INDEX = path.resolve(here, '..', '..', '..', 'code-index'); // 开发布局兜底(tray/src/util → 仓根/code-index)
+// 2026-11-17 发行链:packed 布局=resources/node_modules/code-index(electron-builder extraResources);
+// config.mjs isInsideNodeModules=true → hf-cache 归 ~/.tokensaver/hf-cache;data 由安装器 env 指 %LOCALAPPDATA%。
+const PACKED_CODE_INDEX = process.resourcesPath ? path.join(process.resourcesPath, 'node_modules', 'code-index') : null;
+const CODE_INDEX_ROOT = (PACKED_CODE_INDEX && fs.existsSync(path.join(PACKED_CODE_INDEX, 'paths.mjs'))) ? PACKED_CODE_INDEX : DEV_CODE_INDEX;
 
 let cached = null;
 
@@ -32,7 +37,7 @@ export async function resolvePaths({ force = false } = {}) {
   const nodeBin = await detectNodeBin();
   const out = await new Promise((resolve) => {
     let child;
-    try { child = spawn(nodeBin, [path.join(DEV_CODE_INDEX, 'paths.mjs')], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try { child = spawn(nodeBin, [path.join(CODE_INDEX_ROOT, 'paths.mjs')], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch { resolve(null); return; }
     let so = '';
     let se = '';
@@ -45,10 +50,15 @@ export async function resolvePaths({ force = false } = {}) {
   let j = null;
   try { j = out ? JSON.parse(out) : null; } catch { j = null; }
   if (!j) {
-    // paths.mjs 不可达(部署形态异常):以开发布局兜底,标 degraded 供 UI 提示
-    cached = { dataDir: null, hfCacheDir: null, codeIndexRoot: DEV_CODE_INDEX, packed: false, version: null, nodeBin, degraded: true };
+    // paths.mjs 不可达(部署形态异常):以当前布局兜底,标 degraded 供 UI 提示
+    cached = { dataDir: null, hfCacheDir: null, codeIndexRoot: CODE_INDEX_ROOT, packed: CODE_INDEX_ROOT === PACKED_CODE_INDEX, version: null, nodeBin, degraded: true };
   } else {
     cached = { ...j, nodeBin, degraded: false };
+    // R1 双保险:packed 形态若 env 未生效(data 落回安装目录内,升级即清)→ 托盘侧强制改道 %LOCALAPPDATA%
+    if (cached.packed && process.resourcesPath && String(cached.dataDir || '').startsWith(process.resourcesPath)) {
+      cached.dataDir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'TokenSaver', 'data');
+      process.env.CODE_INDEX_DATA_DIR = cached.dataDir; // 后续 spawn 继承(钩子侧靠安装器广播的用户级 env)
+    }
   }
   return cached;
 }
@@ -61,5 +71,21 @@ export function hfWeightCached(hfCacheDir, modelId) {
   const [org, name] = modelId.split('/');
   try {
     return fs.existsSync(path.join(hfCacheDir, org, name)) || fs.existsSync(path.join(hfCacheDir, `${org}--${name}`));
+  } catch { return null; }
+}
+
+/** 本地权重缓存判定(向导自检与下载完成轮询共用单源,2026-11-17):
+ *  strands:<dir>[:<quant>] 无 '/',hfWeightCached 恒 null——曾致 pollWeights 永不判完成、
+ *  权重下载好后向导仍卡「安装中」直到 10min 兜底。strands 走目录+model_<quant>.onnx
+ *  (回退 model_quantized.onnx);其余 org/name 委托 hfWeightCached。 */
+export function localWeightCached(hfCacheDir, modelId) {
+  if (!hfCacheDir || typeof modelId !== 'string') return null;
+  if (!modelId.startsWith('strands:')) return hfWeightCached(hfCacheDir, modelId);
+  const parts = modelId.split(':'); // [strands, dir, quant?]
+  const dir = parts[1] ?? '';
+  const quant = parts[2] ?? 'quantized';
+  try {
+    return fs.existsSync(path.join(hfCacheDir, dir, `model_${quant}.onnx`))
+      || fs.existsSync(path.join(hfCacheDir, dir, 'model_quantized.onnx'));
   } catch { return null; }
 }

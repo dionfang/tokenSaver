@@ -32,3 +32,11 @@ hf-cache/
 
 # GUI 中继编译产物(本地,init 按需重编;bin/hook-relay.exe)
 /code-index/bin/
+
+# code-index(部署目录、data、.cursor/.zcode/.qoder 钩子不入库)
+/C:/Users/Administrator/AppData/Local/Temp/init-seq-fybZg9/data/
+
+# tray 发行构建产物(2026-11-17)
+tray/release/
+tray/release2/
+tray/release3/
