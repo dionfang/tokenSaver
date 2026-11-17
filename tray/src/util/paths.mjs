@@ -54,10 +54,12 @@ export async function resolvePaths({ force = false } = {}) {
     cached = { dataDir: null, hfCacheDir: null, codeIndexRoot: CODE_INDEX_ROOT, packed: CODE_INDEX_ROOT === PACKED_CODE_INDEX, version: null, nodeBin, degraded: true };
   } else {
     cached = { ...j, nodeBin, degraded: false };
-    // R1 双保险:packed 形态若 env 未生效(data 落回安装目录内,升级即清)→ 托盘侧强制改道 %LOCALAPPDATA%
-    if (cached.packed && process.resourcesPath && String(cached.dataDir || '').startsWith(process.resourcesPath)) {
-      cached.dataDir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'TokenSaver', 'data');
-      process.env.CODE_INDEX_DATA_DIR = cached.dataDir; // 后续 spawn 继承(钩子侧靠安装器广播的用户级 env)
+    // R1 双保险:packed 形态数据必须在 %LOCALAPPDATA%\TokenSaver\data(升级不清);
+    // 任何落回安装目录/resources 内的结果都强制改道并注入 spawn env(钩子侧靠安装器广播的用户级 env)
+    const wantData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'TokenSaver', 'data');
+    if (cached.packed && path.resolve(cached.dataDir || '') !== path.resolve(wantData)) {
+      cached.dataDir = wantData;
+      process.env.CODE_INDEX_DATA_DIR = wantData;
     }
   }
   return cached;

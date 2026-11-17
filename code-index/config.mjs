@@ -65,7 +65,12 @@ export function resolveLayout({
   const dataDir = dataFromEnv
     ? path.resolve(dataFromEnv)
     : packed
-      ? path.join(root, 'scripts', 'data')
+      // 2026-11-17 修复(客户端实测 bug):packed=托盘安装布局,数据必须落用户目录(升级不清)。
+      // 旧值 root/scripts/data 的 root=cwd=安装目录 → 向导状态/账本写进安装目录,升级即清+与安装器
+      // env(LOCALAPPDATA)分裂 → 重开向导「回初始态+pull 重来」。npm 渠道已弃用,scripts/data 口径作废。
+      ? (process.platform === 'win32'
+        ? path.join(homedir, 'AppData', 'Local', 'TokenSaver', 'data')
+        : path.join(homedir, '.tokensaver', 'data'))
       : moduleGit && realpathOr(moduleGit) === moduleAbs
         ? path.join(moduleAbs, 'data')
         : path.resolve(moduleAbs, '..', 'data');
@@ -123,10 +128,9 @@ export const DEFAULT_CONFIG = {
   // Cursor 全量 Read 行数上限。超过 ×1.25 由 preToolUse 拦截;带 offset/limit 的区间读不受限。
   readMaxLines: 500,
   chunk: { targetLines: 70, maxLines: 120, overlapLines: 10, minTail: 15 },
-  // L2 样本库配额(2026-11-10 配置化,原 120 硬编码在 autoExemplars/buildExemplars):
-  //   capPerLabel=单类硬上限(防单一类别垄断近邻票);dynamicQuota=true 时实际配额按各类供给的
-  //   sqrt 平滑分摊 totalCap 总预算,cap 只在某类占比过高时兜底(默认 200 ≈ 总预算一半);
-  //   totalCap=全库总预算(控 kNN 全库扫描/构建成本与内存);
+  // L2 样本库配额(2026-11-10 配置化;2026-11-14 起默认不限):
+  //   capPerLabel=单类硬上限;totalCap=全库总预算。两者默认 0=不限。
+  //   显式配正数且 dynamicQuota=true 时,按各类供给的 sqrt 分摊 totalCap。
   //   dynamicQuota=false 退回旧行为(每类 cap、无全局预算分配)。
   //   authority=同名内容键的标签权威层:'local'(默认,= 项目当前四票自签模式)用本地标签覆盖服务器;
   //     'base' 保留服务器清洗结果(本地只补向量、不改标签)。
@@ -150,8 +154,15 @@ export const DEFAULT_CONFIG = {
   embedCpuThreads: Math.max(2, Math.min(4, Math.floor(os.cpus().length / 4))),
   // 自愈补拉节流(2026-11-14 用户定案:可配置;2026-11-16 默认改 60000):模型被驱逐/缺位后,两次补拉之间的最小间隔。
   //   默认 60000=1 分钟(精排掉线滞后窗口实测 10min 太宽,用户裁决收紧);调大=更省电但滞后久。
-  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。⚠ 消费侧兜底 modelStatus.mjs:1080 的 ||600000 须同改(默认双点)。
+  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。⚠ 消费侧兜底 modelStatus.mjs:1080 的 ||60000 须同改(默认双点)。
   warmMinIntervalMs: 60000,
+  // Ollama runner 异常自愈(2026-11-17 用户定案,默认开):检测 server.log 近 5 分钟
+  //   ≥2 条 "llm server error" 且期望模型未驻留(连载 2 轮健康评估计数)⇒ spawn 重启
+  //   ollama serve(Windows taskkill ollama.exe,由托盘自动拉回)+ 随后 warm 回拉。
+  //   冷却 ollamaRestartCooldownMs 防故障反复时空转;data/code-index.config.json 顶层键可覆盖;
+  //   ollamaAutoRestart=false 即完全关闭(只检测留痕不动作)。⚠ 消费侧兜底 modelStatus.mjs 同改。
+  ollamaAutoRestart: true,
+  ollamaRestartCooldownMs: 30 * 60 * 1000,
   models: {
     embedding: 'qwen3-embedding:0.6b',
     reranker: 'sam860/qwen3-reranker:0.6b-F16',
@@ -249,7 +260,8 @@ export function loadConfig({ soft = false } = {}) {
 /** 决策模型路由面判定(2026-11-08 用户定档)。providers 全空模板条目/缺键均不算远程。
  *  - decisionActive=判定总闸:v4(2026-11-09)远程链删后恒 true——本地判定恒启用,断路器另有挡闸
  *  - decisionLocalWanted=本次是否要加载/预热/自愈本地决策模型:恒 true(唯一判定路径)
- *  arm1/arm2 的 live/rescue 闸走模型判定档案(resolveDecisionProfile),不再读 enabled */
+ *  arm1/arm2 的 live/rescue 闸走模型判定档案(resolveDecisionProfile),不再读 enabled
+ */
 export function decisionRemoteConfigured(cfg = null) { return false; } // v4 兼容桩:远程已删,恒 false(仅防旧调用方炸)
 export function decisionActive(cfg = null) { return true; }
 export function decisionLocalWanted(cfg = null) { return true; }
