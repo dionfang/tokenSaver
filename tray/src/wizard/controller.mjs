@@ -197,14 +197,18 @@ export function createWizardController(deps) {
       envelope.installLog.push(`[pull] ollama pull ${name}`);
       sendState({ ...envelope });
       try {
-        const resp = await fetch(`${base}/api/pull`, { method: 'POST', body: JSON.stringify({ model: name, stream: true }) });
-        if (!resp.ok || !resp.body) { envelope.installLog.push(`[fail] HTTP ${resp.status}`); continue; }
+        // S14-F1(2026-11-17):pull 加超时/取消——Ollama 挂死时不再无限等;120s 无进度即 abort(有进度续命)
+        const ac = new AbortController();
+        let pullTimer = setTimeout(() => ac.abort(new Error('pull 超时(120s 无进度)')), 120_000);
+        const resp = await fetch(`${base}/api/pull`, { method: 'POST', body: JSON.stringify({ model: name, stream: true }), signal: ac.signal });
+        if (!resp.ok || !resp.body) { clearTimeout(pullTimer); envelope.installLog.push(`[fail] HTTP ${resp.status}`); continue; }
         const reader = resp.body.getReader();
         const dec = new TextDecoder();
         let buf = ''; let lastPct = -1; let okLine = false;
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
+          clearTimeout(pullTimer); pullTimer = setTimeout(() => ac.abort(new Error('pull 超时(120s 无进度)')), 120_000); // 收到数据=有进度,续命
           buf += dec.decode(value, { stream: true });
           const lines = buf.split('\n'); buf = lines.pop();
           for (const line of lines) {
@@ -223,8 +227,10 @@ export function createWizardController(deps) {
             } catch { /* 半行,等下一段 */ }
           }
         }
+        clearTimeout(pullTimer);
         envelope.installLog.push(okLine ? `[ok] ${name} 拉取完成` : `[fail] ${name} 拉取未确认成功`);
       } catch (e) {
+        clearTimeout(pullTimer);
         envelope.installLog.push(`[fail] ${name}: ${e?.message || e}`);
       }
     }
