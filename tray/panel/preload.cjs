@@ -13,6 +13,10 @@ contextBridge.exposeInMainWorld('trayPanel', {
   repairHooks: () => ipcRenderer.invoke('tray:repair-hooks'),
   syncEmbed: () => ipcRenderer.invoke('tray:sync-embed'),
   syncVectors: () => ipcRenderer.invoke('tray:sync-vectors'),
+  // M4(2026-11-17):T4 更新公共决策包 + 同意开关(D5 撤回/补同意);进度/结果单向推送
+  updateBase: () => ipcRenderer.invoke('tray:update-base'),
+  setConsent: (on) => ipcRenderer.invoke('tray:set-consent', on === true),
+  onBaseEvent: (cb) => ipcRenderer.on('tray:base-update', (_e, ev) => cb(ev)),
 });
 
 contextBridge.exposeInMainWorld('trayRoots', {

@@ -85,6 +85,46 @@ export async function fetchComponentsManifest(url = MANIFEST_URL, { fetchText, c
   return parseManifest(text, { clientVersion, pins });
 }
 
+// ---------- basepack 清单(T4 专用,§16.6/§19.1 API-1/§19.2,2026-11-17 M4) ----------
+
+export const BASEPACK_URL = 'https://crisvado.com/tokensaver/manifest/basepack.json';
+
+/** pack 项基础校验(纯):url/sha256 必备(下载器硬校验门),model/dim/builtAt 供选包与已最新判定。 */
+export function validatePack(p) {
+  if (!p || typeof p.model !== 'string' || !p.model) return '缺 model';
+  if (typeof p.url !== 'string' || !/^https?:\/\//.test(p.url)) return 'url 须为 http(s)';
+  if (typeof p.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(p.sha256)) return 'sha256 缺失或格式错';
+  if (typeof p.builtAt !== 'string' || !p.builtAt) return '缺 builtAt';
+  if (p.dim != null && (!Number.isFinite(Number(p.dim)) || Number(p.dim) <= 0)) return 'dim 非法';
+  return null;
+}
+
+/**
+ * 解析+验签+版本比对 basepack 清单(与 parseManifest 同口径,packs 替代 items)。
+ * @returns {ok:true, manifest} | {ok:false, error, message}
+ */
+export function parseBasepackManifest(text, { clientVersion, pins = PINS } = {}) {
+  let manifest = null;
+  try { manifest = JSON.parse(text); } catch { return { ok: false, error: 'bad-json', message: '清单不是合法 JSON' }; }
+  if (!verifyManifestSignature(manifest, pins)) return { ok: false, error: 'bad-signature', message: '清单签名校验失败(可能被篡改)' };
+  const v = checkMinClientVersion(manifest, clientVersion);
+  if (!v.ok) return { ok: false, error: 'client-too-old', message: `客户端版本过低(v${v.current}),需 v${v.required} 以上,请先升级客户端`, required: v.required, current: v.current };
+  if (manifest.manifestVersion !== 1) return { ok: false, error: 'bad-version', message: `不支持的清单版本:${manifest.manifestVersion}` };
+  if (!Array.isArray(manifest.packs)) return { ok: false, error: 'bad-schema', message: '清单缺少 packs 数组' };
+  const invalid = [];
+  for (const p of manifest.packs) { const err = validatePack(p); if (err) invalid.push(`${p?.model ?? '?'}:${err}`); }
+  if (invalid.length) return { ok: false, error: 'bad-schema', message: `pack 项非法:${invalid.join(';')}` };
+  return { ok: true, manifest };
+}
+
+/** 拉取 basepack 清单(§19.1 API-1)。fetchText 依赖注入(生产=真实 HTTP,单测=fixture/本地假源)。 */
+export async function fetchBasepackManifest(url = BASEPACK_URL, { fetchText, clientVersion, pins = PINS, timeoutMs = 15_000 } = {}) {
+  let text;
+  try { text = await fetchText(url, { timeoutMs }); } catch (e) { return { ok: false, error: 'network', message: `清单拉取失败:${e?.message || e}` }; }
+  if (typeof text !== 'string' || !text.trim()) return { ok: false, error: 'network', message: '清单响应为空' };
+  return parseBasepackManifest(text, { clientVersion, pins });
+}
+
 /** 清单项类型(§16.6,§18-C6=b 后 tray 段已废):http/deps 走文件下载,ollama-pull 走 /api/pull。 */
 export const ITEM_TYPES = new Set(['http', 'deps', 'ollama-pull']);
 

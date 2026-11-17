@@ -47,10 +47,12 @@
   <div class="row"><span class="dot" id="m-embed"></span><span class="name">向量嵌入</span><span class="state" id="t-embed">检测中</span></div>
   <div class="bar-row"><div class="bar"><i id="embed-bar"></i></div><span class="pct" id="embed-pct">100%</span></div>
 
-  <h2 class="section-title">模型决策状态 <button type="button" id="knn-sync" class="head-btn">立即同步</button></h2>
+  <h2 class="section-title">模型决策状态 <span style="display:flex;gap:6px"><button type="button" id="base-update" class="head-btn">更新</button><button type="button" id="knn-sync" class="head-btn">立即同步</button></span></h2>
   <div class="row"><span class="dot" id="m-knn"></span><span class="name" id="knn-name">模型决策状态</span><span class="state" id="t-knn">检测中</span></div>
   <div class="bar-row"><span class="lbl">本地决策包</span><div class="bar"><i id="knn-bar"></i></div><span class="pct" id="knn-pct">—</span></div>
   <div class="bar-row"><span class="lbl">公共决策包</span><div class="bar"><i id="knn-base-bar"></i></div><span class="pct" id="knn-base-pct"></span></div>
+  <div class="row"><span class="state" id="base-update-msg" style="flex:1;text-align:right"></span></div>
+  <div class="row"><span class="name" style="font-size:12px;color:#8b949e">上传本地向量(互惠:解锁公共包更新)</span><button type="button" id="consent-toggle" class="head-btn">未同意 ○━</button></div>
 
   <h2 class="section-title">三端钩子配置 <button type="button" id="hook-repair" class="head-btn">修复</button></h2>
   <div class="row"><span class="dot" id="m-zcode"></span><span class="name">ZCode</span><span class="state" id="t-zcode">检测中</span></div>
@@ -102,7 +104,46 @@
     for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
     embedRunning = s.embedPid != null;
     paintSyncBtn();
+    consentOn = s.consent?.uploadLocalKnn === true;
+    paintBaseBtn();
   }
+
+  // ---------- M4(2026-11-17):T4 更新公共决策包 + 同意开关(D5) ----------
+  let baseHold = false;
+  let consentOn = false;
+  function paintBaseBtn() {
+    const btn = $('base-update');
+    btn.disabled = baseHold || !consentOn;
+    btn.textContent = baseHold ? '更新中' : '更新';
+    btn.title = consentOn ? '从发行源更新公共决策包(base 层)' : '未同意上传本地向量(互惠约定),更新不可用';
+    $('consent-toggle').textContent = consentOn ? '已同意 ━●' : '未同意 ○━';
+  }
+  function baseMsg(text, kind) {
+    const el = $('base-update-msg');
+    el.textContent = text || '';
+    el.style.color = kind === 'err' ? '#f85149' : kind === 'ok' ? '#3fb950' : '#8b949e';
+  }
+  window.trayPanel?.onBaseEvent((ev) => {
+    if (ev.phase === 'consent') { consentOn = ev.consent?.uploadLocalKnn === true; paintBaseBtn(); return; }
+    if (ev.phase === 'download') { baseMsg(ev.pct != null ? `下载中 ${ev.pct}%` : '下载中…'); return; }
+    if (ev.phase === 'manifest' || ev.phase === 'import') { baseMsg(ev.message || ''); return; }
+    if (ev.phase === 'result' || ev.phase === 'done') {
+      baseHold = false; paintBaseBtn();
+      const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest';
+      baseMsg(ev.message || '', ok ? 'ok' : 'err');
+    }
+  });
+  $('base-update').addEventListener('click', async () => {
+    if (!window.trayPanel?.updateBase || baseHold || !consentOn) return;
+    baseHold = true; paintBaseBtn(); baseMsg('更新中…');
+    try { await window.trayPanel.updateBase(); }
+    finally { baseHold = false; paintBaseBtn(); }
+  });
+  $('consent-toggle').addEventListener('click', async () => {
+    if (!window.trayPanel?.setConsent) return;
+    const r = await window.trayPanel.setConsent(!consentOn);
+    if (r?.ok) { consentOn = r.consent?.uploadLocalKnn === true; paintBaseBtn(); }
+  });
 
   let embedRunning = false;
   let embedHold = false;

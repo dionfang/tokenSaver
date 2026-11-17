@@ -15,6 +15,9 @@ import { createPoller } from './poller.mjs';
 import { resolvePaths, hfWeightCached } from './util/paths.mjs';
 import { modelTooltip } from './util/lamps.mjs';
 import { createWizardController } from './wizard/controller.mjs';
+import { createUpdateBase } from './updateBase.mjs';
+import { createDownloader, httpRequest } from './downloader.mjs';
+import { readConsent, writeConsent, t4Allowed } from './consent.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ICON = path.join(here, '..', 'assets', 'tray.png');
@@ -259,6 +262,52 @@ async function repairHooks(host) {
   else dialog.showErrorBox(String(r.error || '').includes('无法定位') ? '修复钩子' : '修复钩子失败', r.error || '失败');
 }
 
+// ---------- T4 更新公共决策包(M4,§5.4/§16.3):菜单+面板双入口,进度/结果经 tray:base-update 推面板 ----------
+let baseUpdater = null;
+function pushBase(ev) { if (panel && !panel.isDestroyed()) panel.webContents.send('tray:base-update', ev); }
+function getBaseUpdater() {
+  if (baseUpdater) return baseUpdater;
+  const dl = createDownloader({ onProgress: (p) => pushBase({ phase: 'download', pct: p.pct, bytesDone: p.bytesDone, bytesTotal: p.bytesTotal }) });
+  baseUpdater = createUpdateBase({
+    paths: ctx.paths,
+    cmdRun: runner.run.bind(runner),
+    fetchText: async (url, { timeoutMs } = {}) => {
+      const { status, res } = await httpRequest(url, { timeoutMs });
+      let txt = '';
+      res.setEncoding('utf8');
+      for await (const c of res) txt += c;
+      if (status !== 200) throw new Error(`HTTP ${status}`);
+      return txt;
+    },
+    downloader: dl,
+    readState: readTrayState,
+    writeState: writeTrayState,
+    onEvent: pushBase,
+  });
+  return baseUpdater;
+}
+async function runUpdateBase(fromMenu) {
+  const r = await getBaseUpdater().run();
+  pushBase({ phase: 'result', ...r });
+  if (r.outcome === 'updated' || r.outcome === 'already-latest') await poller?.slowRefresh('update-base');
+  if (fromMenu) {
+    if (r.outcome === 'updated' || r.outcome === 'already-latest' || r.outcome === 'consent-required' || r.outcome === 'busy') dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
+    else dialog.showErrorBox('更新公共决策包', r.message || r.outcome);
+  }
+  return r;
+}
+/** 同意开关(D5 撤回/补同意解锁 T4):写 consent 文件→重建菜单(门禁联动)→推面板→快刷快照。 */
+function setConsent(on) {
+  const dataDir = ctx.paths?.dataDir;
+  if (!dataDir) return { ok: false, error: 'no-paths' };
+  writeConsent(dataDir, on === true);
+  ctx.consent = readConsent(dataDir);
+  if (tray) tray.setContextMenu(buildMenu());
+  pushBase({ phase: 'consent', consent: ctx.consent });
+  poller?.fastTick();
+  return { ok: true, consent: ctx.consent };
+}
+
 // ---------- 菜单 ----------
 // 2026-11-17 用户裁决:删菜单一键「切换运行模式」(M3 流水线整体移除)——切模式可能需自检安装
 // 依赖项与手工安装项,无法一键完成;模式切换统一走安装向导(菜单名改为「切换运行模式」,
@@ -267,6 +316,8 @@ function buildMenu() {
   return Menu.buildFromTemplate([
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
+    { label: '更新公共决策包', enabled: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
+    { label: `上传本地向量(互惠)    ${t4Allowed(ctx.consent) ? '━●' : '○━'}`, click: () => { setConsent(!t4Allowed(ctx.consent)); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
     { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
@@ -383,6 +434,14 @@ if (!gotLock) {
       } finally {
         syncBusy = false;
       }
+    });
+    ipcMain.handle('tray:update-base', async () => {
+      try { return await runUpdateBase(false); }
+      catch (e) { return { ok: false, outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
+    });
+    ipcMain.handle('tray:set-consent', (_e, on) => {
+      try { return setConsent(on); }
+      catch (e) { return { ok: false, error: String(e?.message || e).slice(0, 200) }; }
     });
     ipcMain.handle('tray:roots-list', () => {
       try { return { ok: true, roots: listRoots() }; }
