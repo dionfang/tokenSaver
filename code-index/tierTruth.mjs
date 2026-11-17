@@ -10,6 +10,8 @@
  * 上梯口径与 modelRouteProxy 一致:P2 = 当前服务档连续 2 轮修复失败才升一档(R1→R2→R3,封顶 R3),
  * 所以"escalated 的那一轮"就是**低档确实干不动**的直接证据 ⇒ 真值 = 上梯后的那一档。
  * R4 真值只认"用户显式点名旗舰/客户端选定的模型本身就在 R4 档"这类用户侧事实,词法永远给不出 R4 真值。
+ * D6 未落地(S2-F5②,2026-11-17):ESC_NEXT.R3 仍 null(thresholds.mjs),从 R3 上梯的真值恒 R3 不出 R4;
+ * 日后扩 R3→R4 时,本文件 escalated 分支(:59-65)须与 thresholds.ESC_NEXT 同步改,勿只改一处。
  */
 import { TIER_FROM_TYPE, TIER_FROM_INTENSITY } from './tierClassify.mjs';
 import { ESC_NEXT } from './thresholds.mjs'; // S1-F4:上梯表单源(thresholds.mjs)

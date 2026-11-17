@@ -672,6 +672,10 @@ export async function maybePromoteTier({ dataDir = DATA_DIR, lastRun = null, opt
     const accepts = readJsonl(f(dataDir, 'history')).filter((h) => h.accepted === true);
     const lastN = accepts.slice(-consecutive);
     if (lastN.length < consecutive) return { state: 'skipped', reason: `接受轮次不足 ${consecutive}(仅 ${lastN.length},样本会变,别把一次高分当规律)` };
+    // S10-F1(2026-11-17 夜审):接受轮跨度上限——陈旧历史(如 30 天前)+今日 1 轮不得拼凑"连续 N 轮"。
+    // 跨度须 ≤ consecutive×节流×2(容正常多周期间隔,拒跨月拼凑);与下方 minSpacing 下限夹出合理时间窗。
+    const spanMs = (lastN[lastN.length - 1].at || 0) - (lastN[0].at || 0);
+    if (spanMs > consecutive * throt * 2) return { state: 'skipped', reason: '接受轮跨度过大,陈旧历史拼凑不算近期连续稳定' };
     for (let i = 1; i < lastN.length; i += 1) {
       if ((lastN[i].at || 0) - (lastN[i - 1].at || 0) < minSpacingMs) {
         return { state: 'skipped', reason: '相邻接受轮间隔不足,同批重跑不算时间稳定性' };

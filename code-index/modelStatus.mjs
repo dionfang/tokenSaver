@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { DATA_DIR, loadConfig, decisionLocalWanted } from './config.mjs';
@@ -1124,6 +1124,8 @@ export async function assessModelStatus({ sessionId = null } = {}) {
       // 这里借每轮健康评估(缓存 5 分钟)轻量判定,缺位即 detached 后台补预热(warm.mjs 幂等,双模型对齐);fail-open。
       // 2026-11-08:决策模型(tev1)同轨并入——已下载未驻留时同样补预热;显式远程/开关关时不带决策字段,不加决策闸。
       try { maybeWarmReranker({ health: decisionLocalWanted() ? { modelIn, ollama, rerankInstalled, rerankRunning, decisionInstalled, decisionRunning } : { modelIn, ollama, rerankInstalled, rerankRunning }, minIntervalMs: warmMinIntervalMs }); } catch { /* 拉起失败不影响状态句 */ }
+      // Ollama runner 异常自愈(2026-11-17 用户定案,默认开):llm server error 连判两轮 + 过冷却 ⇒ 重启 serve 回拉
+      try { ollamaRunnerSelfHeal({ running, models, decisionWanted: decisionLocalWanted() }); } catch { /* 自愈失败不影响状态句 */ }
     }
   }
 
@@ -1276,4 +1278,101 @@ export async function assessModelStatusCached(sessionId = null, { healthMaxAgeMs
     return renderStatusWith(cached.health, sessionId);
   }
   return assessModelStatus({ sessionId });
+}
+
+// ---------- Ollama runner 异常自愈(2026-11-17 用户定案,默认开) ----------
+
+/** 解析 server.log 行首时间戳(本地时区数构)为毫秒;缺时间戳返回 null。 */
+export function ollamaLogTs(line) {
+  const m = String(line || '').match(/^time=(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).getTime();
+}
+
+/** 近 windowMs 内 "llm server error" 行数(无时间戳的 error 行保守计 1)。 */
+export function ollamaLogErrCount(text, now = Date.now(), windowMs = 5 * 60 * 1000) {
+  let n = 0;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (!line.includes('llm server error')) continue;
+    const ts = ollamaLogTs(line);
+    if (ts == null || now - ts <= windowMs) n += 1;
+  }
+  return n;
+}
+
+/** runner 异常判定(纯函数):有期望模型缺驻留 且 日志近期 err ≥ minErr。 */
+export function ollamaRunnerUnhealthy({ missingModels = [], logText = '', now = Date.now(), errWindowMs = 5 * 60 * 1000, minErr = 2 } = {}) {
+  if (!missingModels.length) return { unhealthy: false, reason: '驻留齐全', errCount: 0, missing: [] };
+  const errCount = ollamaLogErrCount(logText, now, errWindowMs);
+  const unhealthy = errCount >= minErr;
+  return { unhealthy, errCount, missing: missingModels, reason: unhealthy ? `runner 异常(近期 llm server error ×${errCount})` : '仅空闲卸载(无 runner 异常)' };
+}
+
+/** 重启决策(纯函数):连判 ≥2 且过冷却(冷却后连判计数清零)。 */
+export function decideOllamaRestart({ unhealthy, streak = 0, lastRestartAt = 0, now = Date.now(), cooldownMs = 30 * 60 * 1000, auto = true } = {}) {
+  if (!auto) return { restart: false, streak: 0, reason: '自动重启已关(仅检测留痕)' };
+  if (!unhealthy) return { restart: false, streak: 0, reason: '健康' };
+  const next = streak + 1;
+  if (next < 2) return { restart: false, streak: next, reason: '连判 1/2' };
+  if (lastRestartAt && now - lastRestartAt < cooldownMs) return { restart: false, streak: 0, reason: '冷却中' };
+  return { restart: true, streak: 0, reason: '连判≥2 且过冷却' };
+}
+
+const ollamaHealthStatePath = () => path.join(DATA_DIR, 'routing', 'ollama-health.json');
+const ollamaRestartLogPath = () => path.join(DATA_DIR, 'routing', 'ollama-restart.log');
+
+function readOllamaHealthState() {
+  try { const j = JSON.parse(fs.readFileSync(ollamaHealthStatePath(), 'utf8')); return j && typeof j === 'object' ? j : {}; } catch { return {}; }
+}
+function writeOllamaHealthState(s) {
+  try { fs.mkdirSync(path.dirname(ollamaHealthStatePath()), { recursive: true }); atomicWriteFileSync(ollamaHealthStatePath(), JSON.stringify(s)); } catch { /* 状态写失败不影响 */ }
+}
+function logOllamaRestart(rec) {
+  try { fs.mkdirSync(path.dirname(ollamaRestartLogPath()), { recursive: true }); fs.appendFileSync(ollamaRestartLogPath(), JSON.stringify(rec) + '\n'); } catch { /* 留痕失败不影响 */ }
+}
+
+/** Ollama server.log 路径(Windows: %LOCALAPPDATA%\Ollama\server.log;非 win 走 ~/.ollama/logs)。 */
+export function ollamaServerLogPath(home = os.homedir(), env = process.env) {
+  if (process.platform !== 'win32') return path.join(home, '.ollama', 'logs', 'server.log');
+  return path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ollama', 'server.log');
+}
+
+/** 触发重启:Windows 下 taskkill serve(托盘自动拉回,2026-11-17 实测路径);随后 detached warm 回拉。 */
+export function restartOllamaNow({ now = Date.now(), spawnFn = null, taskkillFn = null } = {}) {
+  if (process.platform !== 'win32') return { restarted: false, reason: '非 Windows,跳过(交系统服务管理)' };
+  try {
+    const r = taskkillFn ? taskkillFn() : spawnSync('taskkill', ['//F', '//IM', 'ollama.exe'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    logOllamaRestart({ at: now, status: r?.status === 0 || r?.status == null ? 'killed' : `taskkill rc=${r?.status}`, note: 'ollama runner 异常自愈(默认开)' });
+    writeOllamaHealthState({ unhealthyStreak: 0, lastRestartAt: now });
+    console.error('[ollama-heal] 已重启 ollama serve(托盘自动拉回),随后后台回拉模型');
+    const warmPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'warm.mjs');
+    try {
+      const sp = spawnFn || spawn;
+      const child = sp(process.execPath, [warmPath], { cwd: path.dirname(warmPath), stdio: 'ignore', detached: true, windowsHide: true });
+      child.unref?.();
+    } catch { /* warm 回拉失败下轮再自愈 */ }
+    return { restarted: true };
+  } catch (e) { return { restarted: false, reason: `异常:${e && e.message}` }; }
+}
+
+/** 每轮健康评估触发(ollama=up 分支):读状态→检测→决策→执行。注入 spawnFn/taskkillFn 供测试密闭。 */
+function ollamaRunnerSelfHeal({ running, models, decisionWanted, now = Date.now(), spawnFn = null, taskkillFn = null } = {}) {
+  const c = loadConfig();
+  if (c.ollamaAutoRestart === false) return { action: 'off' };
+  const want = decisionWanted ? [models.embedding, models.reranker, models.decision] : [models.embedding, models.reranker];
+  const missing = want.filter((m) => !modelListed(running, m));
+  let logText = '';
+  try {
+    const lp = ollamaServerLogPath();
+    const st = fs.statSync(lp);
+    logText = fs.readFileSync(lp, { encoding: 'utf8', start: Math.max(0, st.size - 64 * 1024), end: st.size });
+  } catch { /* 无日志=无 runner 异常证据 */ }
+  const probe = ollamaRunnerUnhealthy({ missingModels: missing, logText, now, errWindowMs: 5 * 60 * 1000 });
+  const prev = readOllamaHealthState();
+  const cooldown = Math.max(1000, Math.floor(Number(c.ollamaRestartCooldownMs) || 30 * 60 * 1000));
+  const dec = decideOllamaRestart({ unhealthy: probe.unhealthy, streak: Number(prev.unhealthyStreak) || 0, lastRestartAt: Number(prev.lastRestartAt) || 0, now, cooldownMs: cooldown });
+  if (dec.restart) { restartOllamaNow({ now, spawnFn, taskkillFn }); return { action: 'restarted', ...probe, decision: dec.reason }; }
+  if (dec.streak !== (Number(prev.unhealthyStreak) || 0)) writeOllamaHealthState({ unhealthyStreak: dec.streak, lastRestartAt: Number(prev.lastRestartAt) || 0 });
+  if (probe.unhealthy) console.error(`[ollama-heal] runner 异常候选(缺 ${probe.missing.join(',')};${dec.reason})`);
+  return { action: 'probe', ...probe, decision: dec.reason };
 }

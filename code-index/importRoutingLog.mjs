@@ -139,7 +139,7 @@ export async function buildCandidates({ logFile = DEFAULT_LOG, dbPath = DEFAULT_
   }
   if (out) {
     fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.writeFileSync(out, rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : ''));
+    atomicWriteFileSync(out, rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')); // S5-F1(2026-11-17 复核回改):原子写(11-14 修复曾被并行会话回退,夜审判假 fixed)
   }
   return { total: raw.length, candidates: candidates.length, aligned: rows.length, missed, labeled: rows.filter((r) => r.label).length, out };
 }

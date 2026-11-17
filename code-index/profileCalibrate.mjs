@@ -15,6 +15,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from './config.mjs';
 import { labelFromCounts } from './tierTruth.mjs';
+import { normalizeType } from './classify.mjs';
+import { R1_AMBIGUOUS_CONF } from './thresholds.mjs'; // S1-F2(2026-11-17):歧义窗阈值取单源,消标定器硬编码 0.5
 
 const readJsonl = (f) => { try { return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; } };
 const TYPE2TIER = { multi: 'R2', routine: 'R1', light: 'R1' };
@@ -33,7 +35,7 @@ function voteLabel(voters) {
     const t = v && v.type ? String(v.type) : null;
     if (!t) continue;
     let w = Number.isFinite(Number(v.weight)) && Number(v.weight) > 0 ? Number(v.weight) : 1;
-    if (name === 'decision' && w > 1 && voters.behavior && voters.behavior.type && t !== String(voters.behavior.type)) w = 1;
+    if (name === 'decision' && w > 1 && voters.behavior && voters.behavior.type && normalizeType(t) !== normalizeType(String(voters.behavior.type))) w = 1; // S2-F4(2026-11-17):与正本 autoLabel:105 同口径,归一后比较防 T 旧值跨值域恒不相等误降权
     tally[t] = (tally[t] || 0) + w; total += w; (detail[t] = detail[t] || []).push(name);
   }
   const entries = Object.entries(tally).sort((a, b) => b[1] - a[1]);
@@ -68,7 +70,7 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
       let trig = 0, rescued = 0, hit = 0, wrong = 0;
       for (const r of rows) {
         if (r.l1Tier !== 'R1') continue;
-        if (window === 'ambiguous' && !(r.l1Conf <= 0.5)) continue;
+        if (window === 'ambiguous' && !(r.l1Conf <= R1_AMBIGUOUS_CONF)) continue;
         trig += 1;
         if (r.dmTier === 'R2' && r.dmConf >= minConf) { rescued += 1; if (r.truth === 'R2') hit += 1; else wrong += 1; }
       }

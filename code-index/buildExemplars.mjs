@@ -102,6 +102,20 @@ export function buildExemplars(pool, { capPerLabel = 0, totalCap = 0, dynamicQuo
   return { version: 1, builtAt: new Date().toISOString(), source: 'weak-v1', stats, exemplars };
 }
 
+/** 配额解析:正数才启用;0、缺省、非数都是不限。CLI 正数盖过配置,CLI 的 0 表示读配置。
+ *  不能写成 `Number(x) || 120`——0 是「不限」,会被 || 吃掉并装回旧上限。 */
+export function resolveExemplarCaps(exCfg = {}, cli = {}) {
+  const pos = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  return {
+    capPerLabel: pos(cli.cap) || pos(exCfg.capPerLabel),
+    totalCap: pos(cli.totalCap) || pos(exCfg.totalCap),
+    dynamicQuota: exCfg.dynamicQuota !== false,
+  };
+}
+
 /** 黄金集分层:项目配额 × 类别轮转(尽量覆盖多类型)。plan={项目名:配额};池不足的配额作废。 */
 export function selectGolden(pool, plan = {}) {
   const byProject = new Map();
@@ -230,10 +244,7 @@ function main() {
     process.exit(1);
   }
   const exCfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
-  const capPerLabel = cap || Number(exCfg.capPerLabel) || 120;
-  const totalCap = totalCapOpt || Number(exCfg.totalCap) || 400;
-  const dynamicQuota = exCfg.dynamicQuota !== false;
-  const exemplars = buildExemplars(pool, { capPerLabel, totalCap, dynamicQuota });
+  const exemplars = buildExemplars(pool, resolveExemplarCaps(exCfg, { cap, totalCap: totalCapOpt }));
   fs.mkdirSync(outDir, { recursive: true });
   atomicWriteFileSync(path.join(outDir, 'exemplars.json'), JSON.stringify(exemplars, null, 1) + '\n');
   // 项目配额:按池占比分配 goldenN,foodFocus/TokenSaver/yiwu 优先,工作区 draft 归并为 workspace

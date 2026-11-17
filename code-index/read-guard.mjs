@@ -172,6 +172,26 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
       if (/^[-/]/.test(t)) return /[rRs]/.test(t.slice(1));
       return false;
     });
+    // S3-F1(2026-11-17 夜审):非递归通配删除(rm agent_reports/ab-logs/* / del …\*.json)不走 -r 门控,
+    // 但 glob 会清空保护目录内容——glob 目标的目录部分落入保护目录/工作区即拦(结构性缺口补全)。
+    if (hasProtected) {
+      const covers = (from, to) => { const rel = path.relative(from, to); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+      for (const t of rest) {
+        if (t.startsWith('-')) continue;
+        const bare = t.replace(/^["']|["']$/g, '');
+        if (!bare.includes('*')) continue;
+        const dirPart = bare.split(/[\\/]/).filter((s) => s && !s.includes('*')).join('/');
+        const absDir = expandTarget(dirPart || '.', cwd);
+        if (!absDir) continue;
+        const norm = absDir.replace(/[\\/]+$/, '');
+        if (PROTECTED_DATA.test(absDir) || /(^|[\\/])data$/i.test(norm)
+          || covers(absDir, path.resolve(cwd, 'agent_reports', 'ab-logs'))
+          || covers(absDir, path.resolve(cwd, 'test', 'ab'))
+          || norm === path.resolve(cwd)) {
+          return { permission: 'deny', kind: 'Clean', reason: `通配删除命中保护目录 ${bare}(非递归也可清空证据)` };
+        }
+      }
+    }
     if (!recursive) continue;
     for (const t of rest) {
       if (t.startsWith('-')) continue;

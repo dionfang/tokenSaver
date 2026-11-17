@@ -201,6 +201,8 @@ export function mergeAutoSigned(freshRows, existing = []) {
       continue;
     }
     seen.add(k);
+    // S12-F1(2026-11-17 夜审,纵深):fresh 行入库前复检 isSigned/值域——非法标签不穿透(上游 autoSignGolden 已预过滤,此为兜底)
+    if (!isSigned(r)) continue;
     out.push({ ...r, pkey: k });
   }
   return out;

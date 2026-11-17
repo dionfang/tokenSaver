@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR, decisionActive, loadConfig } from './config.mjs';
 import { isInquiryShape, normalizeType, classifyPrompt } from './classify.mjs';
-import { buildExemplars, loadPool, promptKey } from './buildExemplars.mjs';
+import { buildExemplars, loadPool, promptKey, resolveExemplarCaps } from './buildExemplars.mjs';
 import { atomicWriteFileSync, takeJsonLock, releaseJsonLock } from './proc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -80,6 +80,22 @@ function recordContested(dataDir, entries = []) {
 }
 
 function readJson(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
+
+/** 本轮复核已摘签的行不再以代签身份进样本库。pkey 与 promptKey 都参与对齐。 */
+export function dropDemotedSigned(signedRows, demotedRows) {
+  const dropped = new Set();
+  for (const d of demotedRows || []) {
+    if (!d) continue;
+    if (d.pkey) dropped.add(String(d.pkey));
+    const k = promptKey(d.prompt || '');
+    if (k) dropped.add(k);
+  }
+  return (signedRows || []).filter((s) => {
+    if (!s || !s.prompt) return false;
+    if (s.pkey && dropped.has(String(s.pkey))) return false;
+    return !dropped.has(promptKey(s.prompt));
+  });
+}
 
 /**
  * 合并两个池(raw-labels 历史弱标签 + routing-log 行为标签),按 promptKey 跨文件去重。
@@ -239,7 +255,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     // "行为形态"标签;代签标签是四票合议,更准 ⇒ 同 prompt 去重**代签排最前**(mergePools 先到先得)。
     // 旧实现把 raw 弱标签放 primary 位,172 条代签只有 4-5 条进库(97% 被去重+120/类配额掐断),
     // "进化回路"两端皆断——现 signed → raw → routing-log 三级优先,配额内代签先占位。
-    const signedPool = signedRows.map((s) => ({
+    const signedPool = dropDemotedSigned(signedRows, reviewStats && reviewStats.demotedRows).map((s) => ({
       id: `as-${String(s.pkey || s.prompt || '').slice(0, 12)}`,
       project: s.project || 'TokenSaver',
       prompt: s.prompt,
@@ -254,11 +270,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     }));
     const merged = mergePools([...signedPool, ...primary], extra);
     const exCfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
-    const builtLib = buildExemplars(merged, {
-      capPerLabel: Number(exCfg.capPerLabel) || 120,
-      totalCap: Number(exCfg.totalCap) || 400,
-      dynamicQuota: exCfg.dynamicQuota !== false,
-    }); // 返回 {version,builtAt,source,stats,exemplars[]};配额策略 2026-11-10 起由 config.exemplars 控制
+    const builtLib = buildExemplars(merged, resolveExemplarCaps(exCfg)); // 0=不限;正数才截断
     const exemplars = builtLib.exemplars;
     const outFile = path.join(dataDir, 'routing', 'exemplars.json');
     const before = readJson(outFile);
@@ -267,7 +279,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     const sig = (arr) => arr.map((e) => `${e.id}:${e.label}`).join('|');
     const beforeSig = before && Array.isArray(before.exemplars) ? sig(before.exemplars) : '';
     const beforeN = (before && Array.isArray(before.exemplars) ? before.exemplars : []).length;
-    fs.writeFileSync(outFile, JSON.stringify({ ...builtLib, source: 'raw-labels + 自动代签 + routing-log行为形态' }, null, 1) + '\n');
+    atomicWriteFileSync(outFile, JSON.stringify({ ...builtLib, source: 'raw-labels + 自动代签 + routing-log行为形态' }, null, 1) + '\n');
     const changed = sig(exemplars) !== beforeSig;
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     const slim = (o) => (o ? Object.fromEntries(Object.entries(o).filter(([k]) => !/Rows$/.test(k))) : o); // 状态文件不落整批行(防膨胀)
@@ -593,9 +605,40 @@ function readJsonl(f) {
  */
 async function detectShadowHost() { return null; }
 
-// CLI:node autoExemplars.mjs --review-golden(手动触发一轮复核翻案;6h 周期由 maybeGrowPool 自动带)
+/** 只重写黄金集与样本库,不嵌向量。托盘先等这一步结束并刷新进度条,再另起 --build-vectors。 */
+export async function growDecisionNow({ dataDir = DATA_DIR } = {}) {
+  return maybeGrowPool({ dataDir, minIntervalMs: 0, spawnVectors: false });
+}
+
+/** 命令行一步做完:无视 6 小时节流,先更新黄金集与样本库,再重嵌决策向量。对齐失败不改样本库,仍重嵌现有库。 */
+export async function syncDecisionNow({ dataDir = DATA_DIR } = {}) {
+  const grown = await growDecisionNow({ dataDir });
+  const { buildVectors } = await import('./modelRoute.mjs');
+  const vectors = await buildVectors({ dataDir });
+  return { grown, vectors };
+}
+
+// CLI:node autoExemplars.mjs --review-golden | --grow-now | --sync-now
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (directRun && process.argv.includes('--review-golden')) {
   reviewGolden().then((r) => console.log(JSON.stringify(r))).catch((e) => { console.error(`[err] ${e && e.message ? e.message : e}`); process.exit(1); });
+}
+if (directRun && process.argv.includes('--grow-now') && !process.argv.includes('--sync-now')) {
+  growDecisionNow().then((g) => {
+    console.log(JSON.stringify({ grow: g.state, reason: g.reason || null, exemplars: g.exemplars ?? null }));
+    if (g.state === 'failed') process.exit(1);
+    process.exit(0);
+  }).catch((e) => { console.error(`[err] ${e && e.message ? e.message : e}`); process.exit(1); });
+}
+if (directRun && process.argv.includes('--sync-now')) {
+  syncDecisionNow().then((r) => {
+    const g = r.grown || {};
+    console.log(JSON.stringify({
+      grow: g.state, reason: g.reason || null, exemplars: g.exemplars ?? null,
+      embedded: r.vectors.embedded, reusedLocal: r.vectors.reusedLocal, ok: r.vectors.ok,
+    }));
+    if (g.state === 'failed') process.exit(1);
+    process.exit(0);
+  }).catch((e) => { console.error(`[err] ${e && e.message ? e.message : e}`); process.exit(1); });
 }
 

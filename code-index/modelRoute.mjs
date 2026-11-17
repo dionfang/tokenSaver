@@ -131,6 +131,20 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
   const overrides = {};
   const seen = new Set();
   let embedded = 0, reusedBase = 0, reusedLocal = 0, fail = 0, dim = 0;
+  // 托盘快通道 5 秒读一次。进度文件按同一间隔落盘,不按条写。
+  // covered 只计本地已复用+新嵌入。开头写一次 0,面板用 max(旧条数, covered),不会闪成 0。向量文件写完后删掉。
+  const progressFile = path.join(dataDir, 'routing', 'build-vectors.progress.json');
+  const PROGRESS_WRITE_MS = 5_000;
+  let progressWrittenAt = 0;
+  const noteProgress = (force = false) => {
+    const t = Date.now();
+    if (!force && progressWrittenAt && t - progressWrittenAt < PROGRESS_WRITE_MS) return;
+    progressWrittenAt = t;
+    try {
+      fs.mkdirSync(path.dirname(progressFile), { recursive: true });
+      fs.writeFileSync(progressFile, JSON.stringify({ covered: reusedLocal + embedded, total: ex.exemplars.length, pid: process.pid }));
+    } catch { /* 进度失败不影响嵌入 */ }
+  };
   let targetDim = 0; // 目标模型实测维度(S4-F1:dim 锚定到目标模型产出,旧档复用可能带历史污染)
   const put = (key, meta, v) => {
     if (!dim && v && v.length) dim = v.length;
@@ -158,6 +172,8 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
       }
     : async (t) => (await import('./rangePick.mjs')).embedIntentResilient(t, want);
   const embedForWantFinal = embedFn || embedForWant; // 显式注入(测试密闭)优先
+  try {
+  noteProgress(true);
   for (const e of ex.exemplars) {
     if (!e || !e.prompt) continue;
     const key = vectorKeyOf(e.prompt, want);
@@ -172,10 +188,10 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
     }
     const old = oldOk && oldOk.vectors[key] ? oldOk.vectors[key] : null;
     const oldV = entryVector(old);
-    if (oldV) { put(key, meta, oldV); reusedLocal += 1; continue; }
+    if (oldV) { put(key, meta, oldV); reusedLocal += 1; noteProgress(); continue; }
     try {
       const v = await embedForWantFinal(e.prompt);
-      if (Array.isArray(v) && v.length) { put(key, meta, v); if (!targetDim) targetDim = v.length; embedded += 1; continue; }
+      if (Array.isArray(v) && v.length) { put(key, meta, v); if (!targetDim) targetDim = v.length; embedded += 1; noteProgress(); continue; }
     } catch (err) { if (failFast) throw err; }
     fail += 1;
   }
@@ -204,6 +220,9 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
   fs.mkdirSync(path.dirname(out), { recursive: true });
   atomicWriteFileSync(out, JSON.stringify(doc));
   return { ok: doc.ok, embedded, reusedBase, reusedLocal, fail, out, dim, model: want, authority: auth, slug: paths.slug };
+  } finally {
+    try { fs.unlinkSync(progressFile); } catch { /* 无进度文件 */ }
+  }
 }
 
 /** 向量库与当前嵌入模型是否同源(2026-11-08 修):旧档无 model 字段=不匹配(宁可弃权不出错票)。 */
@@ -470,7 +489,7 @@ export async function classifyRoute(prompt, { dataDir = DATA_DIR, cfg = null, em
  * v2 R3 救援(2026-11-08 重建裁定):词法判 R2 且 kNN 以更高置信(r3MinConf)投 **R3** ⇒ 救回 R3。
  *   向量库当前无 R3 类嵌入(精确真值样本=上梯后干净完成,由 tier-evidence 积累,每类 ≥8 条后由向量构建方
  *   补嵌)⇒ 样本不足时 kNN 投不出 R3,该分支自然不触发(fail-open,零影响);routine/light 票仍无救回意义。
- * 纯函数可测;代理侧由 modelRouting.l2Live.enabled(默认关)门控 + fail-open,向量库/embedFn 缺失=零影响。
+ * 纯函数可测;代理侧 shadow/live 两道总闸恒开(2026-11-14 用户裁定,l2Live/l2.live 开关键不再读取)+ fail-open,向量库/embedFn 缺失=票弃权零影响。
  * 返回 {tier, confidence, rule} 或 null(不介入)。
  */
 export function l2TierRescue(diff, l2, { minConf = 0.8, r3MinConf = 0.85 } = {}) {

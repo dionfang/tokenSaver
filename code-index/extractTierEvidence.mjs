@@ -338,15 +338,17 @@ export function buildEvidence({ usageFile = DEFAULT_USAGE, dbPath = DEFAULT_DB, 
     mapRows.set(`${seg.conv}|${d.session}`, { conv: seg.conv, session: d.session, ts: seg.human.ts, via: row.join });
   }
   outRows.sort((a, b) => a.ts - b.ts);
-  if (out) {
+  // S5-F1(2026-11-17 夜审):0 对齐拒绝写空守卫——有候选段却零对齐时不覆盖既有证据(防 db 瞬断/口径漂移清空),与 importRoutingLog 同族
+  const zeroAlign = segs.length > 0 && aligned === 0;
+  if (out && !zeroAlign) {
     fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.writeFileSync(out, outRows.map((r) => JSON.stringify(r)).join('\n') + (outRows.length ? '\n' : ''));
+    atomicWriteFileSync(out, outRows.map((r) => JSON.stringify(r)).join('\n') + (outRows.length ? '\n' : ''));
   }
-  if (mapFile) {
+  if (mapFile && !zeroAlign) {
     fs.mkdirSync(path.dirname(mapFile), { recursive: true });
-    fs.writeFileSync(mapFile, [...mapRows.values()].map((r) => JSON.stringify(r)).join('\n') + (mapRows.size ? '\n' : ''));
+    atomicWriteFileSync(mapFile, [...mapRows.values()].map((r) => JSON.stringify(r)).join('\n') + (mapRows.size ? '\n' : ''));
   }
-  return { segs: segs.length, dbMsgs: dbMsgs.length, aligned, dup, pkeyJoined, missed, map: mapRows.size, rows: outRows, out };
+  return { segs: segs.length, dbMsgs: dbMsgs.length, aligned, dup, pkeyJoined, missed, map: mapRows.size, rows: outRows, out, zeroAlign };
 }
 
 function lowerBound(axis, ts) {

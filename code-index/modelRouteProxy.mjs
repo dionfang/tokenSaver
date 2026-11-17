@@ -48,7 +48,7 @@ import { DATA_DIR, loadConfig } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
-import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext } from './thresholds.mjs'; // S1-F4:歧义窗/上梯表单源(thresholds.mjs)
+import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS } from './thresholds.mjs'; // S1-F4:歧义窗/上梯表单源(thresholds.mjs);S1-F2(2026-11-17):门控两值并入单源
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
 import { resolveDecisionProfile } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
@@ -68,7 +68,7 @@ function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8'))
 // 要放行改 data 配置 switchGuard.enabled=false),阶段轮数上限恒生效。
 // maxPhaseTurns(2026-11-04 迁移):语义属阶段生命周期、不受门控开关控制,配置新家=modelRouting.maxPhaseTurns
 // (旧位置 switchGuard.maxPhaseTurns 仍兼容读取);此处保留作为 decideTarget 无配置时的兜底默认。
-const DEFAULT_GUARD = { enabled: true, maxContextTokens: 200000, maxPhaseTurns: 4 };
+const DEFAULT_GUARD = { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS, maxPhaseTurns: MAX_PHASE_TURNS }; // S1-F2(2026-11-17):两值取 thresholds 单源,消残余硬编码
 
 // 门控疲劳放行(2026-11-05 用户定档):同会话被门控连续拦截满 N 次 ⇒ 放行一次升档(证据消耗,计数随新阶段归零)。
 // 疲劳 = "反复想升档却一直被拦"的会话级证据,兜住 R1 干完了但质量差、无 P2 报错信号的场景;
@@ -1542,7 +1542,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
             });
             // 歧义轮(置信≤0.5 的 R1)影子 A/B:只记"改判 R2"会解析到哪,不改实弹——攒数据再定策略
-            const ambiguousR1 = diff.tier === 'R1' && Number(diff.confidence) <= 0.5;
+            const ambiguousR1 = diff.tier === 'R1' && Number(diff.confidence) <= RREF_AMB_CONF; // S1-F2(2026-11-17):歧义窗阈值取单源
             const amb = ambiguousR1 ? resolveTier('R2', {
               cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
               inventory: inventory0, health: health0,
@@ -1760,7 +1760,8 @@ export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.co
     r3Lexical: { enabled: true, eagerEscalate: true },
     // 决策模型 R-ref 预兜底票(v2.1→v2.6 2026-11-08;v4 2026-11-09 远程链删,恒本地档案制):
     // decisionOn 恒 true(本地判定恒启用,断路器另有挡闸);rRef 参数走模型判定档案——
-    // 默认表 tev1 0.4/all-r1、strands 0.8/all-r1,data JSON profiles 可覆盖,未建档回退 FALLBACK(旧硬编码,零漂移)。
+    // 默认表 tev1/strands 按档案标定;参数权威=代码档案表+服务器档案层(base 包内嵌 profiles/独立 decision-profiles.base.json),
+    // 客户端 config profiles 覆盖通道已移除(2026-11-14,S2-F5①);未建档回退 FALLBACK(救回影子+代签保守计权,零漂移)。
     decisionOn: true,
     rRef: (() => {
       const prof = resolveDecisionProfile(readJson(configPath), { dataDir: path.dirname(configPath) }) // 档案层文件随 dataDir(测试隔离契约,同断路器);

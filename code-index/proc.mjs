@@ -41,8 +41,13 @@ export function takeJsonLock(lockPath) {
   return false;
 }
 
-export function releaseJsonLock(lockPath) {
-  try { fs.unlinkSync(lockPath); } catch { /* 已释放 */ }
+/** 只删除本进程持有的锁。晚退出的旧进程不能删掉后任已经写上的锁。 */
+export function releaseJsonLock(lockPath, ownerPid = process.pid) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    if (Number(raw?.pid) !== Number(ownerPid)) return false;
+  } catch { return false; }
+  try { fs.unlinkSync(lockPath); return true; } catch { return false; }
 }
 
 /**

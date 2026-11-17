@@ -25,5 +25,6 @@ export function collectPaths({ moduleDir = here } = {}) {
   };
 }
 
-const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+// 必须 fileURLToPath:pathname 在含空格路径下保留 %20,会导致 CLI 直跑判定失败、托盘当 degraded
+const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (directRun) console.log(JSON.stringify(collectPaths(), null, 1));

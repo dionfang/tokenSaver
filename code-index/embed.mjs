@@ -25,7 +25,7 @@ import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, release
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, decisionLocalWanted } from './config.mjs';
 import { vectorPaths, readVectorMeta, writeVectorMeta, wantEmbedModel } from './vectorStore.mjs';
 import { ensureLocalResident, residentEmbed } from './localResident.mjs';
-import { takeJsonLock, releaseJsonLock } from './proc.mjs';
+import { takeJsonLock, releaseJsonLock, pidAlive } from './proc.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
@@ -101,11 +101,14 @@ if (!FORCE && meta.signature === curSig && fs.existsSync(EMB_PATH) && meta.model
 // S4-F1(2026-11-11 夜审):旧"读-查-直写"两步非原子,与 --build-vectors 的 wx 锁交叉互拆 → 双嵌入竞跑。
 // 统一走 takeJsonLock(wx-first + 陈旧接管,2026-11-10 修的原语;写 {pid,ts} 与 embedBusy 读形一致),持有至退出。
 {
+  let prev = null;
+  try { prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8')); } catch { /* 无锁或损坏 */ }
   if (!takeJsonLock(PIDFILE)) {
-    let prev = { pid: NaN, ts: 0 };
-    try { prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8')); } catch { /* 锁主读不出 */ }
-    console.log(`[warn] 已有嵌入进程在运行(pid ${Number(prev.pid) || '?'},ts ${Number(prev.ts) || '?'}),本次退出`);
+    console.log(`[warn] 已有嵌入进程在运行(pid ${Number(prev?.pid) || '?'},ts ${Number(prev?.ts) || '?'}),本次退出`);
     process.exit(0);
+  }
+  if (prev && Number.isFinite(Number(prev.pid)) && !pidAlive(Number(prev.pid))) {
+    console.log(`[info] 接管过期嵌入锁(原 pid ${prev.pid} 已不在)`);
   }
   process.on('exit', () => { releaseJsonLock(PIDFILE); });
 }
@@ -281,15 +284,20 @@ if (misses.length) {
     fs.renameSync(PAIRED_PATH + '.' + process.pid + '.tmp', PAIRED_PATH);
     console.log(`[info] 部分进度已落盘(${doneRows.length}/${misses.length},崩溃可续)`);
   };
-  for (let b = 0; b * BATCH < misses.length; b++) {
-    const idxs = misses.slice(b * BATCH, (b + 1) * BATCH);
-    const rowsPart = await emb.embed(idxs.map(i => chunks[i].t));
-    if (rowsPart.length !== idxs.length) { console.error(`[err] 嵌入返回 ${rowsPart.length} 行,期望 ${idxs.length}`); process.exit(1); }
-    rowsPart.forEach((row, k) => { vec.set(row, idxs[k] * emb.dim); doneRows.push(row); });
-    doneIdx.push(...idxs);
-    console.log(`[progress] 嵌入 ${doneRows.length}/${misses.length}`);
-    if ((b + 1) % 8 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
-    if (PACE_MS && (b + 1) * BATCH < misses.length) await new Promise(r => setTimeout(r, PACE_MS)); // 批间喘息(WHEA 缓解)
+  try {
+    for (let b = 0; b * BATCH < misses.length; b++) {
+      const idxs = misses.slice(b * BATCH, (b + 1) * BATCH);
+      const rowsPart = await emb.embed(idxs.map(i => chunks[i].t));
+      if (rowsPart.length !== idxs.length) { console.error(`[err] 嵌入返回 ${rowsPart.length} 行,期望 ${idxs.length}`); process.exit(1); }
+      rowsPart.forEach((row, k) => { vec.set(row, idxs[k] * emb.dim); doneRows.push(row); });
+      doneIdx.push(...idxs);
+      console.log(`[progress] 嵌入 ${doneRows.length}/${misses.length}`);
+      if ((b + 1) % 8 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
+      if (PACE_MS && (b + 1) * BATCH < misses.length) await new Promise(r => setTimeout(r, PACE_MS)); // 批间喘息(WHEA 缓解)
+    }
+  } catch (e) {
+    console.error(`[err] 嵌入中断(${String(e?.message || e).slice(0, 200)}),释放锁;冷却结束后自动续嵌`);
+    process.exit(1);
   }
 }
 

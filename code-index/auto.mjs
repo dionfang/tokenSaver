@@ -13,7 +13,7 @@ import { loadConfig, DATA_DIR, gitHeadOf } from './config.mjs';
 import { assessModelStatus } from './modelStatus.mjs';
 import { readVectorMeta, vectorStoreNeedsEmbed, wantEmbedModel } from './vectorStore.mjs';
 import { takeJsonLock, releaseJsonLock, spawnLogged } from './proc.mjs';
-import { embedBusy, embedCrashed } from './embedGate.mjs'; // S4-F3 busy 判定单源化;embedCrashed=崩溃残留判定(WHEA 防再点火,2026-11-11)
+import { embedBusy, embedCrashed, EMBED_CRASH_COOLDOWN_MS } from './embedGate.mjs'; // S4-F3 busy 判定单源化;embedCrashed=冷却期内的死 pid 锁(2026-11-16 起过期可接管)
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const indexJson = path.join(DATA_DIR, 'index.json');
@@ -160,8 +160,8 @@ if (f.need) {
     if (embedBusy()) {
       console.error('[index] 后台嵌入进程已在运行,跳过重复启动');
     } else if (embedCrashed()) {
-      // 2026-11-11 修:embedPidAlive 已在 S4-F3 单源化中删除,此处漏改的未定义引用会让"需要处理"路径整段 ReferenceError,预热与状态句全被跳过
-      console.error('[index] 检测到上次嵌入异常终止(残留 .embed.pid,进程已不在),已挂起自动续嵌(WHEA 防再点火);确认机器稳定后请手动运行 node embed.mjs 恢复');
+      const min = Math.round(EMBED_CRASH_COOLDOWN_MS / 60000);
+      console.error(`[index] 上次嵌入异常终止且仍在 ${min} 分钟冷却期内,暂不自动续嵌;冷却结束后下次保鲜会接管。也可立即手动运行 node embed.mjs`);
     } else {
       const pid = spawnLogged(path.join(here, 'embed.mjs'), path.join(DATA_DIR, 'embed.log'), here).pid;
       console.error(`[index] 嵌入已转后台(pid ${pid},日志 data/embed.log;期间检索自动降级 bm25,完成后自动恢复)`);
