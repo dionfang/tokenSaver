@@ -28,6 +28,7 @@ const cosine = (a, b) => {
   return na && nb ? dot / Math.sqrt(na * nb) : 0;
 };
 const atomicWrite = (file, data) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true }); // 首装 dataDir 可能无 routing/(2026-11-17 M4 审查)
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, data);
   fs.renameSync(tmp, file);
@@ -63,7 +64,9 @@ export function importServerPack({ packPath, dataDir = DATA_DIR } = {}) {
   const want = currentEmbedModel();
   // 四防线①指纹:不符整包拒收(绝不与本地库混存,防语义空间污染)
   if (parsed.model !== want) return { ok: false, error: `指纹不符:pack.model=${parsed.model} ≠ 当前嵌入 ${want} —— 整包拒收(重嵌后重试)` };
-  const localLayer = loadVectors(dataDir);
+  // loadVectors 无 base/local 时返回 null(首装/新 dataDir/切模式未重嵌)——2026-11-17 M4 实弹审查根因:
+  // 直读 .vectors 抛 TypeError 致导入崩溃;空本地层按空库处理(近重复检测自然跳过)。
+  const localLayer = loadVectors(dataDir) || { vectors: {}, dim: 0, layers: { local: false } };
   const dim = Number(parsed.dim) || (localLayer.dim || 0);
   const accept = {}, reject = { fingerprint: 0, label: 0, dim: 0, pkey: 0 };
   for (const [pkey, e] of Object.entries(parsed.vectors || {})) {
@@ -82,7 +85,7 @@ export function importServerPack({ packPath, dataDir = DATA_DIR } = {}) {
   const doc = { version: 1, model: parsed.model, dim, builtAt: parsed.builtAt || new Date().toISOString(), source: parsed.source, authority: 'base', ok: Object.keys(accept).length, vectors: accept };
   atomicWrite(paths.base.slugFile, JSON.stringify(doc));
   // 导入后状态
-  const merged = loadVectors(dataDir, { model: parsed.model });
+  const merged = loadVectors(dataDir, { model: parsed.model }) || { vectors: {}, layers: null };
   return {
     ok: true, baseFile: paths.base.slugFile,
     accepted: Object.keys(accept).length, rejected: reject, nearDupSample: nearDup,
