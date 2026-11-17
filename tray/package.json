@@ -8,7 +8,8 @@
   "scripts": {
     "start": "electron .",
     "icon": "node assets/gen-icon.mjs",
-    "dist": "electron-builder --win nsis"
+    "dist": "electron-builder --win nsis",
+    "predist": "node build/stage-weights.mjs"
   },
   "devDependencies": {
     "electron": "^33.2.0",
