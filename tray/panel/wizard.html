@@ -116,10 +116,12 @@ function render() {
   $('btnBack').style.visibility = w.status === 'DONE' ? 'hidden' : 'visible';
   const gate = nextGate(w);
   // 2026-11-15 修复:load 推送到达前按钮禁用(S.w=null 时点击会被旧逻辑静默吞掉——加载竞态)
-  // 2026-11-16:安装/拉取/自检/接线进行中一律禁下一步(接线自动驱动,完成自动跳 DONE)
+  // 2026-11-17 修复:busy 禁用门**只作用于对应步骤**——旧全局门使下载中回退到 MODE 后
+  // 下一步仍被禁,用户回不到 ENVCHECK(页面切换死锁)。下载/自检只关 ENVCHECK,接线只关 INIT_RUN。
   const initRunning = w.status === 'INIT_RUN' && !w.lastError;
-  $('btnNext').disabled = !!S.installing || !!S.checking || initRunning || !S.w || !gate.ok;
-  $('btnNext').textContent = !S.w ? '加载中…' : (S.installing ? '安装中…' : (S.checking ? '检测中…' : (initRunning ? '正在接线…' : (w.status === 'DONE' ? '已完成' : (w.status === 'INIT_RUN' ? '正在接线…' : '下一步')))));
+  const envBusy = w.status === 'ENVCHECK' && (!!S.installing || !!S.checking);
+  $('btnNext').disabled = envBusy || initRunning || !S.w || !gate.ok;
+  $('btnNext').textContent = !S.w ? '加载中…' : (envBusy ? (S.installing ? '下载中…' : '检测中…') : (initRunning ? '正在接线…' : (w.status === 'DONE' ? '已完成' : '下一步')));
   const rc = $('btnRecheck'); if (rc) { rc.style.display = w.status === 'ENVCHECK' ? '' : 'none'; rc.disabled = !!S.installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; } // 重新自检仅 ENVCHECK 步显示于导航
   if (w.status === 'INIT') {
     $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 环境自检(缺项自动安装/拉取) → 数据上传同意 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
