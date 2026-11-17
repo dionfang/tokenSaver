@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { probeOllama, createDownloader, httpRequest } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
 import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
-import { hfWeightCached } from '../util/paths.mjs';
+import { localWeightCached } from '../util/paths.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -51,7 +51,7 @@ export function createWizardController(deps) {
   /** 软项自动安装(2026-11-16 用户需求:检测到缺失即页面自动激活,CMD 滚动+进度条):
    *  spawn 长任务,stdout/stderr 逐行推 envelope.installLog(尾部 50 行),完成后重跑 envProbe 刷新自检。
    *  deps=npm install(npmmirror;需 node 就绪);weights=localResident 常驻(HuggingFace 懒下载,
-   *  cpu 模式下常驻本就保留,完成判定=hfWeightCached 全 true 轮询)。 */
+   *  cpu 模式下常驻本就保留,完成判定=localWeightCached 全 true 轮询)。 */
 
   function pushInstallLine(chunk) {
     for (const line of String(chunk).split(/\r?\n/)) {
@@ -77,10 +77,12 @@ export function createWizardController(deps) {
     };
     if (pollWeights) {
       // 权重=localResident 常驻进程不退出;轮询 hf-cache 三项全缓存即判定完成(10min 兜底)
+      // 2026-11-17 修复:判定走 localWeightCached(与 envProbe 同源)——旧 hfWeightCached 对
+      // strands id(无 '/')恒 null,三项 every 永不成立,权重下完仍卡「安装中」直到 10min 超时
       const W = ['Xenova/jina-embeddings-v2-base-zh', 'Xenova/bge-reranker-base', 'strands:strands-decider-2B-hobson-v19:q4f16'];
       const t0 = Date.now();
       const timer = setInterval(() => {
-        const all = W.every((mid) => hfWeightCached(paths.hfCacheDir, mid) === true);
+        const all = W.every((mid) => localWeightCached(paths.hfCacheDir, mid) === true);
         if (all) { clearInterval(timer); finish('[ok] 权重全部缓存完成(hf-cache)'); }
         else if (Date.now() - t0 > 10 * 60_000) { clearInterval(timer); finish('[warn] 下载超时——可点「重新自检」重试,或由首次使用懒下载补齐'); }
       }, 5000);
@@ -144,15 +146,8 @@ export function createWizardController(deps) {
             hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——正在自动 ollama pull(或手动执行)' });
         }
       } else {
-        // strands 权重:目录名含前缀、文件名带档位后缀(model_<quant>.onnx,实测 model_q4f16.onnx),不走 hfWeightCached 的 org/name 分支
-        const cached = (id) => {
-          if (!String(id).startsWith('strands:')) return hfWeightCached(paths.hfCacheDir ?? '', id) === true;
-          const parts = String(id).split(':'); // [strands, dir, quant?]
-          const dir = parts[1] ?? '';
-          const quant = parts[2] ?? 'quantized';
-          return fs.existsSync(path.join(paths.hfCacheDir ?? '', dir, `model_${quant}.onnx`))
-            || fs.existsSync(path.join(paths.hfCacheDir ?? '', dir, 'model_quantized.onnx'));
-        };
+        // 2026-11-17:缓存判定收敛 localWeightCached(util/paths,与 pollWeights 同一函数,防两处漂移)
+        const cached = (id) => localWeightCached(paths.hfCacheDir ?? '', id) === true;
         // 2026-11-16 用户裁决:cpu 三行与 gpu 同格式显示具体模型名(本地 嵌入模型/精排模型/决策模型 <id>)
         for (const [label, id, pretty] of [
           ['嵌入模型', embId, embId],
@@ -164,6 +159,16 @@ export function createWizardController(deps) {
             hint: ok ? '已缓存(hf-cache)' : '未缓存——首次使用时自动下载(HuggingFace)' });
         }
       }
+      // 2026-11-17 审查补口(§22.2 遗留):磁盘预检——cpu 权重 ~1.7GB/gpu 模型 ~2-3GB 下载前看余量,
+      // 防半截下载。软项(不阻断:余量不足仅告警,用户可自行清理);statfs 失败=未知不判红。
+      try {
+        const target = mode === 'cpu' ? (paths.hfCacheDir || paths.dataDir) : paths.dataDir;
+        const st = fs.statfsSync(target);
+        const freeGB = (st.bavail * st.bsize) / (1024 ** 3);
+        const needGB = 2;
+        checks.push({ id: 'disk', label: `磁盘余量(${target.split(/[\\/]/)[0]} 盘)`, ok: freeGB >= needGB, hard: false,
+          hint: freeGB >= needGB ? `剩余 ${freeGB.toFixed(1)} GB(充足)` : `仅剩 ${freeGB.toFixed(1)} GB,建议 ≥${needGB} GB(模型下载可能失败,请先清理磁盘)` });
+      } catch { /*  statfs 不可用 → 不加该项(不判红) */ }
       return { checks };
     },
     runInitCommand: async (cmd) => {
