@@ -175,6 +175,7 @@ export function createPoller(deps) {
       degraded: !paths.dataDir,
       embedPid,
       modelIn: health?.modelIn ?? null,
+      models: health?.models ?? null, // 模型名(tooltip 呈现用,2026-11-17)
       consent,
     };
     onSnapshot(snapshot);

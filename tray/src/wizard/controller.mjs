@@ -14,7 +14,7 @@ import { probeOllama, createDownloader, httpRequest } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
 import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
 import { localWeightCached } from '../util/paths.mjs';
-import { missingModels, downloadWeights } from './weightsOnline.mjs';
+import { downloadWeights, planEnvFollowup } from './weightsOnline.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -254,23 +254,19 @@ export function createWizardController(deps) {
     const r = await machine.runEnvChecks();
     const env = r.state?.envChecks ?? [];
     const mode = r.state?.runMode;
-    const nodeOk = env.some((c) => c.id === 'node' && c.ok === true);
-    // gpu 模式:缺模型 → 自动 /api/pull(不依赖 node,Ollama 服务已由 MODE 门禁保证)
-    const missingModels = env.filter((c) => c.tag && c.ok !== true).map((c) => c.tag);
-    if (!envelope.installing && mode === 'gpu' && missingModels.length) {
-      pullModels(missingModels); // 异步串行,进度经 sendState 推送
-      return { ...r, ok: true, message: `开始自动拉取 ${missingModels.length} 个 Ollama 模型` };
+    // 2026-11-17:补齐计划放 weightsOnline.planEnvFollowup。此处曾用局部 const missingModels
+    // 遮蔽同名导入,cpu 缺权重时把数组当函数调用 →「missingModels is not a function」,下载永不启动。
+    const plan = planEnvFollowup(env, { mode, installing: envelope.installing });
+    if (plan.kind === 'pull') {
+      pullModels(plan.models);
+      return { ...r, ok: true, message: `开始自动拉取 ${plan.models.length} 个 Ollama 模型` };
     }
-    const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
-    if (!envelope.installing && nodeOk && depsBad) {
+    if (plan.kind === 'deps') {
       startInstall('deps', 'npm install --ignore-scripts --registry=https://registry.npmmirror.com', [], { cwd: paths.codeIndexRoot, shell: true });
     }
-    // 2026-11-17 全在线:cpu 缺权重 → HF/镜像在线下载(替代旧 localResident 懒下载触发;
-    // 三源实测有效,external-data 双文件+tokenizer,见 weightsOnline.mjs)
-    const missingW = missingModels(env);
-    if (!envelope.installing && missingW.length) {
-      startWeightsOnline(missingW);
-      return { ...r, ok: true, message: `开始在线下载 ${missingW.length} 个 CPU 权重模型` };
+    if (plan.kind === 'weights') {
+      startWeightsOnline(plan.models);
+      return { ...r, ok: true, message: `开始在线下载 ${plan.models.length} 个 CPU 权重模型` };
     }
     return r;
   }

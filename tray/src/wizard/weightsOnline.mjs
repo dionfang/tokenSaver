@@ -48,6 +48,22 @@ export function missingModels(envChecks) {
   return WEIGHT_MODELS.filter((m) => bad.has(m.rowId));
 }
 
+/** 自检之后补哪一项。gpu 缺 tag 走 pull;cpu 且 node 就绪但 deps 缺失走 npm;
+ *  否则缺的 w-* 行走在线权重。进行中(installing 非空)不插队。
+ *  调用方不得再用局部名 missingModels——那会遮蔽本函数依赖的同名导出,cpu 路径会把数组当函数调用。 */
+export function planEnvFollowup(env, { mode, installing = null } = {}) {
+  const checks = env ?? [];
+  if (installing) return { kind: 'none' };
+  const missingOllama = checks.filter((c) => c.tag && c.ok !== true).map((c) => c.tag);
+  if (mode === 'gpu' && missingOllama.length) return { kind: 'pull', models: missingOllama };
+  const nodeOk = checks.some((c) => c.id === 'node' && c.ok === true);
+  const depsBad = checks.some((c) => c.id === 'deps' && c.ok !== true);
+  if (nodeOk && depsBad) return { kind: 'deps' };
+  const weights = missingModels(checks);
+  if (weights.length) return { kind: 'weights', models: weights };
+  return { kind: 'none' };
+}
+
 /** 逐模型逐文件下载(串行,单文件失败不阻断其余文件/模型;调用方收口后重跑自检)。 */
 export async function downloadWeights({ models, downloader, baseDir, onLine = () => {} }) {
   const results = [];
