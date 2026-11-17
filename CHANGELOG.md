@@ -48,6 +48,10 @@
 - test/readme.md 全量登记(39 套件 + 17 支评测脚本);model-routing.md 口径对齐(FALLBACK 影子化、maxLatencyMs)
 - 夜间审查台账两轮闭环(20261109/20261111:61 fixed / 5 open 知情)
 
+### 移除
+
+- **npm 发布渠道整体弃用**(2026-11-17 用户拍板):删除 `npm/` 目录与 `sync-npm.mjs`,不再提供 `npm i -D @dionfang/tokensaver` 安装方式。安装统一走源码仓 `node init.mjs` 或复制 `code-index/` 部署。连带清理:README/部署使用说明中英 npm 段、init.test npm 打包校验、depgraph-layers/gen_graph_md 镜像引用、known-annotations sync-npm 条;npm-chain-align.work.mjs 归档 test/archive/。
+
 ## v1.0.0(2026-11-05)
 
 - 首个发布版本:省耗记账(Token Ledger)+ 动态模型路由(AutoTier),含自进化闭环
@@ -58,3 +62,7 @@
 - **向量库混维根治**:CLI --build-vectors 不再绕过模型绑定;dim 锚定目标模型实测维度+逐条自检;污染向量库已重建
 - **判定与代理健壮性**:tripBreaker 参数误传抛错替代静默写生产;prevHuman 支持 blocks 数组消息形态;决策档案层序修正(当前模型权威);uninit 卸载不再吞段后用户文本
 - **脚本修复**:ollama-model-eval 导入期崩溃修复(buildBody→buildSystemoneBody);importRoutingLog/extractTierEvidence 原子写
+
+### 补充(2026-11-17 Ollama runner 自愈)
+
+- **新增 Ollama runner 异常自动重启**:server.log 近 5 分钟 ≥2 条 `llm server error` 且期望模型缺驻留,连判两轮且过冷却(默认 30min,`ollamaRestartCooldownMs`)即自动 taskkill 重启 serve(托盘自愈拉回)+ warm 回拉;`ollamaAutoRestart:false` 可关(默认开)

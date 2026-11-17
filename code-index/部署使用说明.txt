@@ -7,7 +7,7 @@ TokenSaver 部署使用说明
 1. Node.js ≥ 18 与 git。
 2. 嵌入/精排/决策模型二选一(决策判定跟嵌入同路径;默认 local):
    - local(推荐,无需外部服务):模型权重缓存在 code-index/hf-cache(嵌入+精排+决策
-     约 1.5GB(q4f16 决策 1.0GB+嵌入+精排;q8 权重已删,切回需重新获取——指标备档在 data/routing/profile-calibration-strands-q8.md),复制部署需整目录带走;npm 安装缓存在 ~/.tokensaver/hf-cache),
+     约 1.5GB(q4f16 决策 1.0GB+嵌入+精排;q8 权重已删,切回需重新获取——指标备档在 data/routing/profile-calibration-strands-q8.md),复制部署需整目录带走),
      缺失时首次使用自动下载;
    - ollama:本机自行安装并启动 Ollama,再手工 pull(本工具不代拉、不自动启动):
      版本推荐:**钉 Ollama 0.40.15**(实测嵌入批量 ~0.83s/块;0.40.16 退化至 1.17-1.42s/块约慢 1.5 倍,0.40.7 居中且波动大;三版本 /v1/systemone 决策端点均兼容)。升级前按同口径复测嵌入吞吐(batch 32、腾显存、90s 双采样)。
@@ -32,12 +32,7 @@ TokenSaver 部署使用说明
   不带 node_modules 与 data/),在该目录执行:
   node init.mjs
   不传 --roots 时自动把当前项目(git 仓库根)列为索引目录;要额外索引其他目录才传
-  --roots "其他路径"。数据落在旁边 data/(npm 安装固定 scripts/data/)。
-
-方式 C:npm 安装
-  npm i -D @dionfang/tokensaver
-  npx tokensaver init --roots "D:/app-a,D:/app-b"
-  数据固定写在仓库 scripts/data/。
+  --roots "其他路径"。数据落在旁边 data/。
 
 安装参数:
   node init.mjs [--roots "路径1[,路径2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
@@ -46,8 +41,8 @@ TokenSaver 部署使用说明
   --model-in  嵌入/决策判定模型来源:ollama 或 local(默认)。
   --hooks     只装指定客户端的钩子。省耗记账功能三端都装;动态模型路由只装 ZCode 与 Qoder。
 
-验证安装:node status.mjs(或 npx tokensaver status)
-日常检索:node search.mjs 关键词 --k 5(或 npx tokensaver search 关键词 --k 5)
+验证安装:node status.mjs
+日常检索:node search.mjs 关键词 --k 5
 
 ======================================================================
 三、配置说明
@@ -182,7 +177,7 @@ TokenSaver deployment guide
    local by default):
    - local (recommended, no external service): weights cached in code-index/hf-cache
      (embedding + reranker + decision ≈1.5GB with q4f16; q8 weights removed — re-fetch if switching back, metrics archived in data/routing/profile-calibration-strands-q8.md — copy the whole directory when
-     copy-deploying; npm installs cache to ~/.tokensaver/hf-cache). Missing models
+     copy-deploying). Missing models
      download automatically on first use.
    - ollama: install and start Ollama yourself, then pull by hand (this tool never
      Version pin: **Ollama 0.40.15** (measured bulk embedding ~0.83s/chunk; 0.40.16 regressed to 1.17-1.42s/chunk, ~1.5x slower; 0.40.7 in between with high variance; /v1/systemone decision endpoint compatible on all three). Re-benchmark with the same protocol before upgrading.
@@ -209,12 +204,7 @@ Option B: copy deployment
   node init.mjs
   Without --roots the current project (its git root) is indexed automatically; pass
   --roots "other/path" only to index additional directories. Data lands in a data/
-  directory beside it (npm installs always use scripts/data/).
-
-Option C: npm install
-  npm i -D @dionfang/tokensaver
-  npx tokensaver init --roots "D:/app-a,D:/app-b"
-  Data is always written to the repo's scripts/data/.
+  directory beside it.
 
 init options:
   node init.mjs [--roots "path1[,path2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
@@ -225,8 +215,8 @@ init options:
   --hooks     Install hooks for the selected client only. The Token Ledger installs on
               all three clients; dynamic model routing on ZCode and Qoder only.
 
-Verify: node status.mjs (or npx tokensaver status)
-Daily search: node search.mjs keywords --k 5 (or npx tokensaver search keywords --k 5)
+Verify: node status.mjs
+Daily search: node search.mjs keywords --k 5
 
 ======================================================================
 3. Configuration
@@ -303,20 +293,18 @@ existing config is never overwritten):
     switchGuard                no upgrades on very thick context (on by default,
                                threshold 200k tokens; auto-released after 3 consecutive
                                blocks; the client receives a compression suggestion)
-    l2                         nested L2 config (collapsed 2026-11-07):
-                               {shadow — embedder master gate (default false) /
-                               vote:{minSim,minConf} voting thresholds (0.55/0.6) /
-                               live:{enabled,minConf} live-proxy rescue (default
-                               off)} — with shadow off neither branch gets the
-                               embedder; legacy l2Shadow/l2Live/old l2.minSim stay
+    l2                         **retired (2026-11-14 user ruling)**: the L2 shadow
+                               / live fusion votes are always on (code constants,
+                               their on/off config keys — l2.shadow, l2.live.enabled,
+                               legacy top-level l2Shadow/l2Live — are no longer
+                               read); thresholds (minSim 0.55 / minConf 0.6 /
+                               live 0.3) belong to the calibration domain and
+                               follow code defaults; legacy threshold keys stay
                                readable for one version window
-    r3Lexical                  R3 lexical-channel master switch (v2, 2026-11-08;
-                               enabled = lexical R3 requiring a top-risk word plus
-                               independent corroboration; eagerEscalate = P2 one-
-                               strike speedup — an R2-difficulty task escalates to R3
-                               on its first error; both on by default; setting either
-                               to false closes that channel; the proxy re-reads it
-                               every request)
+    r3Lexical                  **retired**: the R3 lexical channel and the P2
+                               one-strike speedup are always on (code constants;
+                               enabled/eagerEscalate are not configurable); the
+                               word lists live in tierClassify.mjs
     decisionModel              judge model for the four-vote consensus (localized v4,
                                2026-11-09: judging is always local, zero remote
                                calls — ollama = models.decision (tev1:0.8b) / local =

@@ -11,6 +11,8 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 **模块二:动态模型路由(AutoTier)**——init 后本地代理(127.0.0.1:8117)即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(以 R3=1x 为基准:R1 日常 0.05x / R2 增强 0.5x / R4 奢侈 3.625x)调度真实模型,贵模型只在必要时使用;配合健康滑链、门控疲劳放行与自进化闭环持续降本。**仅 ZCode 与 Qoder 两个客户端支持,且只对自定义模型中以 Anthropic Messages 协议接入的模型生效**(会话不选 auto 或模型不是该接入方式时,零行为)。
 
 适合在本地代码库上用 Agent 开发。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
+
+另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板;能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
 ![微信图片_20261105220119.png](https://raw.gitcode.com/user-images/assets/11189521/7fabff6c-6f9b-44a9-943b-fbc69d24b447/微信图片_20261105220119.png '微信图片_20261105220119.png')
 
 ### 工作方式
@@ -21,7 +23,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 - 读取守卫:整文件 Read 超过 `readMaxLines`(默认 500)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。**护栏面与索引面统一(2026-11-07)**:只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制/未收录类型)直接放行不计入节约口径(图片走宿主视觉通道,真实成本是视觉 token)。Cursor 的 preToolUse 用字面 matcher。
 - 索引保鲜:git 仓库按 HEAD 判断过期;非 git 目录默认 24 小时重建。
 - 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次(下限口径,真实节约随后续轮数复利);状态句实时展示今日/累计。
-- 模型清理:切换模型后发起会话,会话开始即卸掉"切换前拉起"的驻留模型(只卸本工具拉起的,你自己 pull 的聊天模型不碰);宿主关闭后由脱离父进程的看护统一卸载 Ollama 驻留、停掉 transformers.js 常驻进程(不留 keep_alive 两小时的尾巴)。手动清:`node cleanup.mjs --all`。
+- 模型清理:切换模型后发起会话,会话开始即卸掉"切换前拉起"的驻留模型(只卸本工具拉起的,你自己 pull 的聊天模型不碰);宿主关闭后由脱离父进程的看护统一卸载 Ollama 驻留、停掉 transformers.js 常驻进程(不留 keep_alive 驻留尾巴)。手动清:`node cleanup.mjs --all`。
 
 #### 动态模型路由(要点)
 
@@ -48,7 +50,7 @@ ollama pull tev1:0.8b
 
 ### 使用
 
-`init` 会安装依赖、写配置、接线 hook,并在后台建索引、预热。用 `node status.mjs`(或 `npx tokensaver status`)确认就绪。参数名写错、缺少取值,或 `--model-in` / `--hooks` 取值非法时,报错退出且不改配置。`--roots=路径` 与 `--model-in=local` 这种写法也可以。
+`init` 会安装依赖、写配置、接线 hook,并在后台建索引、预热。用 `node status.mjs` 确认就绪。参数名写错、缺少取值,或 `--model-in` / `--hooks` 取值非法时,报错退出且不改配置。`--roots=路径` 与 `--model-in=local` 这种写法也可以。
 
 #### 独立工具(推荐)
 
@@ -68,7 +70,7 @@ node search.mjs 关键词 --k 5
 
 复制的是 `code-index/` 这一个目录,可放在项目任意位置,建议 `scripts/code-index`。必须带上 `hf-cache`。不要带 `node_modules`,不要带 `data/`。
 
-数据写在与该目录平级的 `data/`(建议路径下即 `scripts/data`)。若 `code-index` 本身就是 git 根,则写在其下的 `data/`。可用环境变量 `CODE_INDEX_DATA_DIR` 改位置。npm 安装固定用仓库 `scripts/data`。
+数据写在与该目录平级的 `data/`(建议路径下即 `scripts/data`)。若 `code-index` 本身就是 git 根,则写在其下的 `data/`。可用环境变量 `CODE_INDEX_DATA_DIR` 改位置。
 
 ```bash
 cd 目标项目/scripts/code-index
@@ -77,15 +79,6 @@ node status.mjs
 ```
 
 只复制了 `code-index/` 时,同目录的 [`部署使用说明.txt`](code-index/部署使用说明.txt) 是同一份说明。
-
-#### npm(发布后)
-
-```bash
-npm i -D @dionfang/tokensaver
-npx tokensaver init
-npx tokensaver status
-npx tokensaver search 关键词 --k 5
-```
 
 ### 初始化参数
 
@@ -131,6 +124,8 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 | `readMaxLines` | 全量 Read 行数上限,默认 `500`。设得很大等于关掉拦截 |
 | `chunk` | `targetLines` 70,`maxLines` 120,`overlapLines` 10,`minTail` 15 |
 | `staleNonGitMs` | 非 git 目录多久重建一次,毫秒。默认 `86400000` |
+| `embedCpuThreads` | 本地(transformers.js)嵌入的 CPU 线程上限。默认 `min(4, max(2, 物理核数/4))`;`0`=全核 |
+| `warmMinIntervalMs` | 模型被驱逐/缺位后两次自愈补拉的最小间隔,毫秒。默认 `60000`(最小 1000) |
 | `knownAnnotations` | `"项目名/相对路径"` → 一句职责 |
 
 #### modelRouting(动态模型路由配置)
@@ -160,12 +155,11 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 
 ### 仓库模块
 
-运行时脚本只在 `code-index/` 维护。发布 npm 包时 `prepack` 会跑 [`sync-npm.mjs`](sync-npm.mjs),把运行时生成到 `npm/`。
+运行时脚本只在 `code-index/` 维护。npm 发布渠道已弃(2026-11-17),不再提供 npm 安装。
 
 | 目录 | 用途 |
 |---|---|
 | [`code-index/`](code-index/) | 运行时。直接部署、在本仓运行,或复制到目标项目的就是这一份 |
-| [`npm/`](npm/) | npm 发布骨架。只含 `package.json` 等基本文件;发布前由 `sync-npm.mjs` 生成运行时 |
 
 ### 许可
 
@@ -183,6 +177,8 @@ TokenSaver is a local agent productivity tool with two core feature modules.
 
 Built for agent-based development on local repositories. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
+An optional desktop tray client lives in `tray/` (Electron): tray status lamps + dual-channel polling + install wizard/self-check panel; all capabilities spawn `code-index` micro-CLIs, with zero import coupling to the host (engineering red line guarded by `test/tray/importBan.test.mjs`).
+
 ### How it works
 
 #### Token Ledger (key points)
@@ -191,7 +187,7 @@ Built for agent-based development on local repositories. One TokenSaver can inde
 - Read guard: a full-file Read past 1.25 × `readMaxLines` (default 500) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. **Guard scope equals index scope (2026-11-07)**: only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries/unlisted types) passes through without entering the savings ledger (images go through the host vision channel — real cost is vision tokens). Cursor's preToolUse uses literal matchers.
 - Index freshness: git repositories go stale by HEAD; non-git directories rebuild every 24 hours by default.
 - Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point (a lower bound; real savings compound over later turns); the status line shows today/cumulative live.
-- Model cleanup: starting a session after a model switch unloads the leftovers the previous models had pulled up (only models this tool loaded — chat models you pulled yourself are never touched); after the host closes, a detached watcher unloads every Ollama-resident model and stops the transformers.js resident process, so no two-hour keep_alive tail is left behind. Manual cleanup: `node cleanup.mjs --all`.
+- Model cleanup: starting a session after a model switch unloads the leftovers the previous models had pulled up (only models this tool loaded — chat models you pulled yourself are never touched); after the host closes, a detached watcher unloads every Ollama-resident model and stops the transformers.js resident process, so no keep_alive tail is left behind. Manual cleanup: `node cleanup.mjs --all`.
 
 #### Dynamic model routing (key points)
 
@@ -218,7 +214,7 @@ If the model names were changed in `code-index/config.mjs`, pull those names ins
 
 ### Usage
 
-`init` installs dependencies, writes config, attaches hooks, and builds and warms the index in the background. Confirm it is ready with `node status.mjs` (or `npx tokensaver status`). A bad flag name, a missing value, or an illegal `--model-in` / `--hooks` value exits with an error and does not change config. `--roots=path` and `--model-in=local` are also accepted.
+`init` installs dependencies, writes config, attaches hooks, and builds and warms the index in the background. Confirm it is ready with `node status.mjs`. A bad flag name, a missing value, or an illegal `--model-in` / `--hooks` value exits with an error and does not change config. `--roots=path` and `--model-in=local` are also accepted.
 
 #### Standalone tool (recommended)
 
@@ -238,7 +234,7 @@ Later, edit `roots` in `data/code-index.config.json` and run `node init.mjs` wit
 
 Copy the `code-index/` directory only. It can sit anywhere in the project; `scripts/code-index` is the suggested path. You must include `hf-cache`. Do not include `node_modules` or `data/`.
 
-Data is written to a `data/` directory beside it (`scripts/data` on the suggested path). If `code-index` is itself the git root, data is written to `data/` inside it. Override the location with `CODE_INDEX_DATA_DIR`. An npm install always uses the repo's `scripts/data`.
+Data is written to a `data/` directory beside it (`scripts/data` on the suggested path). If `code-index` is itself the git root, data is written to `data/` inside it. Override the location with `CODE_INDEX_DATA_DIR`.
 
 ```bash
 cd target-project/scripts/code-index
@@ -247,15 +243,6 @@ node status.mjs
 ```
 
 If you copied only `code-index/`, [`部署使用说明.txt`](code-index/部署使用说明.txt) in that same directory is the same guide.
-
-#### npm (after publish)
-
-```bash
-npm i -D @dionfang/tokensaver
-npx tokensaver init
-npx tokensaver status
-npx tokensaver search keywords --k 5
-```
 
 ### init options
 
@@ -301,6 +288,8 @@ Project settings live in `data/code-index.config.json`, beside `code-index/`. Ke
 | `readMaxLines` | Line cap for a full-file Read. Default `500`. A very large value turns the guard off |
 | `chunk` | `targetLines` 70, `maxLines` 120, `overlapLines` 10, `minTail` 15 |
 | `staleNonGitMs` | How often a non-git directory is rebuilt, in milliseconds. Default `86400000` |
+| `embedCpuThreads` | CPU thread cap for local (transformers.js) embedding. Default `min(4, max(2, cores/4))`; `0` = all cores |
+| `warmMinIntervalMs` | Minimum interval between self-healing re-pulls after a model is evicted, in milliseconds. Default `60000` (floor 1000) |
 | `knownAnnotations` | `"project/relative-path"` → one sentence on what the file does |
 
 #### modelRouting (dynamic model routing config)
@@ -330,12 +319,11 @@ Scope and boundaries: only ZCode/Qoder take part; auto dispatches only custom mo
 
 ### Repository layout
 
-Runtime scripts are maintained only in `code-index/`. On npm publish, `prepack` runs [`sync-npm.mjs`](sync-npm.mjs) and generates the runtime into `npm/`.
+Runtime scripts are maintained only in `code-index/`. The npm publish channel was retired (2026-11-17); npm installation is no longer offered.
 
 | Directory | Role |
 |---|---|
 | [`code-index/`](code-index/) | Runtime. This is what you deploy directly, run in this repo, or copy into a target project |
-| [`npm/`](npm/) | npm publish skeleton. Only `package.json` and a few basic files; `sync-npm.mjs` generates the runtime before publish |
 
 ### License
 
