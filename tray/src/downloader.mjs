@@ -17,12 +17,21 @@ const RETRIES_PER_URL = 3;
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** http(s) 请求(依赖注入点:单测用本地 node:http 假源)。resolve 于响应头;body 由调用方消费流。 */
-export function httpRequest(url, { method = 'GET', headers = {}, body = null, timeoutMs = 30_000 } = {}) {
+/** http(s) 请求(依赖注入点:单测用本地 node:http 假源)。resolve 于响应头;body 由调用方消费流。
+ *  2026-11-17 修复:跟随 3xx 重定向(≤5 跳)——HF/镜像 resolve/main/… 必 302 到 CDN,
+ *  旧实现收 302 直接判失败致三权重在线下载全灭(决策模型「无法自动下载」根因)。
+ *  Range/方法/头在跳间保留(CDN 支持续传);每跳独立超时。 */
+export function httpRequest(url, { method = 'GET', headers = {}, body = null, timeoutMs = 30_000 } = {}, _depth = 0) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === 'https:' ? https : http;
     const req = lib.request(u, { method, headers, timeout: timeoutMs }, (res) => {
+      const loc = res.headers.location;
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && loc && _depth < 5) {
+        res.resume(); // 排空重定向响应体,释放 socket
+        resolve(httpRequest(new URL(loc, url).toString(), { method, headers, body, timeoutMs }, _depth + 1));
+        return;
+      }
       resolve({ status: res.statusCode, headers: res.headers, res, req });
     });
     req.on('timeout', () => { req.destroy(new Error(`请求超时(${timeoutMs}ms)`)); });
