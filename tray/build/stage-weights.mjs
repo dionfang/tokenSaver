@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.resolve(here, '..', '..', 'code-index', 'hf-cache');
 const DST = path.join(here, 'weights');
+// 2026-11-17 用户终裁:维持完整包(三权重随包)。半离线懒下载提案被否——strands 无公开下载源,
+// 懒下载会把「找源/上传/等待」难度转嫁给客户;完整包装完零下载零配置。
 const ITEMS = [
   ['Xenova/jina-embeddings-v2-base-zh', 'Xenova/jina-embeddings-v2-base-zh'],
   ['Xenova/bge-reranker-base', 'Xenova/bge-reranker-base'],
