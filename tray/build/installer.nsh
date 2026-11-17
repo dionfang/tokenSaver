@@ -7,13 +7,8 @@
   WriteRegStr HKCU "Environment" "CODE_INDEX_DATA_DIR" "$LOCALAPPDATA\TokenSaver\data"
   ; 广播环境变量变更(HWND_BROADCAST=0xFFFF, WM_SETTINGCHANGE=0x1A);新启动进程继承,已开 IDE 需重启
   System::Call 'user32::SendMessageTimeout(i 0xFFFF, i 0x1A, i 0, t "Environment", i 0, i 1000, *i .r0)'
-  ; 2026-11-17 完整包(用户终裁,半离线懒下载提案被否):三模型权重直解到 packed hfCacheDir
-  ; 单源落点($PROFILE\.tokensaver\hf-cache);升级时已存在则跳过(保用户权重/省解压时间)。
-  IfFileExists "$PROFILE\.tokensaver\hf-cache\strands-decider-2B-hobson-v19\model_q4f16.onnx" weights_done 0
-    SetOutPath "$PROFILE\.tokensaver\hf-cache"
-    File /r "${PROJECT_DIR}\build\weights\Xenova"
-    File /r "${PROJECT_DIR}\build\weights\strands-decider-2B-hobson-v19"
-  weights_done:
+  ; 2026-11-17 全在线模式(用户拍板):安装包只含基础依赖,三 CPU 权重装后由向导在线下载
+  ; (HF/镜像,weightsOnline.mjs);安装器不再解包权重。
 !macroend
 
 !macro customUnInstall

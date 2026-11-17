@@ -1,7 +1,7 @@
-# TokenSaver 安装包构建(2026-11-17 发行链落地,方案 R1/§3-6b/C6;同日用户拍板「全离线包」)
-# 主包=Electron 壳+code-index 源码+production 依赖(packed 布局)+三模型权重(1.47GB,NSIS 直解
-# 到 ~/.tokensaver/hf-cache);装完零下载、完全离线可用。构建:cd tray && npm run dist
-# (predist 自动 stage 权重;需 ELECTRON_MIRROR/ELECTRON_BUILDER_BINARIES_MIRROR 指 npmmirror)
+# TokenSaver 安装包构建(2026-11-17 发行链;同日终裁「全在线模式」:安装包只含基础依赖,
+# 三 CPU 权重装后由向导在线下载 HF/镜像,三源实测有效见 weightsOnline.mjs / 方案 §23.5)
+# 主包=Electron 壳+code-index 源码+production 依赖(packed 布局)≈215MB。
+# 构建:cd tray && npm run dist(需 ELECTRON_MIRROR/ELECTRON_BUILDER_BINARIES_MIRROR 指 npmmirror)
 appId: com.tokensaver.tray
 productName: TokenSaver
 copyright: Copyright © 2026 dionfang

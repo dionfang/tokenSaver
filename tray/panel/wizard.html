@@ -204,7 +204,7 @@ function renderEnvCheck(w) {
   const hardBad = checks.filter((c) => c.hard && c.ok !== true);
   const rows = checks.length ? checks.map((c) => `
     <div class="item"><div class="meta"><span>${esc(c.label)}</span>
-      <span class="${c.ok ? 'ok' : (c.hard ? 'err' : 'sub')}">${c.ok ? '✔' : (c.hard ? '✘' : '待补')}${c.hint ? ' — ' + esc(c.hint) : ''}</span>
+      <span class="${c.ok ? 'ok' : 'err'}">${c.ok ? '✔' : '✘'}${!c.ok && !c.hard ? ' 待补' : ''}${c.hint ? ' — ' + esc(c.hint) : ''}</span>
     </div></div>`).join('') : '<div class="sub">正在检测环境…</div>';
   const installing = S.installing;
   // 2026-11-17 用户裁决:不再显示 CMD 滚动文字——进度条 + 条下一行动态文字说明当前在做什么
@@ -213,13 +213,18 @@ function renderEnvCheck(w) {
   let installBlock = '';
   if (installing) {
     const isPull = String(installing).startsWith('pull');
+    const isWO = installing === 'weights-online'; // 2026-11-17 全在线:CPU 权重 HF/镜像下载
     const pp = S.pullProgress;
-    const width = isPull ? (pp ? pp.pct : 0) : 100;
-    const cls = isPull ? (pp && pp.pct >= 100 ? 'full' : '') : 'stripes';
+    const wp = S.progress; // downloader 逐文件进度
+    const width = isPull ? (pp ? pp.pct : 0) : isWO ? (wp && wp.pct != null ? wp.pct : 0) : 100;
+    const cls = isPull ? (pp && pp.pct >= 100 ? 'full' : '') : isWO ? (wp && wp.pct >= 100 ? 'full' : '') : 'stripes';
     const stage = isPull
       ? (pp ? `正在拉取 Ollama 模型 ${pp.model}(${pp.pct}%)` : `正在拉取 Ollama 模型 ${String(installing).slice(5)}…`)
-      : (lastLine ? lastLine.replace(/^\[(pull|info)\]\s*/, '') : (installing === 'deps' ? '正在安装推理依赖(npm install)…' : '正在下载 cpu 模式权重(HuggingFace → hf-cache)…'));
-    installBlock = `<div class="bar ${isPull ? '' : 'stripes'}"><i class="${isPull ? cls : ''}" style="width:${width}%"></i></div>
+      : isWO
+        ? `${lastLine ? lastLine.replace(/^\[(weights|ok|fail)\]\s*/, '') : '正在在线下载 CPU 权重(HF/镜像 → hf-cache)…'}${wp && wp.pct != null ? `(${wp.pct}%)` : ''}`
+        : (lastLine ? lastLine.replace(/^\[(pull|info)\]\s*/, '') : '正在安装推理依赖(npm install)…');
+    const stripes = !isPull && !isWO;
+    installBlock = `<div class="bar ${stripes ? 'stripes' : ''}"><i class="${stripes ? '' : cls}" style="width:${width}%"></i></div>
       <div class="stage">${esc(stage)}</div>`;
   } else if (failLine) {
     installBlock = `<div class="err">${esc(failLine)}(点「重新自检」重试)</div>`;

@@ -101,11 +101,21 @@ export function createDownloader(deps = {}) {
     if (standalone) control = { requested: null }; // 直调入口(如向导内代下 Ollama 安装包)不继承上一轮的暂停/取消
     const final = safeDest(baseDir, item.dest);
     if (!final) return { status: 'failed', error: `dest 越界:${item.dest}` };
-    // 重入跳过:终名已存在且 sha256 通过(§16.4 已校验通过项跳过,不重复下载)
+    // 重入跳过:终名已存在且 sha256 通过(§16.4 已校验通过项跳过,不重复下载);
+    // 2026-11-17 全在线:sha256 可选(HF 在线权重无预置哈希,HTTPS 保完整性),无 sha 时按期望字节数判完整
     if (fs.existsSync(final)) {
-      const got = await sha256File(final).catch(() => null);
-      if (got === item.sha256.toLowerCase()) {
-        emit({ itemId: item.id, pct: 100, bytesDone: item.bytes ?? null, bytesTotal: item.bytes ?? null, phase: 'done', skipped: true });
+      if (item.sha256) {
+        const got = await sha256File(final).catch(() => null);
+        if (got === item.sha256.toLowerCase()) {
+          emit({ itemId: item.id, pct: 100, bytesDone: item.bytes ?? null, bytesTotal: item.bytes ?? null, phase: 'done', skipped: true });
+          return { status: 'ok', skipped: true };
+        }
+      } else if (item.bytes != null && fs.statSync(final).size === Number(item.bytes)) {
+        emit({ itemId: item.id, pct: 100, bytesDone: item.bytes, bytesTotal: item.bytes, phase: 'done', skipped: true });
+        return { status: 'ok', skipped: true };
+      } else if (!item.sha256 && item.bytes == null) {
+        // 小文件(config/tokenizer_config)无预置哈希与字节数:终名只在校验/size 门通过后改名,存在即完整
+        emit({ itemId: item.id, pct: 100, bytesDone: null, bytesTotal: null, phase: 'done', skipped: true });
         return { status: 'ok', skipped: true };
       }
     }
@@ -131,10 +141,16 @@ export function createDownloader(deps = {}) {
   /** .part 已完整时直接校验改名,避免对「已下满」再发 Range → HTTP 416 死循环。 */
   async function finalizeIfComplete(item, part, final) {
     emit({ itemId: item.id, pct: 100, bytesDone: fs.statSync(part).size, bytesTotal: item.bytes ?? null, phase: 'verify' });
-    const got = await sha256File(part);
-    if (got !== item.sha256.toLowerCase()) {
+    if (item.sha256) {
+      const got = await sha256File(part);
+      if (got !== item.sha256.toLowerCase()) {
+        try { fs.unlinkSync(part); } catch { /* 尽力 */ }
+        throw new Error(`sha256 校验失败(期望 ${item.sha256.slice(0, 12)}… 实得 ${got.slice(0, 12)}…)`);
+      }
+    } else if (item.bytes != null && fs.statSync(part).size !== Number(item.bytes)) {
+      const got = fs.statSync(part).size;
       try { fs.unlinkSync(part); } catch { /* 尽力 */ }
-      throw new Error(`sha256 校验失败(期望 ${item.sha256.slice(0, 12)}… 实得 ${got.slice(0, 12)}…)`);
+      throw new Error(`字节数不符(期望 ${item.bytes} 实得 ${got})`);
     }
     atomicRename(part, final);
     emit({ itemId: item.id, pct: 100, bytesDone: item.bytes ?? null, bytesTotal: item.bytes ?? null, phase: 'done' });

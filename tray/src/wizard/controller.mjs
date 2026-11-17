@@ -14,6 +14,7 @@ import { probeOllama, createDownloader, httpRequest } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
 import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
 import { localWeightCached } from '../util/paths.mjs';
+import { missingModels, downloadWeights } from './weightsOnline.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -156,7 +157,7 @@ export function createWizardController(deps) {
         ]) {
           const ok = cached(id);
           checks.push({ id: `w-${label}`, label: `本地${label} ${pretty}`, ok, hard: false,
-            hint: ok ? '已缓存(hf-cache)' : '未缓存——首次使用时自动下载(HuggingFace)' });
+            hint: ok ? '已缓存(hf-cache)' : '未缓存' });
         }
       }
       // 2026-11-17 审查补口(§22.2 遗留):磁盘预检——cpu 权重 ~1.7GB/gpu 模型 ~2-3GB 下载前看余量,
@@ -261,16 +262,36 @@ export function createWizardController(deps) {
       return { ...r, ok: true, message: `开始自动拉取 ${missingModels.length} 个 Ollama 模型` };
     }
     const depsBad = env.some((c) => c.id === 'deps' && c.ok !== true);
-    // 2026-11-17 审查修复:权重行 id 已改 w-*(嵌入/精排/决策),旧匹配 id==='weights' 恒 false→cpu 缺权重不再自动装
-    const weightsBad = env.some((c) => String(c.id).startsWith('w-') && c.ok !== true);
-    if (!envelope.installing && nodeOk && (depsBad || weightsBad)) {
-      const id = depsBad ? 'deps' : 'weights';
-      startInstall(id,
-        id === 'deps' ? 'npm install --ignore-scripts --registry=https://registry.npmmirror.com' : 'node',
-        id === 'deps' ? [] : ['localResident.mjs'],
-        { cwd: paths.codeIndexRoot, pollWeights: id === 'weights', shell: id === 'deps' });
+    if (!envelope.installing && nodeOk && depsBad) {
+      startInstall('deps', 'npm install --ignore-scripts --registry=https://registry.npmmirror.com', [], { cwd: paths.codeIndexRoot, shell: true });
+    }
+    // 2026-11-17 全在线:cpu 缺权重 → HF/镜像在线下载(替代旧 localResident 懒下载触发;
+    // 三源实测有效,external-data 双文件+tokenizer,见 weightsOnline.mjs)
+    const missingW = missingModels(env);
+    if (!envelope.installing && missingW.length) {
+      startWeightsOnline(missingW);
+      return { ...r, ok: true, message: `开始在线下载 ${missingW.length} 个 CPU 权重模型` };
     }
     return r;
+  }
+
+  /** 全在线权重下载(串行模型×文件;进度经 downloader onProgress → envelope.progress)。 */
+  async function startWeightsOnline(models) {
+    envelope.installing = 'weights-online';
+    envelope.installLog = [];
+    sendState({ ...envelope });
+    const r = await downloadWeights({
+      models, downloader, baseDir: paths.hfCacheDir,
+      onLine: (l) => {
+        envelope.installLog.push(l);
+        if (envelope.installLog.length > 200) envelope.installLog = envelope.installLog.slice(-100);
+        sendState({ ...envelope });
+      },
+    });
+    envelope.installing = null;
+    envelope.installLog.push(r.ok ? '[ok] CPU 权重下载完成' : '[fail] 部分权重下载失败(点「重新自检」重试;未齐前决策票弃权/检索降级 bm25)');
+    await machine.runEnvChecks().catch(() => {});
+    sendState({ ...envelope });
   }
 
   async function dispatch(action, payload = {}) {
