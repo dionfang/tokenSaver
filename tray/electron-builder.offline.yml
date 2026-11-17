@@ -1,0 +1,8 @@
+# 离线完整包配置(2026-11-17 双形态发布):extends 在线基配置,仅换 nsh(带权重解包)/输出目录/产物名。
+# 发布命令:npm run dist:offline(先 stage 权重再构建);在线包仍 npm run dist。
+extends: ./electron-builder.yml
+directories:
+  output: release-offline
+nsis:
+  include: build/installer-offline.nsh
+artifactName: TokenSaver-Setup-${version}-offline.${ext}

@@ -41,3 +41,5 @@ tray/release/
 tray/release2/
 tray/release3/
 tray/release-decision/
+tray/build/weights/
+tray/release-offline/
