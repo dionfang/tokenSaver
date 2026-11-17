@@ -228,7 +228,11 @@ function writeModelIn(dataDir, modelIn) {
   writeConfig(file, cfg);
 }
 
+let switchingMode = false; // M3 防重入:流水线在跑时拒绝再次切换
+/** M3 完整切换流水线(2026-11-17,B2 口径):门禁→确认→写配置→(gpu)自动拉缺失模型→全量重嵌→预热;
+ *  任一步失败回滚 modelIn。进度经托盘 Tooltip 实时展示(pull 真百分比来自 ollamaPull.mjs 行契约)。 */
 async function switchRunMode() {
+  if (switchingMode) return dialog.showMessageBox({ message: '切换进行中,请等待当前流水线完成', buttons: ['知道了'] });
   const cur = ctx.snapshot?.modelIn === 'local' ? 'cpu' : ctx.snapshot?.modelIn ? 'gpu' : null;
   if (!cur) return dialog.showErrorBox('切换运行模式', '还没有读到当前运行模式,请稍后再试');
   const next = cur === 'cpu' ? 'gpu' : 'cpu';
@@ -243,18 +247,45 @@ async function switchRunMode() {
     defaultId: 1,
     cancelId: 1,
     message: `切换到${nextLabel}`,
-    detail: `当前是${cur === 'gpu' ? 'gpu模型' : 'cpu模型'}。确认后写入运行配置。两边的向量文件都会保留。`,
+    detail: `当前是${cur === 'gpu' ? 'gpu模型' : 'cpu模型'}。确认后将自动:${next === 'gpu' ? '拉取缺失的 Ollama 模型 → ' : ''}全量重新嵌入向量 → 预热模型。两边的向量文件都会保留。`,
   });
   if (confirm.response !== 0) return;
-  const dataDir = ctx.paths?.dataDir;
-  if (!dataDir) return dialog.showErrorBox('切换运行模式', '无法定位数据目录');
+  const { dataDir, nodeBin, codeIndexRoot } = ctx.paths || {};
+  if (!dataDir || !nodeBin || !codeIndexRoot) return dialog.showErrorBox('切换运行模式', '无法定位数据目录/Node/code-index');
+  const setTip = (s) => { try { tray?.setToolTip(`TokenSaver 切换运行模式:${s}`); } catch { /* 托盘未就绪 */ } };
+  const tail = (r) => String(r.stderr || r.stdout || `exit ${r.code}`).trim().split('\n').slice(-3).join('\n').slice(0, 400);
+  switchingMode = true;
   try {
+    setTip('写入运行配置…');
     writeModelIn(dataDir, next === 'gpu' ? 'ollama' : 'local');
+    if (next === 'gpu') {
+      setTip('拉取 Ollama 模型…');
+      const r = await runner.run('pull', nodeBin, [`${codeIndexRoot}/ollamaPull.mjs`], {
+        cwd: codeIndexRoot, label: '切换:拉取模型',
+        onLine: (l) => { if (l.startsWith('[progress]')) setTip(l.replace('[progress] ', '')); },
+      });
+      if (r.skipped) throw new Error(`有任务在跑(${r.busyFamily}),稍后再试`);
+      if (r.code !== 0) throw new Error(`模型拉取失败:${tail(r)}`);
+    }
+    const roots = readConfig().cfg?.roots || [];
+    if (roots.length) {
+      setTip('全量重新嵌入向量(耗时取决于索引规模)…');
+      const r = await runner.run('embed', nodeBin, [`${codeIndexRoot}/embed.mjs`], { cwd: codeIndexRoot, label: '切换:重嵌向量' });
+      if (r.code !== 0) throw new Error(`向量重嵌失败:${tail(r)}`);
+    }
+    setTip('预热模型…');
+    const r = await runner.run('warm', nodeBin, [`${codeIndexRoot}/warm.mjs`], { cwd: codeIndexRoot, label: '切换:预热' });
+    if (r.skipped) throw new Error(`有任务在跑(${r.busyFamily}),稍后再试`);
+    if (r.code !== 0) throw new Error(`预热失败:${tail(r)}`);
+    await poller?.slowRefresh('switch-mode');
+    dialog.showMessageBox({ message: `已切换到${nextLabel}${next === 'gpu' ? '(模型已拉取)' : ''}${roots.length ? ',向量已重嵌' : ''},模型已预热`, buttons: ['知道了'] });
   } catch (e) {
-    return dialog.showErrorBox('切换运行模式', String(e?.message || e).slice(0, 200));
+    try { writeModelIn(dataDir, cur === 'gpu' ? 'ollama' : 'local'); } catch { /* 回滚尽力而为 */ }
+    await poller?.slowRefresh('switch-rollback');
+    dialog.showErrorBox('切换运行模式失败(已回滚原模式)', String(e?.message || e).slice(0, 400));
+  } finally {
+    switchingMode = false;
   }
-  await poller?.slowRefresh('switch-mode');
-  dialog.showMessageBox({ message: `已切换到${nextLabel}`, buttons: ['知道了'] });
 }
 
 // ---------- 菜单 ----------

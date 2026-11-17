@@ -5,8 +5,8 @@
  */
 import { spawn } from 'node:child_process';
 
-export const TIMEOUTS = { status: 30_000, hooksStatus: 15_000, warm: 120_000, auto: 300_000, init: 300_000, import: 60_000 };
-const MUTEX_FAMILIES = new Set(['warm', 'auto', 'init', 'import']);
+export const TIMEOUTS = { status: 30_000, hooksStatus: 15_000, warm: 120_000, auto: 300_000, init: 300_000, import: 60_000, pull: 600_000, embed: 3_600_000 };
+const MUTEX_FAMILIES = new Set(['warm', 'auto', 'init', 'import', 'pull']); // pull 互斥(2026-11-17 M3:拉模型与 warm/init 抢资源);embed 自持 .embed.pid 锁不入互斥族
 
 /** 树杀命令构造(纯函数,供单测):Windows=taskkill /PID x /T /F,其余平台退化为 kill -9。 */
 export function killTreeCommand(pid, platform = process.platform) {
@@ -23,7 +23,7 @@ export function createCmdRunner() {
 
   /** 跑一条命令。返回 { code, stdout, stderr, timedOut, skipped, busyFamily?, label }。
    *  互斥族忙时 skipped:true 不 spawn;超时先树杀、5s 仍未退强收口并标 timedOut:true。 */
-  function run(family, file, args, { timeoutMs = TIMEOUTS[family] ?? 60_000, cwd, label = `${file} ${args.join(' ')}`.slice(0, 120) } = {}) {
+  function run(family, file, args, { timeoutMs = TIMEOUTS[family] ?? 60_000, cwd, label = `${file} ${args.join(' ')}`.slice(0, 120), onLine = null } = {}) {
     const busy = busyFamily();
     if (MUTEX_FAMILIES.has(family) && busy) {
       return Promise.resolve({ code: null, stdout: '', stderr: '', timedOut: false, skipped: true, busyFamily: busy, label });
@@ -44,7 +44,15 @@ export function createCmdRunner() {
       let timedOut = false;
       let settled = false;
       const cap = (buf, max, keep) => (buf.length > max ? buf.slice(-keep) : buf);
-      child.stdout?.on('data', (d) => { stdout = cap(stdout + d, 1_000_000, 500_000); });
+      let lineBuf = ''; // 2026-11-17 M3:onLine 流式行回调(增量,不传则行为与旧版完全一致)
+      child.stdout?.on('data', (d) => {
+        stdout = cap(stdout + d, 1_000_000, 500_000);
+        if (onLine) {
+          lineBuf += d;
+          const ls = lineBuf.split(/\r?\n/); lineBuf = ls.pop();
+          for (const l of ls) if (l.trim()) { try { onLine(l); } catch { /* 回调异常不影响命令 */ } }
+        }
+      });
       child.stderr?.on('data', (d) => { stderr = cap(stderr + d, 200_000, 100_000); });
       const killTimer = setTimeout(() => {
         timedOut = true;
