@@ -392,12 +392,15 @@ export function ensureModelRoutingSection(cfg) {
 
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 // 枢纽以本模块所在仓为准,不跟当前工作区走,避免在业务仓里跑 init 把 data 搞乱。
-const repoRoot = findGitRoot(here) || findGitRoot(process.cwd());
-if (directRun) {
-if (!repoRoot) {
-  console.error('[err] 未找到 git 仓库根(从本模块向上未发现 .git);请在 TokenSaver/code-index 内运行');
-  process.exit(1);
+// Bug3(20261118):打包/复制部署无 .git 时回落模块上级目录为锚,不硬退(roots 以参数/config 为准)。
+export function resolveRepoRoot(moduleDir, cwd) {
+  const r = findGitRoot(moduleDir) || findGitRoot(cwd);
+  if (r) return { root: r, fallback: false };
+  return { root: path.resolve(moduleDir, '..'), fallback: true };
 }
+const { root: repoRoot, fallback: repoRootFallback } = resolveRepoRoot(here, process.cwd());
+if (repoRootFallback) console.error('[note] 未发现工具仓 .git(打包/复制部署),以模块上级目录为锚;roots 以参数/config 为准');
+if (directRun) {
 const parsedArgs = parseInitArgs(args);
 if (parsedArgs.error) {
   console.error(`[err] ${parsedArgs.error}`);
@@ -575,6 +578,24 @@ if (!configExisted || modelInArg) {
     console.error(`        ollama pull ${DEFAULT_CONFIG.models.embedding}`);
     console.error(`        ollama pull ${DEFAULT_CONFIG.models.reranker}`);
     console.error(`        ollama pull ${DEFAULT_CONFIG.models.decision}(本地决策判定,替代远程 decision-model-preview)`);
+    // 2026-11-18 用户裁决(方案 A 客户端化,CLI 同口径):gpu 路径代写用户级 OLLAMA_MAX_LOADED_MODELS=5
+    // 抬高并发驻留上限,防聊天模型挤入 LRU 逐走调用最稀疏的嵌入模型(keep_alive 24h 救不了 LRU)。
+    // 幂等:已同值跳过;reg add 失败不阻断(提示手工);对已运行 Ollama 需重启生效(env 启动时读)。
+    try {
+      const KEY = 'OLLAMA_MAX_LOADED_MODELS', WANT = '5';
+      if (process.platform === 'win32') {
+        const q = spawnSync('reg', ['query', 'HKCU\\Environment', '/v', KEY], { windowsHide: true, encoding: 'utf8' });
+        if (!(q.status === 0 && String(q.stdout || '').includes(KEY) && String(q.stdout || '').includes(WANT))) {
+          const set = spawnSync('reg', ['add', 'HKCU\\Environment', '/v', KEY, '/t', 'REG_SZ', '/d', WANT, '/f'], { windowsHide: true, encoding: 'utf8' });
+          if (set.status === 0) {
+            try { spawnSync('powershell', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","5","User")'], { windowsHide: true, encoding: 'utf8' }); } catch { /* 广播尽力 */ }
+            console.error(`  [ok] 已写入用户级 OLLAMA_MAX_LOADED_MODELS=${WANT}(防嵌入模型被 LRU 驱逐)——对已在运行的 Ollama 需重启后生效`);
+          } else console.error(`  [warn] OLLAMA_MAX_LOADED_MODELS 写入失败(可手工设:系统环境变量同名=${WANT}),不影响安装`);
+        } else console.error(`  [ok] Ollama 并发驻留上限已配置(OLLAMA_MAX_LOADED_MODELS=${WANT})`);
+      } else if (!process.env.OLLAMA_MAX_LOADED_MODELS) {
+        console.error(`  [提示] Linux/macOS:建议为 Ollama 服务设 OLLAMA_MAX_LOADED_MODELS=${WANT}(防嵌入模型被 LRU 驱逐;如 systemd Environment=)`);
+      }
+    } catch { /* 配置尽力,失败不影响安装 */ }
   }
   console.error('        该路径拉起失败时检索降级 bm25,不自动改换另一条路径;决策模型拉起失败则决策票弃权(fail-open)。');
 }
@@ -683,24 +704,31 @@ function cursorForwarderSource(hooksDir) {
 }
 
 function cursorPromptGuardSource(hooksDir) {
-  const body = `const child = spawn(process.execPath, [entry, '--host', 'cursor'], { stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true })
-let out = ''
-child.stdout.setEncoding('utf8')
-child.stdout.on('data', (c) => { out += c })
-child.on('error', () => { process.stdout.write('{"continue":true}'); process.exit(0) })
-child.on('exit', () => {
-  try {
-    const parsed = JSON.parse(out)
-    const payload = { continue: parsed.continue !== false }
-    if (typeof parsed.additionalContext === 'string' && parsed.additionalContext) payload.additionalContext = parsed.additionalContext
-    process.stdout.write(JSON.stringify(payload))
-  } catch {
-    process.stdout.write('{"continue":true}')
-  }
-  process.exit(0)
+  const body = `let raw = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (c) => { raw += c })
+process.stdin.on('end', () => {
+  const child = spawn(process.execPath, [entry, '--host', 'cursor'], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true })
+  let out = ''
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (c) => { out += c })
+  child.on('error', () => { process.stdout.write('{"continue":true}'); process.exit(0) })
+  child.on('exit', () => {
+    try {
+      const parsed = JSON.parse(out)
+      const payload = { continue: parsed.continue !== false }
+      if (typeof parsed.additionalContext === 'string' && parsed.additionalContext) payload.additionalContext = parsed.additionalContext
+      process.stdout.write(JSON.stringify(payload))
+    } catch {
+      process.stdout.write('{"continue":true}')
+    }
+    process.exit(0)
+  })
+  child.stdin.write(raw)
+  child.stdin.end()
 })
 `;
-  return hookScript(hooksDir, 'prompt-guard.mjs', 'Cursor beforeSubmitPrompt: 转发 prompt-guard.mjs(模型变更则后台重嵌)。透传 additionalContext(Cursor 3.27.22 beforeSubmitPrompt schema 原生支持,实证见 model-routing.md #15);解析失败/超时一律 fail-open 回 {"continue":true},绝不拦截用户输入。', body);
+  return hookScript(hooksDir, 'prompt-guard.mjs', 'Cursor beforeSubmitPrompt: 本进程读完 stdin 再写入子进程。Windows 上 inherit 接不到 Cursor 后写入的管道。', body);
 }
 
 function cursorReadGuardSource(hooksDir) {
@@ -1165,7 +1193,7 @@ export function disciplineItems({ rel, dataRel, packed = false }) {
     P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/known-annotations.json` 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后必跑 `' + annotationCmd + '` 体检——键必须命中索引路径(死链在 details.mjs 里永不显示,先改键名或删条),文本 ≤50 字,JSON 保持合法'),
     P(7, '**提交后保鲜**:执行 `git commit` 后,运行 `' + autoCmd + '`(HEAD 没变秒级跳过;有变更时 build 内联约 10s+嵌入转后台)——有 PostToolUse hook 的环境已自动做,重复触发零成本'),
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
-    P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。`npm/部署使用说明.txt` 由 sync-npm 从 code-index 那份生成,改源文件后重新同步,不要单独删英文'),
+    P(9, '**文档英文**:`README.md` 与 code-index 的 `部署使用说明.txt` 在中文正文后各有一段英文译文。修改时保留英文段,并按改过的中文改对应英文。禁止删掉英文只留中文。'),
     P(10, '**部署产物同步**:改了 `init.mjs` 的纪律段/输出纪律段/hooks、`output-diet.md` 等部署模板或 AGENTS.md 段规则后,先让测试全绿,再运行 `' + (packed ? 'npx tokensaver sync' : 'cd ' + rel + ' && node deploySync.mjs') + '` 校验一致性;不一致就重新运行 `' + (packed ? 'npx tokensaver init' : 'node init.mjs') + '` 全盘部署(幂等,会重写 hooks 与各仓 AGENTS.md),再跑门禁确认。门禁未过不得声称部署已与代码库一致。**增删/改名用户级 hooks 转发器时,必须同步 `init.mjs` 与 `uninit.mjs` 两处部署/清理逻辑**:先登记 `init.mjs` 的 `USER_FORWARDER_FILES` 单源清单(uninit 清理与 deploySync 门禁都从这里取),漏登记会被 deploySync 拦下(安装⊆登记、卸载≡登记,卸载残留/手抄漂移都算不过)'),
     P(11, '**实验数据保护**:`agent_reports/`(A/B 实验结果 ab-logs 等,2026-11-07 自 data/ab 迁入、2026-11-11 自 test/ab/result 迁入;2026-11-14 用户定:全部本地资产不入 git)等实验目录里是唯一的原始证据,删了不可再生且**无版本控制兜底**(git 里已取消追踪):禁止 `git clean -x/-X`、`rm -rf agent_reports` 这类顺手清理;要重跑实验就直接覆盖写(`prepare` 只清任务工作目录),确需清理先征得用户同意'),
     P(12, '**缺陷文档回写**:按缺陷文档(如 `agent_reports/failures.md`)修完 bug 后,必须回写该文档——逐条标注已修/未修与修复位置,并把该文档标记为「已处理」;同一份文档不得再作为待修清单二次下发,重复下发时先核对文档内的已修标记,只处理仍未修的条目'),
@@ -1243,24 +1271,27 @@ function ensureBugfixSop(root) {
   ok(`[${path.basename(root)}] bugfix-sop.md 作业规程骨架已铺(纪律段第 13 条的复盘落点)`);
 }
 
-// 宿主仓库 + config 实际生效的每个 root(去重);root 不是 git 仓库(纯目录)则只索引不接线
+// 非 git root 也接线 AGENTS.md/bugfix-sop(检索纪律与 git 无关,2026-11-18 用户审查指出旧「非git只索引不接线」不合理);
+// git 门只 gate .gitignore。索引保鲜对非 git 走 mtime/24h 回退(auto.mjs),commit-refresh 自 gate 于 git commit 文本。
+function wireRootsList(roots, repoRoot) {
+  for (const r of roots) {
+    const isGit = fs.existsSync(path.join(r, '.git'));
+    wireRepo(r);
+    if (!isGit) { console.error(`  [note] ${r} 非 git 仓库:AGENTS.md 已接线,保鲜走 mtime/24h 回退,不写 .gitignore`); continue; }
+    const giEntries = r === repoRoot
+      ? gitignoreEntries({ packed: PACKED_INSTALL, repoRoot, moduleDir: here, dataDir: DATA_DIR })
+      : [...EDITOR_IGNORE];
+    ensureGitignore(r, giEntries);
+  }
+}
+// 宿主仓库 + config 实际生效的每个 root(去重)
 currentStep = 'wire-repos(接线各仓库 hooks + AGENTS.md)';
 const effRoots = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8')).roots || []; }
   catch { return []; }
 })();
 const wireRoots = [...new Set([repoRoot, ...effRoots.map(r => path.resolve(r))])];
-for (const r of wireRoots) {
-  if (!fs.existsSync(path.join(r, '.git'))) {
-    console.error(`  [note] ${r} 非 git 仓库,只索引不接线(无 AGENTS.md/hooks)`);
-    continue;
-  }
-  wireRepo(r);
-  const giEntries = r === repoRoot
-    ? gitignoreEntries({ packed: PACKED_INSTALL, repoRoot, moduleDir: here, dataDir: DATA_DIR })
-    : [...EDITOR_IGNORE];
-  ensureGitignore(r, giEntries);
-}
+wireRootsList(wireRoots, repoRoot);
 
 // 钩子本体统一装在用户级:所有工作区共享一份,绝对路径直指本模块,不依赖各仓的 workspace 信任审批
 currentStep = 'user-hooks(用户级钩子接线)';

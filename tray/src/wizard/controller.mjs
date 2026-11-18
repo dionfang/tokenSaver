@@ -199,6 +199,27 @@ export function createWizardController(deps) {
   let nodeQualification = { ok: false, version: null, reason: 'unchecked' };
   const refreshNodeForm = async () => { nodeQualification = await detectNodeQualification({ execFile }); envelope.nodeForm = nodeQualification; return nodeQualification; };
 
+  /** gpu 模式:向导代写 Ollama 并发驻留上限(2026-11-18 用户裁决,方案 A 客户端化)——
+   *  OLLAMA_MAX_LOADED_MODELS 默认 3,聊天模型挤入即 LRU 逐走调用最稀疏的嵌入模型(keep_alive 24h 救不了 LRU);
+   *  写用户级 env + WM_SETTINGCHANGE 广播(与安装器 env 注入同手法,sh=execFile 注入);值已同且未写过则不动(幂等)。
+   *  注意:对已运行中的 Ollama 进程不生效(启动时读 env),须重启 Ollama——向导在 MODE 步 recheck 后提示。 */
+  async function ensureOllamaMaxLoaded() {
+    const KEY = 'OLLAMA_MAX_LOADED_MODELS';
+    const WANT = '5';
+    try {
+      const q = await new Promise((resolve) => {
+        execFile('reg', ['query', 'HKCU\\Environment', '/v', KEY], { windowsHide: true, encoding: 'utf8' }, (e, stdout) => resolve({ ok: !e, stdout: String(stdout || '') }));
+      });
+      if (q.ok && q.stdout.includes(KEY) && q.stdout.includes(WANT)) return { ok: true, already: true };
+      const set = await new Promise((resolve) => {
+        execFile('reg', ['add', 'HKCU\\Environment', '/v', KEY, '/t', 'REG_SZ', '/d', WANT, '/f'], { windowsHide: true, encoding: 'utf8' }, (e) => resolve({ ok: !e }));
+      });
+      if (!set.ok) return { ok: false, error: 'reg add 失败' };
+      try { execFile('powershell', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","5","User")'], { windowsHide: true, encoding: 'utf8' }, () => {}); } catch { /* 广播尽力 */ }
+      return { ok: true, already: false };
+    } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+  }
+
   const push = (extra = {}) => { envelope.wizard = machine.getState(); sendState({ ...envelope, ...extra }); return envelope; };
 
   /** init 完成后拉一次三端钩子灯(spawn hooksStatus,失败不阻断 DONE)。 */
@@ -344,7 +365,18 @@ export function createWizardController(deps) {
       case 'set-roots': return push(machine.setRoots(payload.list ?? []));
       case 'remove-root': return push(machine.removeRoot(payload.dir));
       case 'set-mode': { const r = machine.setRunMode(payload.mode); return push(r); }
-      case 'recheck-ollama': { const r = await machine.recheckOllama(); envelope.ollamaVersion = r.version ?? null; return push(r); }
+      case 'recheck-ollama': {
+        const r = await machine.recheckOllama();
+        envelope.ollamaVersion = r.version ?? null;
+        // 2026-11-18 用户裁决(方案 A 客户端化):gpu 就绪即代写 OLLAMA_MAX_LOADED_MODELS=5(用户级),
+        // 抬高并发驻留上限防嵌入模型被 LRU 驱逐;值刚被改写时提示重启 Ollama(env 启动时才读)。
+        if (r.ok) {
+          const m = await ensureOllamaMaxLoaded();
+          envelope.installLog.push(m.ok ? (m.already ? '[ok] Ollama 并发驻留上限已配置(OLLAMA_MAX_LOADED_MODELS=5)' : '[ok] 已写入 OLLAMA_MAX_LOADED_MODELS=5(防嵌入模型被 LRU 驱逐)——对已在运行的 Ollama 需重启后生效') : `[warn] 并发驻留上限写入失败(${m.error || '未知'}),不影响向导`);
+          sendState({ ...envelope });
+        }
+        return push(r);
+      }
       case 'set-consent': return push(machine.setConsent(payload.checked === true));
       case 'start-env-check': {
         // 2026-11-16 拍板 B:环境自检替代清单下载;进行中重复调用给可见反馈(不再静默吞——用户实测「没反应」)
