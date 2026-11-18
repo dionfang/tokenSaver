@@ -19,6 +19,7 @@ import { modelTooltip } from './util/lamps.mjs';
 import { createWizardController } from './wizard/controller.mjs';
 import { createUpdateBase } from './updateBase.mjs';
 import { createUploadKnn } from './uploadKnn.mjs';
+import { checkAppUpdate, scheduleBackgroundCheck, installOnQuit } from './appUpdater.mjs';
 import { createDownloader, httpRequest } from './downloader.mjs';
 import { readConsent, t4Allowed } from './consent.mjs';
 import { createDownloadRegistry } from './util/downloadRegistry.mjs';
@@ -186,6 +187,7 @@ function activateTray() {
     tray.setToolTip('TokenSaver');
     tray.setContextMenu(buildMenu());
     tray.on('double-click', () => openPanel());
+    scheduleBackgroundCheck(pushBase); // C6=b 应用自更新:托盘就绪后 30s 静默检查+后台下载(退出时装)
   })();
 }
 
@@ -351,6 +353,7 @@ function buildMenu() {
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
     { label: '更新公共决策包', visible: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
+    { label: '检查应用更新', click: () => { openPanel(); checkAppUpdate({ onEvent: pushBase, fromMenu: true }); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
     { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
@@ -541,5 +544,5 @@ if (!gotLock) {
   });
   app.on('window-all-closed', (e) => { /* 托盘常驻:面板关了不退 */ });
   // 2026-11-15 退出握手:菜单「退出」→ app.quit() 触发 before-quit 置真,close 拦截放行(hide 兜底不拦真退)
-  app.on('before-quit', () => { quitting = true; });
+  app.on('before-quit', () => { quitting = true; installOnQuit(); }); // 就绪态静默装新版(C6=b 退出时装)
 }
