@@ -12,7 +12,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 适合在本地代码库上用 Agent 开发。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
 
-另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板;能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
+另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板 + 公共决策包一键更新/本地向量上传(均带同意门禁);能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
 ![微信图片_20261105220119.png](https://raw.gitcode.com/user-images/assets/11189521/7fabff6c-6f9b-44a9-943b-fbc69d24b447/微信图片_20261105220119.png '微信图片_20261105220119.png')
 
 ### 工作方式
@@ -22,7 +22,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 - 混合检索:BM25 词法 + 向量余弦;需要更准再加 `--rerank`;嵌入拉起失败自动降为纯 BM25。嵌入默认 local(transformers.js),可选 `--model-in ollama`;判定模型跟同路径本地化,默认启用、零远程调用(ollama=tev1:0.8b,local=常驻 ONNX)。
 - 读取守卫:整文件 Read 超过 `readMaxLines`(默认 500)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。**护栏面与索引面统一(2026-11-07)**:只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制/未收录类型)直接放行不计入节约口径(图片走宿主视觉通道,真实成本是视觉 token)。Cursor 的 preToolUse 用字面 matcher。
 - 索引保鲜:git 仓库按 HEAD 判断过期;非 git 目录默认 24 小时重建。
-- 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次(下限口径,真实节约随后续轮数复利);状态句实时展示今日/累计。
+- 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次(下限口径,真实节约随后续轮数复利);状态句实时展示今日/累计。**口径声明(2026-11-18)**:① 预取(prefetch)注入只登记免读候选,同会话后续读取守卫拦截同文件才转正入账一次(守卫让位不双计,压缩侧按预取实际注入量),未证实的候选 7 天过期不计;② 会话放大依赖宿主 usage 数据源:ZCode(db)/Qoder(qoder-usage)覆盖放大,**Cursor 无 usage 喂入,只计入口一次、不计会话放大**(显式口径,非缺陷);③ 检索原文分母按命中块行区间并集去重(重叠行不重复计);④ output 侧节约/路由降档成本/本地替代远程不在本账本口径内。
 - 模型清理:切换模型后发起会话,会话开始即卸掉"切换前拉起"的驻留模型(只卸本工具拉起的,你自己 pull 的聊天模型不碰);宿主关闭后由脱离父进程的看护统一卸载 Ollama 驻留、停掉 transformers.js 常驻进程(不留 keep_alive 驻留尾巴)。手动清:`node cleanup.mjs --all`。
 
 #### 动态模型路由(要点)
@@ -177,7 +177,7 @@ TokenSaver is a local agent productivity tool with two core feature modules.
 
 Built for agent-based development on local repositories. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
-An optional desktop tray client lives in `tray/` (Electron): tray status lamps + dual-channel polling + install wizard/self-check panel; all capabilities spawn `code-index` micro-CLIs, with zero import coupling to the host (engineering red line guarded by `test/tray/importBan.test.mjs`).
+An optional desktop tray client lives in `tray/` (Electron): tray status lamps + dual-channel polling + install wizard/self-check panel + one-click decision-pack update / local vector upload (both consent-gated); all capabilities spawn `code-index` micro-CLIs, with zero import coupling to the host (engineering red line guarded by `test/tray/importBan.test.mjs`).
 
 ### How it works
 
@@ -186,7 +186,7 @@ An optional desktop tray client lives in `tray/` (Electron): tray status lamps +
 - Hybrid search: BM25 lexical + vector cosine; add `--rerank` for tighter ranking; falls back to BM25-only if the embedding model fails to start. Embedding defaults to local (transformers.js), optionally `--model-in ollama`; the decision model follows the same path locally — always on, zero remote calls (ollama = tev1:0.8b, local = resident ONNX).
 - Read guard: a full-file Read past 1.25 × `readMaxLines` (default 500) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. **Guard scope equals index scope (2026-11-07)**: only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries/unlisted types) passes through without entering the savings ledger (images go through the host vision channel — real cost is vision tokens). Cursor's preToolUse uses literal matchers.
 - Index freshness: git repositories go stale by HEAD; non-git directories rebuild every 24 hours by default.
-- Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point (a lower bound; real savings compound over later turns); the status line shows today/cumulative live.
+- Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point (a lower bound; real savings compound over later turns); the status line shows today/cumulative live. **Scope notes (2026-11-18)**: (1) prefetch injection only registers an avoided-read candidate; it is booked once when the read guard later intercepts the same file in the same session (the guard yields to avoid double counting; compressed side = tokens actually injected by prefetch); unproven candidates expire after 7 days and are never booked; (2) per-session amplification depends on host usage feeds: ZCode (db) and Qoder (qoder-usage) are covered, **Cursor has no usage feed and is booked entry-once only, without session amplification** (explicit scope, not a defect); (3) the search original-token denominator deduplicates hit spans by line-range union (overlap lines counted once); (4) output-side savings, routing downshift cost and local-replaces-remote are outside this ledger's scope.
 - Model cleanup: starting a session after a model switch unloads the leftovers the previous models had pulled up (only models this tool loaded — chat models you pulled yourself are never touched); after the host closes, a detached watcher unloads every Ollama-resident model and stops the transformers.js resident process, so no keep_alive tail is left behind. Manual cleanup: `node cleanup.mjs --all`.
 
 #### Dynamic model routing (key points)

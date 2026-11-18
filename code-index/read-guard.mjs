@@ -97,6 +97,14 @@ export function tokensFromBlockedBytes(bytes) {
   return Math.ceil(n / 4);
 }
 
+/** 预取 claim 认领(动态导入避循环;失败=null 走原口径,不影响拦截)。 */
+async function takePrefetchClaimSafe(session, file, now) {
+  try {
+    const { takePrefetchClaim } = await import('./modelStatus.mjs');
+    return takePrefetchClaim(session, file, { now });
+  } catch { return null; }
+}
+
 async function recordBlockedBytes(bytes) {
   const tokens = tokensFromBlockedBytes(bytes);
   if (tokens <= 0) return;
@@ -174,18 +182,32 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
     });
     // S3-F1(2026-11-17 夜审):非递归通配删除(rm agent_reports/ab-logs/* / del …\*.json)不走 -r 门控,
     // 但 glob 会清空保护目录内容——glob 目标的目录部分落入保护目录/工作区即拦(结构性缺口补全)。
-    if (hasProtected) {
-      const covers = (from, to) => { const rel = path.relative(from, to); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
-      for (const t of rest) {
-        if (t.startsWith('-')) continue;
-        const bare = t.replace(/^["']|["']$/g, '');
-        if (!bare.includes('*')) continue;
-        const dirPart = bare.split(/[\\/]/).filter((s) => s && !s.includes('*')).join('/');
-        const absDir = expandTarget(dirPart || '.', cwd);
-        if (!absDir) continue;
-        const norm = absDir.replace(/[\\/]+$/, '');
-        if (PROTECTED_DATA.test(absDir) || /(^|[\\/])data$/i.test(norm)
-          || covers(absDir, path.resolve(cwd, 'agent_reports', 'ab-logs'))
+    // S3-F1(20261118 扩):通配元字符不止 * —— ?(单字符)与 [...](字符组)同样是 glob 展开形态,
+    // 只查 * 会漏放「ab-logs/?????」「[a-z][a-z]」;Windows 文件名禁用 ?(不会误杀真实文件),[ 允许但极罕见。
+    // S3-F4(20261118):目标含变量引用(rm $X/*)→静态解析不出真实目录,无法证明安全即按危险处理
+    // (与递归分支「变量整体承载」同口径)。
+    // S3-F2(20261118):**绝对路径**通配目标与递归分支对齐——绝对路径可指向别仓的证据目录,
+    // 不能凭本 cwd 的 hasProtected 判安全;相对路径仍按 hasProtected(无数据工作区不误伤)。
+    const isGlobTarget = (s) => /[*?]/.test(s) || /\[[^\]]*\]/.test(s);
+    const hasVarRef = (s) => /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z0-9_]+%/.test(s);
+    const covers = (from, to) => { const rel = path.relative(from, to); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+    for (const t of rest) {
+      if (t.startsWith('-')) continue;
+      const bare = t.replace(/^["']|["']$/g, '');
+      if (!isGlobTarget(bare)) continue;
+      if (hasVarRef(bare)) {
+        return { permission: 'deny', kind: 'Clean', reason: `通配删除目标含变量引用(${t}),无法静态验证——请改用字面量路径` };
+      }
+      const dirPart = bare.split(/[\\/]/).filter((s) => s && !isGlobTarget(s)).join('/');
+      const absDir = expandTarget(dirPart || '.', cwd);
+      if (!absDir) continue;
+      const norm = absDir.replace(/[\\/]+$/, '');
+      const isAbs = path.isAbsolute(bare);
+      if (PROTECTED_DATA.test(absDir) || /(^|[\\/])data$/i.test(norm)) {
+        if (isAbs || hasProtected) return { permission: 'deny', kind: 'Clean', reason: `通配删除命中保护目录 ${bare}(非递归也可清空证据)` };
+      }
+      if (hasProtected) {
+        if (covers(absDir, path.resolve(cwd, 'agent_reports', 'ab-logs'))
           || covers(absDir, path.resolve(cwd, 'test', 'ab'))
           || norm === path.resolve(cwd)) {
           return { permission: 'deny', kind: 'Clean', reason: `通配删除命中保护目录 ${bare}(非递归也可清空证据)` };
@@ -583,7 +605,7 @@ export async function runReadGuard({ stdinText } = {}) {
     // Bash 不退款:宿主对超限输出做 persisted-output 存盘截断,全文并未进上下文。
     const d = denials[dkey];
     if (d && Number(d.bytes) > 0) {
-      await trackEvent({ at: d.at, session: convId, kind: d.kind === 'Rewrite' ? 'Rewrite' : 'Read', file, bytes: d.bytes, void: true });
+      await trackEvent({ at: d.at, session: convId, kind: d.kind || 'Read', file, bytes: d.bytes, void: true });
     }
     delete denials[dkey];
     try { saveDenials(convId, denials); } catch { /* 仍放行 */ }
@@ -608,15 +630,19 @@ export async function runReadGuard({ stdinText } = {}) {
             { ...ti, offset: s, limit },
             rewriteGuidance({ file, lines, size: st.size, range, searchCmd: searchCmd() }),
           );
+          const claim = await takePrefetchClaimSafe(convId, file, now);
+          const compressed = claim ? (Number(claim.injectedTokens) || 0) : Math.ceil(rangeBytes / 4);
           try {
             const { addInputSavings } = await import('./modelStatus.mjs');
-            addInputSavings(tokensFromBlockedBytes(st.size), Math.ceil(rangeBytes / 4));
+            addInputSavings(tokensFromBlockedBytes(st.size), compressed);
           } catch { /* 记账失败仍改写 */ }
-          await trackEvent({ at: now, session: convId, kind: 'Rewrite', file, bytes: st.size, rangeBytes, s, e: Math.min(range.e, lines) });
+          await trackEvent(claim
+            ? { at: now, session: convId, kind: 'Prefetch', file, bytes: st.size, originalTokens: tokensFromBlockedBytes(st.size), compressedTokens: compressed }
+            : { at: now, session: convId, kind: 'Rewrite', file, bytes: st.size, rangeBytes, s, e: Math.min(range.e, lines) });
           markHookRewrite(convId, file, now);
           // 改写也登记一次拦截:5 分钟内重发同一文件即放行全文(与 deny 同口径的逃生舱)
           try {
-            denials[dkey] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: 'Rewrite', file };
+            denials[dkey] = { at: now, agentType: detectAgentType(input), response: body, bytes: st.size, kind: claim ? 'Prefetch' : 'Rewrite', file };
             saveDenials(convId, denials);
           } catch { /* 登记不上不影响改写 */ }
           respond(body);
@@ -638,8 +664,22 @@ export async function runReadGuard({ stdinText } = {}) {
     } catch {
       return emit(dialect, 'allow');
     }
-    await recordBlockedBytes(st.size);
-    await trackEvent({ at: now, session: convId, kind: 'Read', file, bytes: st.size });
+    // 预取免读转正(PU-002 A):同会话同文件有未转正 claim → 本次拦截证实免读,
+    // 以 claim 的注入量为 compressed 入账一次,guard 自身不再重复计;无 claim 走原口径。
+    const claim = await takePrefetchClaimSafe(convId, file, now);
+    if (claim) {
+      const tok = tokensFromBlockedBytes(st.size);
+      try {
+        const { addInputSavings } = await import('./modelStatus.mjs');
+        addInputSavings(tok, Number(claim.injectedTokens) || 0);
+      } catch { /* 记账失败仍拒绝 */ }
+      await trackEvent({ at: now, session: convId, kind: 'Prefetch', file, bytes: st.size, originalTokens: tok, compressedTokens: Number(claim.injectedTokens) || 0 });
+      denials[dkey] = { ...denials[dkey], kind: 'Prefetch' };
+      try { saveDenials(convId, denials); } catch { /* 仍拒绝 */ }
+    } else {
+      await recordBlockedBytes(st.size);
+      await trackEvent({ at: now, session: convId, kind: 'Read', file, bytes: st.size });
+    }
     respond(body);
     return body;
   }

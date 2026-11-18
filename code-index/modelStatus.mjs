@@ -351,6 +351,43 @@ export function appendReadEvent(entry) {
   } catch { /* 留痕失败不影响主流程 */ }
 }
 
+// ---------- 预取免读 claim(PU-002 选项 A,2026-11-18):prefetch 注入只登记不入账;
+// 同会话后续 read-guard 拦截同文件才转正(归因强=证实 agent 有整读意图而被免),转正时 guard
+// 不再重复入账(防双计),compressed 用预取实际注入量(真实已花成本)。未证实的 claim 过期丢弃。 ----------
+const PREFETCH_CLAIMS_PATH = path.join(DATA_DIR, 'usage', 'prefetch-claims.jsonl');
+const CLAIM_TTL_MS = 7 * 24 * 3600 * 1000;
+const normClaimFile = (f) => String(f || '').replace(/\\/g, '/').toLowerCase();
+
+export function appendPrefetchClaim(claim, file = PREFETCH_CLAIMS_PATH) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, JSON.stringify({ ...claim, claimed: false }) + '\n');
+  } catch { /* 登记失败不影响注入 */ }
+}
+
+/** 认领一条未转正 claim(同会话+同文件,路径后缀兼容项目相对/绝对);成功即标 claimed 落盘,只认一次。 */
+export function takePrefetchClaim(session, filePath, { now = Date.now(), file = PREFETCH_CLAIMS_PATH } = {}) {
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n'); } catch { return null; }
+  const sid = String(session || '');
+  const want = normClaimFile(filePath);
+  if (!sid || !want) return null;
+  let hit = null;
+  const out = [];
+  for (const l of lines) {
+    if (!l.trim()) continue;
+    let j; try { j = JSON.parse(l); } catch { continue; }
+    if (now - Number(j.at || 0) > CLAIM_TTL_MS) continue; // 过期顺带清理
+    const cf = normClaimFile(j.file);
+    const match = !j.claimed && j.session === sid && (cf === want || want.endsWith('/' + cf));
+    if (match && !hit) { hit = j; out.push(JSON.stringify({ ...j, claimed: true, claimedAt: now })); }
+    else out.push(JSON.stringify(j));
+  }
+  if (!hit) return null;
+  try { atomicWriteFileSync(file, out.join('\n') + '\n'); } catch { return null; }
+  return hit;
+}
+
 /**
  * 事件读取。day=null → 全部事件(跨日连续累计用);否则只取该日。
  * 返回三类:拦截事件(带 session)、Search 事件(session 暂空,待认领)、SearchClaim(归属指认)。
@@ -367,6 +404,7 @@ export function readReadEvents(eventsPath = READ_EVENTS_PATH, day = dayKey(Date.
       if (!j) continue;
       if (day && dayKey(Number(j.at)) !== day) continue;
       if (j.kind === 'SearchClaim') { out.push(j); continue; }
+      if (j.kind === 'Prefetch' && j.session && Number(j.originalTokens) > 0) { out.push(j); continue; }
       if (Number(j.bytes) > 0 && j.session) { out.push(j); continue; }
       if (j.kind === 'Search' && Number(j.originalTokens) > 0) out.push(j);
     } catch { /* 坏行跳过 */ }
@@ -786,7 +824,7 @@ export function computeAccumulation(events, watermarks = {}, opts = {}) {
   for (const ev of events) {
     if (ev.void || ev.kind === 'SearchClaim') continue;
     const key = eventKey(ev);
-    const tokens = ev.kind === 'Search'
+    const tokens = (ev.kind === 'Search' || ev.kind === 'Prefetch')
       ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
       : ev.kind === 'Rewrite'
         ? Math.max(0, Math.ceil((Number(ev.bytes) - Number(ev.rangeBytes || 0)) / 4))
@@ -890,7 +928,9 @@ export function applySessionAccumulation() {
       continue;
     }
     if (d.rolloutMissing) {
-      // 数据源不可用:不放大,但入口一次仍要留痕(会话总计要含这一笔)
+      // 数据源不可用:不放大,但入口一次仍要留痕(会话总计要含这一笔)。
+      // 口径声明(PU-004 选项 B,2026-11-18):Cursor 无 usage 喂入(agent-usage 仅 ZCode/qoder 行),
+      // 其会话恒走本分支=只计入口一次、不计会话放大;Qoder 有 qoder-usage 行覆盖放大。非缺陷,显式口径。
       if (!watermarks[d.key]) {
         watermarks[d.key] = { at: d.at, session: d.session, kind: d.kind, file: d.file, tokens: d.tokens, counted: 0, lastAt: d.at || 0, lastKey: '', accumulated: 0, voided: false };
         changed = true;

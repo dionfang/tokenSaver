@@ -24,6 +24,7 @@ import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
 import { vectorStoreNeedsEmbed, wantEmbedModel } from './vectorStore.mjs';
 import { pidAlive, spawnLogged, LOCK_TTL_MS } from './proc.mjs';
 import { embedIntent } from './rangePick.mjs';
+import { appendPrefetchClaim } from './modelStatus.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const self = fileURLToPath(import.meta.url);
@@ -186,7 +187,7 @@ function readJson(file) {
 }
 
 /** 预取总入口:返回 additionalContext 文本;null = 本次不注入。statePath 可注入以便测试密闭。 */
-export function prefetchContext(payload, { chunksPath = path.join(DATA_DIR, 'chunks.jsonl'), configPath = path.join(DATA_DIR, 'code-index.config.json'), statePath = path.join(DATA_DIR, '.prefetch-last.json') } = {}) {
+export function prefetchContext(payload, { chunksPath = path.join(DATA_DIR, 'chunks.jsonl'), configPath = path.join(DATA_DIR, 'code-index.config.json'), statePath = path.join(DATA_DIR, '.prefetch-last.json'), claimsPath = path.join(DATA_DIR, 'usage', 'prefetch-claims.jsonl') } = {}) {
   const cfg = readJson(configPath) || {};
   const pc = cfg.prefetch && typeof cfg.prefetch === 'object' ? cfg.prefetch : {};
   if (pc.enabled === false) return null;
@@ -209,7 +210,21 @@ export function prefetchContext(payload, { chunksPath = path.join(DATA_DIR, 'chu
     .slice(0, k);
   if (!hits.length) return null;
   try { fs.writeFileSync(statePath, JSON.stringify({ sha, at: Date.now() })); } catch { /* 记不上就不去重 */ }
-  return `[code-index] 与提问相关的索引命中(直接按行号区间读,不必再检索):\n${formatHits(mergeHitRanges(hits))}`;
+  const merged = mergeHitRanges(hits);
+  // 预取免读候选 claim(PU-002 A,2026-11-18):只登记不入账;同会话后续 read-guard 拦截同文件
+  // 才转正(证实 agent 有整读意图而被免),转正时 guard 让位不双计,compressed=预取实际注入量。
+  // 未证实的 claim 7 天过期丢弃(归因强、量小,不虚高)。
+  try {
+    const session = String(payload.sessionId || payload.session_id || payload.conversation_id || '');
+    if (session) {
+      const byFile = new Map();
+      for (const c of merged) { const arr = byFile.get(c.p) || []; arr.push(c); byFile.set(c.p, arr); }
+      for (const [p, group] of byFile) {
+        appendPrefetchClaim({ at: Date.now(), session, file: p, injectedTokens: Math.ceil(Buffer.byteLength(formatHits(group)) / 4) }, claimsPath);
+      }
+    }
+  } catch { /* claim 登记失败不影响注入 */ }
+  return `[code-index] 与提问相关的索引命中(直接按行号区间读,不必再检索):\n${formatHits(merged)}`;
 }
 
 // ---------- 主流程 ----------
