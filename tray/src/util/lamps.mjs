@@ -57,8 +57,9 @@ export function modelLamps(health, { localWeights = {} } = {}) {
   };
 }
 
-/** 托盘悬浮提示(2026-11-17 用户裁决):一行一模型=灯 emoji+类型+名,替代 ⚙ 状态句。
- *  灯语义同 modelLamps(绿=驻留/就绪,黄=已装未驻留,红=缺失);Windows tooltip ≤127 字符,
+/** 托盘悬浮提示(2026-11-17 用户裁决;2026-11-18 改文字状态词):一行一模型=状态词+类型+名。
+ *  原 emoji 灯在 Windows 托盘 tooltip 单色渲染成灰圈(用户实测不分红黄绿)→ 改文字状态词,
+ *  灯语义同 modelLamps(绿=正常,黄=未驻留/未缓存,红=未安装);Windows tooltip ≤127 字符,
  *  strands id 用向导同款短形 dir(quant)。纯函数,快照缺灯时给获取中兜底。 */
 export function modelTooltip(snapshot) {
   const m = snapshot?.lamps?.models;
@@ -71,13 +72,13 @@ export function modelTooltip(snapshot) {
     const p = s.split(':'); // [strands, dir, quant?]
     return `${p[1] ?? ''}(${p[2] ?? 'quantized'})`;
   };
-  const LAMP = { green: '🟢', yellow: '🟡', red: '🔴' };
+  const LAMPW = { green: '正常', yellow: '未驻留', red: '未安装' };
   const rows = [
     ['嵌入模型', local ? names.localEmbedding : names.embedding, m.embedding],
     ['精排模型', local ? names.localReranker : names.reranker, m.reranker],
     ['决策模型', local ? names.localDecision : names.decision, m.decision],
   ];
-  return rows.map(([t, n, l]) => `${LAMP[l] || '⚪'} ${t} ${n ? pretty(n) : '(未知)'}`).join('\n');
+  return rows.map(([t, n, l]) => `${LAMPW[l] || '未知'} ${t} ${n ? pretty(n) : '(未知)'}`).join('\n');
 }
 
 /** §5.3.2 嵌入状态灯(含 empty)。vectors={embExists,meta} 由采集层读 data/vectors/<modelIn>/。 */

@@ -84,7 +84,7 @@ function openPanel() {
   if (panel && !panel.isDestroyed()) { panel.show(); panel.focus(); return; }
   panel = new BrowserWindow({
     title: 'TokenSaver 状态面板',
-    width: 460, height: 560, resizable: false, maximizable: false, fullscreenable: false, show: false,
+    width: 460, height: 620, resizable: false, maximizable: false, fullscreenable: false, show: false, // 2026-11-18 用户裁决:加高,三端钩子三行完整显示
     autoHideMenuBar: true,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
@@ -345,7 +345,7 @@ function buildMenu() {
   return Menu.buildFromTemplate([
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
-    { label: '更新公共决策包(先上传本地向量)', visible: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
+    { label: '更新公共决策包', visible: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
     { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
