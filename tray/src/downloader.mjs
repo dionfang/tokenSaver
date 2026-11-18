@@ -143,6 +143,8 @@ export function createDownloader(deps = {}) {
           if (attempt < RETRIES_PER_URL) await sleep(500 * 2 ** (attempt - 1)); // 指数退避(§16.4)
         }
       }
+      // 换源前清 .part:不同服务器的 Range 语义/偏移不可信,错位续传=整文件从头甚至坏件(2026-11-18 弱网加固)
+      try { if (fs.existsSync(part)) fs.unlinkSync(part); } catch { /* 尽力 */ }
     }
     return { status: 'failed', error: `全部源重试失败:${String(lastErr?.message || lastErr)}` };
   }
@@ -178,7 +180,9 @@ export function createDownloader(deps = {}) {
           catch (e) { console.error(`[downloader] .part 校验失败,丢弃并从头重下: ${e?.message || e}`); startFrom = 0; }
         }
         const headers = startFrom > 0 ? { Range: `bytes=${startFrom}-` } : {};
-        const { status, headers: rh, res, req } = await httpReq(url, { headers });
+        // 弱网加固(2026-11-18):大文件(>16MB)静默断开 30s→120s——慢速但流动的流不再被 30s 看门狗反复掐死
+        const stall = Number(item.bytes) > 16 * 1024 * 1024 ? 120_000 : 30_000;
+        const { status, headers: rh, res, req } = await httpReq(url, { headers, timeoutMs: stall });
         active = { req, res };
         if (stopped()) { res.destroy(); return reject(new Error('aborted')); }
         let append = false;

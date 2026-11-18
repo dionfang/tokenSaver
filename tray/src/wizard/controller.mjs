@@ -203,10 +203,11 @@ export function createWizardController(deps) {
       envelope.installing = `pull:${name}`;
       envelope.installLog.push(`[pull] ollama pull ${name}`);
       sendState({ ...envelope });
+      let pullTimer = null; // S14-1(20261118 P1 修复):try 外声明——try 内 let 对 catch 不可见,catch 引用必 ReferenceError→installing 永卡「下载中」
       try {
         // S14-F1(2026-11-17):pull 加超时/取消——Ollama 挂死时不再无限等;120s 无进度即 abort(有进度续命)
         const ac = new AbortController();
-        let pullTimer = setTimeout(() => ac.abort(new Error('pull 超时(120s 无进度)')), 120_000);
+        pullTimer = setTimeout(() => ac.abort(new Error('pull 超时(120s 无进度)')), 120_000);
         const resp = await fetch(`${base}/api/pull`, { method: 'POST', body: JSON.stringify({ model: name, stream: true }), signal: ac.signal });
         if (!resp.ok || !resp.body) { clearTimeout(pullTimer); envelope.installLog.push(`[fail] HTTP ${resp.status}`); continue; }
         const reader = resp.body.getReader();
@@ -292,7 +293,10 @@ export function createWizardController(deps) {
       },
     });
     envelope.installing = null;
-    envelope.installLog.push(r.ok ? '[ok] CPU 权重下载完成' : '[fail] 部分权重下载失败(点「重新自检」重试;未齐前决策票弃权/检索降级 bm25)');
+    const failed = (r.results || []).filter((x) => x.status !== 'ok').map((x) => `${x.model}/${x.file}:${x.error || x.status}`);
+    envelope.installLog.push(r.ok
+      ? '[ok] CPU 权重下载完成'
+      : `[fail] 权重下载失败(${failed.slice(0, 3).join('; ')}${failed.length > 3 ? ` 等 ${failed.length} 项` : ''})——点「重新自检」重试;未齐前决策票弃权/检索降级 bm25`);
     await machine.runEnvChecks().catch(() => {});
     sendState({ ...envelope });
   }

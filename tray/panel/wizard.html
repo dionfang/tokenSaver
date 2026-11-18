@@ -229,7 +229,7 @@ function renderEnvCheck(w) {
     const stage = isPull
       ? (pp ? `正在拉取 Ollama 模型 ${pp.model}(${pp.pct}%)` : `正在拉取 Ollama 模型 ${String(installing).slice(5)}…`)
       : isWO
-        ? `${lastLine ? lastLine.replace(/^\[(weights|ok|fail)\]\s*/, '') : '正在在线下载 CPU 权重(HF/镜像 → hf-cache)…'}${wp && wp.pct != null ? `(${wp.pct}%)` : ''}`
+        ? `${lastLine ? lastLine.replace(/^\[(weights|ok|fail)\]\s*/, '') : '正在在线下载 CPU 权重(HF/镜像 → hf-cache)…'}${wp ? ` ${String(wp.itemId || '').split(':').slice(1).join(':')} ${bytes(wp.bytesDone) || '0 KB'}/${bytes(wp.bytesTotal) || '?'}(${wp.pct != null ? wp.pct : 0}%)` : ''}`
         : (lastLine ? lastLine.replace(/^\[(pull|info)\]\s*/, '') : '正在安装推理依赖(npm install)…');
     const stripes = !isPull && !isWO;
     installBlock = `<div class="bar ${stripes ? 'stripes' : ''}"><i class="${stripes ? '' : cls}" style="width:${width}%"></i></div>
