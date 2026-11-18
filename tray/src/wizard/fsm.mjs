@@ -49,7 +49,9 @@ export function canLeaveConsent() { return { ok: true }; }
 export function isEnvReady(checks) {
   const list = checks ?? [];
   if (!list.length) return { ok: false, reason: 'not-checked', message: '尚未执行环境自检' };
-  const hardFail = list.filter((c) => c.hard && c.ok !== true);
+  // 2026-11-18 交互同步:模型行「下载中」不拦下一步(可跳过完成接线,托盘面板显示下载百分比);
+  // 未在下载的缺失硬项仍拦。cpu/gpu 同口径。
+  const hardFail = list.filter((c) => c.hard && c.ok !== true && c.downloading !== true);
   return hardFail.length
     ? { ok: false, reason: 'env-incomplete', message: `环境未就绪:${hardFail.map((c) => c.label).join(', ')}` }
     : { ok: true };

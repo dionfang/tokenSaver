@@ -21,6 +21,7 @@ import { createUpdateBase } from './updateBase.mjs';
 import { createUploadKnn } from './uploadKnn.mjs';
 import { createDownloader, httpRequest } from './downloader.mjs';
 import { readConsent, t4Allowed } from './consent.mjs';
+import { createDownloadRegistry } from './util/downloadRegistry.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ICON = path.join(here, '..', 'assets', 'tray.png');
@@ -106,6 +107,7 @@ function wizardController() {
   wizardCtl = createWizardController({
     paths: ctx.paths,
     cmdRun: runner.run.bind(runner),
+    weightRegistry,
     sendState: (st) => {
       if (wizardWin && !wizardWin.isDestroyed()) wizardWin.webContents.send('wizard:state', st);
       // 2026-11-17:向导-only 模式下向导完成 → 立即转托盘模式(同会话无缝衔接)
@@ -357,11 +359,14 @@ function buildMenu() {
 }
 
 let weightsAuto = null, autoDownloader = null; // 2026-11-18 托盘自动补权重
+// 模型下载进度登记簿(2026-11-18 交互同步):wizard 权重下载/托盘自动补/gpu pull 三路共用;
+// 面板模型行「下载中 pct%」+ 自检行/下一步门禁(下载中可跳过)。
+const weightRegistry = createDownloadRegistry({ onChange: (snap) => { if (panel && !panel.isDestroyed()) panel.webContents.send('tray:weight-download', snap); } });
 function applySnapshot(snapshot) {
   ctx.snapshot = snapshot;
   // 2026-11-18:local 权重缺失且向导已完成时,托盘自动发起补下载(节流+防与向导并发)
   if (!weightsAuto && ctx.paths?.hfCacheDir) {
-    autoDownloader = createDownloader({});
+    autoDownloader = createDownloader({ onProgress: (p) => weightRegistry.update(p) });
     weightsAuto = createWeightsAuto({ downloadWeights, downloader: autoDownloader, getBaseDir: () => ctx.paths?.hfCacheDir, log: (l) => { try { fs.appendFileSync(path.join(ctx.paths.dataDir, 'weights-auto.log'), l + '\n'); } catch { /* 日志失败不阻断 */ } } });
   }
   if (weightsAuto) {
@@ -369,12 +374,12 @@ function applySnapshot(snapshot) {
     weightsAuto.maybe(snapshot.localWeights, snapshot.modelIn, { busy }).catch(() => {});
   }
   ctx.consent = snapshot.consent;
+  if (panel && !panel.isDestroyed()) panel.webContents.send('tray:snapshot', { ...snapshot, weightDownload: weightRegistry.snapshot() });
   if (tray) {
     tray.setContextMenu(buildMenu());
     // 2026-11-17 用户裁决:悬浮提示改模型拉起状态(灯+类型+名,一行一模型),不再显示 ⚙ 状态句
     tray.setToolTip(modelTooltip(snapshot));
   }
-  if (panel && !panel.isDestroyed()) panel.webContents.send('tray:snapshot', snapshot);
 }
 
 // ---------- 启动 ----------

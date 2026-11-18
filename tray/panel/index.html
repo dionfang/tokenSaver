@@ -80,6 +80,7 @@
       // 2026-11-15:未运行=未驻留显存(Ollama 空闲卸载/未预热),非故障——悬停说明,避免误判
       $(`t-${k}`).title = '「未运行」= 该模型当前未驻留显存:Ollama keep_alive 到期空闲卸载或尚未预热;检索/预热时会自动拉起';
     }
+    paintWeightDownload(s.weightDownload || null); // 2026-11-18:下载中显示百分比,替代「未安装」
     $('mode').textContent = s.modelIn === 'local' ? 'cpu模型' : s.modelIn ? 'gpu模型' : '未知';
     setLamp('embed', L.embed, EMBED_TEXT);
     const p = L.detail || {};
@@ -96,10 +97,13 @@
     $('knn-bar').className = kpct != null && kpct >= 100 ? 'full' : '';
     $('knn-pct').textContent = kt != null ? `${kd}/${kt}(${kpct ?? 0}%)` : '—';
     // 公共决策包(原名 base 向量包):未下载=灰条且无文案;已下载=同本地格式「done/total(pct%)」
+    // 下载/导入进行中(baseDownloading)由 onBaseEvent 实时驱动进度条,周期快照不覆盖,避免条来回跳。
     const bd = p.knnBaseDone, bt = p.knnBaseTotal, bpct = p.knnBasePct;
-    $('knn-base-bar').style.width = `${bd != null ? (bpct ?? 0) : 0}%`;
-    $('knn-base-bar').className = bd == null ? 'grey' : (bpct != null && bpct >= 100 ? 'full' : '');
-    $('knn-base-pct').textContent = bd != null && bt != null ? `${bd}/${bt}(${bpct ?? 0}%)` : '';
+    if (!baseDownloading) {
+      $('knn-base-bar').style.width = `${bd != null ? (bpct ?? 0) : 0}%`;
+      $('knn-base-bar').className = bd == null ? 'grey' : (bpct != null && bpct >= 100 ? 'full' : '');
+      $('knn-base-pct').textContent = bd != null && bt != null ? `${bd}/${bt}(${bpct ?? 0}%)` : '';
+    }
     for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
     embedRunning = s.embedPid != null;
     paintSyncBtn();
@@ -110,6 +114,7 @@
   // ---------- M4/M5(2026-11-18 交互裁决):「更新」=互惠动作(先上传本地已签向量再下载);
   // 同意唯一入口=安装向导数据上传步,面板保持监控定位(上传/同意开关已删) ----------
   let baseHold = false;
+  let baseDownloading = false; // 公共决策包下载/导入进行中:进度条改由 onBaseEvent 驱动,render 暂不覆盖
   let consentOn = false;
   function paintBaseBtn() {
     const btn = $('base-update');
@@ -124,12 +129,32 @@
   }
   window.trayPanel?.onBaseEvent((ev) => {
     if (ev.phase === 'consent') { consentOn = ev.consent?.uploadLocalKnn === true; paintBaseBtn(); return; }
-    if (ev.phase === 'download') { baseMsg(ev.pct != null ? `下载中 ${ev.pct}%` : '下载中…'); return; }
-    if (ev.phase === 'manifest' || ev.phase === 'import') { baseMsg(ev.message || ''); return; }
+    if (ev.phase === 'download') {
+      // 下载进度实时上条(此前仅文字行更新,进度条不动=用户报「下载完进度条没对应更新」)
+      baseDownloading = true;
+      const pct = ev.pct ?? 0;
+      $('knn-base-bar').style.width = `${pct}%`;
+      $('knn-base-bar').className = pct >= 100 ? 'full' : '';
+      $('knn-base-pct').textContent = ev.pct != null ? `下载中 ${pct}%` : '下载中…';
+      baseMsg(ev.pct != null ? `下载中 ${ev.pct}%` : '下载中…');
+      return;
+    }
+    if (ev.phase === 'import') {
+      baseDownloading = true; // 下载已满,导入期间条保持满格黄,文案转「导入中」
+      $('knn-base-bar').style.width = '100%';
+      $('knn-base-bar').className = '';
+      $('knn-base-pct').textContent = '导入中…';
+      baseMsg(ev.message || '');
+      return;
+    }
+    if (ev.phase === 'manifest') { baseMsg(ev.message || ''); return; }
     if (ev.phase === 'result' || ev.phase === 'done') {
+      baseDownloading = false;
       baseHold = false; paintBaseBtn();
       const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest';
       baseMsg(ev.message || '', ok ? 'ok' : 'err');
+      // 成功即拉新快照,进度条从下载态转入真实 base 层条数比例(不再等周期 tick/被 slowInFlight 跳过)
+      if (ok) window.trayPanel?.refresh?.().catch(() => {});
     }
   });
   $('base-update').addEventListener('click', async () => {
@@ -153,6 +178,20 @@
   }
 
   window.trayPanel?.onSnapshot(render);
+  // 2026-11-18 交互同步:模型下载中显示「下载中 pct%」替代「未安装」(向导权重/托盘自动补/gpu pull 三路)
+  function paintWeightDownload(wd) {
+    if (!wd) return;
+    for (const k of ['embedding', 'reranker', 'decision']) {
+      const it = wd[k];
+      if (!it) continue;
+      const el = $(`t-${k}`);
+      if (!el) continue;
+      el.textContent = `下载中 ${it.pct != null ? it.pct : 0}%${it.file ? ' · ' + it.file : ''}`;
+      el.title = it.phase === 'pull' ? 'Ollama 拉取中' : '权重文件下载中(向导/托盘自动补),完成后自动转绿';
+      $(`m-${k}`).className = 'dot yellow';
+    }
+  }
+  window.trayPanel?.onWeightDownload((wd) => paintWeightDownload(wd || null));
   $('snap-refresh').addEventListener('click', async () => {
     const btn = $('snap-refresh');
     if (!window.trayPanel?.refresh || btn.disabled) return;

@@ -148,7 +148,7 @@ function nextGate(w) {
   if (w.status === 'MODE') return (w.runMode === 'cpu' || (w.runMode === 'gpu' && w.ollamaReady === true)) ? { ok: true } : { ok: false };
   if (w.status === 'ENVCHECK') {
     const checks = w.envChecks || [];
-    return checks.length && checks.every((c) => c.ok || !c.hard) ? { ok: true } : { ok: false };
+    return checks.length && checks.every((c) => c.ok || !c.hard || c.downloading) ? { ok: true } : { ok: false };
   }
   return { ok: false };
 }
@@ -209,10 +209,10 @@ function bytes(n) { return n == null ? '' : n >= 1 << 30 ? (n / (1 << 30)).toFix
 
 function renderEnvCheck(w) {
   const checks = w.envChecks || [];
-  const hardBad = checks.filter((c) => c.hard && c.ok !== true);
+  const hardBad = checks.filter((c) => c.hard && c.ok !== true && c.downloading !== true);
   const rows = checks.length ? checks.map((c) => `
     <div class="item"><div class="meta"><span>${esc(c.label)}</span>
-      <span class="${c.ok ? 'ok' : 'err'}">${c.ok ? '✔' : '✘'}${!c.ok && !c.hard ? ' 待补' : ''}${c.hint ? ' — ' + esc(c.hint) : ''}</span>
+      <span class="${c.ok ? 'ok' : c.downloading ? 'hint' : 'err'}">${c.ok ? '✔' : c.downloading ? `⏬ 下载中 ${c.downloadPct ?? 0}%` : '✘'}${!c.ok && !c.hard && !c.downloading ? ' 待补' : ''}${c.hint && !c.downloading ? ' — ' + esc(c.hint) : ''}</span>
     </div></div>`).join('') : '<div class="sub">正在检测环境…</div>';
   const installing = S.installing;
   // 2026-11-17 用户裁决:不再显示 CMD 滚动文字——进度条 + 条下一行动态文字说明当前在做什么

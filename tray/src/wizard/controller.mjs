@@ -43,11 +43,12 @@ export function createWizardController(deps) {
     execFile,                       // nodeSetup 用(注入 child_process.execFile)
     ollamaBase,
     openPath = async () => {},
+    weightRegistry = null, // 模型下载进度登记簿(2026-11-18 交互同步:自检行/下一步门禁/托盘面板共用)
   } = deps;
   // fetchText/clientVersion/manifestUrl/pins 已随拍板 B 移除(清单下载撤,M4 base 包复用时再回);
   // downloader 实例保留(manifest+downloader 模块原样保留供 M4)。
   let envelope = { wizard: null, progress: null, hooks: null, nodeForm: null, installLog: [], installing: null }; // 发往渲染层的整体状态
-  const downloader = createDownloader({ onProgress: (p) => { envelope.progress = p; sendState(envelope); sendProgress(p); } });
+  const downloader = createDownloader({ onProgress: (p) => { envelope.progress = p; weightRegistry?.update(p); sendState(envelope); sendProgress(p); } });
 
   /** 软项自动安装(2026-11-16 用户需求:检测到缺失即页面自动激活,CMD 滚动+进度条):
    *  spawn 长任务,stdout/stderr 逐行推 envelope.installLog(尾部 50 行),完成后重跑 envProbe 刷新自检。
@@ -96,6 +97,16 @@ export function createWizardController(deps) {
 
   const nodeBinForWizard = () => pickNodeBin({ dataDir: paths.dataDir, qualified: nodeQualification });
 
+  /** ollama tag → 登记簿模型键(登记簿 pull/面板「下载中%」共用;与 envProbe 的 cfg 口径一致)。 */
+  const modelKeyForTag = (name) => {
+    let m = {};
+    try { m = JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8')).models ?? {}; } catch { /* 无配置 */ }
+    const EMB = m.embedding || 'qwen3-embedding:0.6b';
+    const RRK = m.reranker || 'sam860/qwen3-reranker:0.6b-F16';
+    const DEC = m.decision || 'tev1:0.8b';
+    return name === EMB ? 'embedding' : name === RRK ? 'reranker' : name === DEC ? 'decision' : null;
+  };
+
   const machine = createWizard({
     dataDir: paths.dataDir,
     // 现有配置的 roots(2026-11-16 用户需求:第 1 步自动载入当前 roots,可增删后重新接线)
@@ -140,24 +151,31 @@ export function createWizardController(deps) {
           const { status, res } = await httpRequest(`${ollamaBase || 'http://127.0.0.1:11434'}/api/tags`, { timeoutMs: 3000 });
           if (status === 200) { let txt = ''; res.setEncoding('utf8'); for await (const c of res) txt += c; installed = (JSON.parse(txt).models || []).map((m) => m.name); }
         } catch { /* 服务不在听 → 三项显示未知(不判红,MODE 门禁已过) */ }
+        // 2026-11-18 交互同步:cpu/gpu 下一步逻辑统一——模型行下载中(downloading)不拦下一步,
+        // 可跳过完成接线,托盘面板显示下载百分比;未在下载的缺失硬项仍拦。
+        const TAGKEY = { [EMB]: 'embedding', [RRK]: 'reranker', [DEC]: 'decision' };
         for (const [label, name] of [['嵌入模型', EMB], ['精排模型', RRK], ['决策模型', DEC]]) {
           const ok = installed == null ? false : installed.includes(name);
-          // 2026-11-16 用户裁决:gpu 三模型行收紧为硬项——自动 pull 有出路(拉完自动放行),缺模型不放行
+          const key = TAGKEY[name];
+          const dl = weightRegistry?.isDownloading(key) ? weightRegistry.snapshot()[key] : null;
           checks.push({ id: `m-${name}`, label: `Ollama ${label} ${name}`, ok, hard: true, tag: name,
-            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : '未安装——正在自动 ollama pull(或手动执行)' });
+            downloading: !!dl, downloadPct: dl?.pct ?? null,
+            hint: installed == null ? 'Ollama 未响应,无法确认' : ok ? '已安装' : dl ? `下载中 ${dl.pct ?? 0}%` : '未安装——正在自动 ollama pull(或手动执行)' });
         }
       } else {
         // 2026-11-17:缓存判定收敛 localWeightCached(util/paths,与 pollWeights 同一函数,防两处漂移)
         const cached = (id) => localWeightCached(paths.hfCacheDir ?? '', id) === true;
         // 2026-11-16 用户裁决:cpu 三行与 gpu 同格式显示具体模型名(本地 嵌入模型/精排模型/决策模型 <id>)
-        for (const [label, id, pretty] of [
-          ['嵌入模型', embId, embId],
-          ['精排模型', rrkId, rrkId],
-          ['决策模型', decId, `strands-${(decId.split(':')[1] || '').replace(/^strands-/, '')}(${decId.split(':')[2] || 'quantized'})`],
+        for (const [label, id, pretty, key] of [
+          ['嵌入模型', embId, embId, 'embedding'],
+          ['精排模型', rrkId, rrkId, 'reranker'],
+          ['决策模型', decId, `strands-${(decId.split(':')[1] || '').replace(/^strands-/, '')}(${decId.split(':')[2] || 'quantized'})`, 'decision'],
         ]) {
           const ok = cached(id);
+          const dl = !ok && weightRegistry?.isDownloading(key) ? weightRegistry.snapshot()[key] : null;
           checks.push({ id: `w-${label}`, label: `本地${label} ${pretty}`, ok, hard: false,
-            hint: ok ? '已缓存(hf-cache)' : '未缓存' });
+            downloading: !!dl, downloadPct: dl?.pct ?? null,
+            hint: ok ? '已缓存(hf-cache)' : dl ? `下载中 ${dl.pct ?? 0}%` : '未缓存' });
         }
       }
       // 2026-11-17 审查补口(§22.2 遗留):磁盘预检——cpu 权重 ~1.7GB/gpu 模型 ~2-3GB 下载前看余量,
@@ -202,6 +220,7 @@ export function createWizardController(deps) {
       if (envelope.installLog.length > 200) envelope.installLog = envelope.installLog.slice(-100); // 2026-11-17 审查:pull 日志封顶(防长拉取无限增长)
       envelope.installing = `pull:${name}`;
       envelope.installLog.push(`[pull] ollama pull ${name}`);
+      const pkey = weightRegistry ? modelKeyForTag(name) : null;
       sendState({ ...envelope });
       let pullTimer = null; // S14-1(20261118 P1 修复):try 外声明——try 内 let 对 catch 不可见,catch 引用必 ReferenceError→installing 永卡「下载中」
       try {
@@ -226,10 +245,10 @@ export function createWizardController(deps) {
               if (j.error) { envelope.installLog.push(`[fail] ${name}: ${j.error}`); continue; }
               if (j.total && j.completed != null) {
                 const pct = Math.floor((j.completed / j.total) * 100);
-                if (pct !== lastPct) { lastPct = pct; envelope.pullProgress = { model: name, pct }; envelope.installLog.push(`[pull] ${name} ${pct}%`); sendState({ ...envelope }); }
+                if (pct !== lastPct) { lastPct = pct; envelope.pullProgress = { model: name, pct }; envelope.installLog.push(`[pull] ${name} ${pct}%`); weightRegistry?.pull(pkey, pct); sendState({ ...envelope }); }
               } else if (j.status) {
                 envelope.installLog.push(`[pull] ${name}: ${j.status}`);
-                if (j.status === 'success') okLine = true;
+                if (j.status === 'success') { okLine = true; weightRegistry?.done(pkey); }
                 sendState({ ...envelope });
               }
             } catch { /* 半行,等下一段 */ }
@@ -237,9 +256,11 @@ export function createWizardController(deps) {
         }
         clearTimeout(pullTimer);
         envelope.installLog.push(okLine ? `[ok] ${name} 拉取完成` : `[fail] ${name} 拉取未确认成功`);
+        if (!okLine) weightRegistry?.clear(pkey);
       } catch (e) {
         clearTimeout(pullTimer);
         envelope.installLog.push(`[fail] ${name}: ${e?.message || e}`);
+        weightRegistry?.clear(pkey);
       }
     }
     envelope.installing = null;

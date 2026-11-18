@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('trayPanel', {
   // 上传/同意不再单独暴露(同意唯一入口=安装向导数据上传步);进度/结果单向推送。
   updateBase: () => ipcRenderer.invoke('tray:update-base'),
   onBaseEvent: (cb) => ipcRenderer.on('tray:base-update', (_e, ev) => cb(ev)),
+  // 2026-11-18 交互同步:模型下载进度(向导权重/托盘自动补/gpu pull)→ 面板行「下载中 pct%」
+  onWeightDownload: (cb) => ipcRenderer.on('tray:weight-download', (_e, snap) => cb(snap)),
 });
 
 contextBridge.exposeInMainWorld('trayRoots', {
