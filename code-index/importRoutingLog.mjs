@@ -69,6 +69,7 @@ function normHead(s) {
  * 对齐判据:part.time_created ∈ [ts-窗口, ts+窗口] 且 data 文本包含 promptHead 归一化前缀。
  */
 export async function alignAndLabel(candidates, { dbPath = DEFAULT_DB, windowMs = 10000 } = {}) {
+  if (!candidates.length) return { rows: [], missed: 0 }; // 空候选(缺日志/fresh 安装)不探 db(2026-11-18)
   let DatabaseSync;
   try { ({ DatabaseSync } = require('node:sqlite')); } catch { return { rows: [], error: 'node:sqlite 不可用' }; }
   let db;
@@ -83,12 +84,22 @@ export async function alignAndLabel(candidates, { dbPath = DEFAULT_DB, windowMs 
       const head = normHead(c.promptHead);
       const probe = head.slice(0, 12);
       const hitsAll = near.all(c.ts - windowMs, c.ts + windowMs);
+      // S5-F7(20261118):两_pass 对齐——先全头精确匹配;无命中才用 12 字前缀回落。
+      // 原单_pass `includes(head)||includes(probe)` 会让共享前缀的别条 prompt 先命中(±10s 窗错配)。
       let hit = null;
       for (const h of hitsAll) {
         const t = textOf(h.data);
         if (!t) continue;
         const nt = t.replace(/\s+/g, ' ');
-        if (nt.includes(head) || nt.includes(probe)) { hit = h; break; }
+        if (nt.includes(head)) { hit = h; break; }
+      }
+      if (!hit) {
+        for (const h of hitsAll) {
+          const t = textOf(h.data);
+          if (!t) continue;
+          const nt = t.replace(/\s+/g, ' ');
+          if (nt.includes(probe)) { hit = h; break; }
+        }
       }
       if (!hit) { missed += 1; continue; }
       const shape = { calls: 0, writes: 0, dispatches: 0, reads: 0 };
@@ -127,7 +138,11 @@ function textOf(data) {
 }
 
 export async function buildCandidates({ logFile = DEFAULT_LOG, dbPath = DEFAULT_DB, out = DEFAULT_OUT } = {}) {
-  const raw = fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  // 缺日志文件=fresh 安装(2026-11-18 测试机 ENOENT:客户端首启无 usage/routing-log.jsonl,
+  // --grow-now 即炸面板「立即同步失败」):按空日志 fail-open,与 loadPool/exportWeakLabels 同口径。
+  let raw = [];
+  try { raw = fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  catch { raw = []; }
   const candidates = pickCandidates(raw);
   const { rows, missed, error } = await alignAndLabel(candidates, { dbPath });
   // S5-F4(2026-11-10 夜审):db 瞬断/打不开时旧逻辑拿空 rows 无条件截断写盘,清空 routinglog-labels.jsonl;
@@ -139,7 +154,14 @@ export async function buildCandidates({ logFile = DEFAULT_LOG, dbPath = DEFAULT_
   }
   if (out) {
     fs.mkdirSync(path.dirname(out), { recursive: true });
-    atomicWriteFileSync(out, rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')); // S5-F1(2026-11-17 复核回改):原子写(11-14 修复曾被并行会话回退,夜审判假 fixed)
+    // S5-F3(20261118):并集写盘——部分 miss 时旧已标行不得被整文件替换丢掉(池缩水);
+    // 新对齐行按 promptKey 覆盖同键,未命中的旧行保留。全 miss 守卫(上面)仍先拒写。
+    let existing = [];
+    try { existing = fs.readFileSync(out, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { /* 无旧文件 */ }
+    const byKey = new Map(existing.map((r) => [r.promptKey || promptKey(r.prompt || ''), r]));
+    for (const r of rows) byKey.set(r.promptKey || promptKey(r.prompt || ''), r);
+    const union = [...byKey.values()];
+    atomicWriteFileSync(out, union.map((r) => JSON.stringify(r)).join('\n') + (union.length ? '\n' : '')); // S5-F1 原子写保留
   }
   return { total: raw.length, candidates: candidates.length, aligned: rows.length, missed, labeled: rows.filter((r) => r.label).length, out };
 }
