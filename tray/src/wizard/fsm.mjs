@@ -71,6 +71,10 @@ export function initCommands({ roots = [], runMode }) {
     cmds.push({ args: ['--set-roots', ''], label: '清空索引目录(不索引任何项目)' });
   }
   cmds.push({ args: ['--model-in', runMode === 'gpu' ? 'ollama' : 'local'], label: '设置运行模式' });
+  // 2026-11-18 差异同步(用户拍板):向导接线显式 --hooks all 装配三端钩子——
+  // 旧版缺省按宿主 env 探测(仅当前宿主),未开宿主的机器不会被接钩子(探测盲区)。
+  // init --hooks 幂等(重写同内容),重跑接线重复装配安全。
+  cmds.push({ args: ['--hooks', 'all'], label: '装配三端钩子(ZCode/Cursor/Qoder)' });
   return cmds;
 }
 
