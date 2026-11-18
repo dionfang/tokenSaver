@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 // manifest/downloader 保留给 M4 base 包更新复用(2026-11-16 拍板 B:向导不再走清单下载);
 import { probeOllama, createDownloader, httpRequest } from '../downloader.mjs';
 import { createWizard } from './fsm.mjs';
-import { detectNodeQualification, pickNodeBin } from './nodeSetup.mjs';
+import { detectNodeQualification, pickNodeBin, refreshPathForNodeDiscovery } from './nodeSetup.mjs';
 import { localWeightCached } from '../util/paths.mjs';
 import { downloadWeights, planEnvFollowup } from './weightsOnline.mjs';
 
@@ -123,7 +123,7 @@ export function createWizardController(deps) {
     // 环境自检(2026-11-16 拍板 B,替代清单下载):node=硬项(缺=接线跑不了,用户自行装);
     // deps=软项(init 接线时 npm install 自动补);权重=软项,真实检测 hf-cache 缓存。软项不阻断接线。
     envProbe: async () => {
-      const nq = nodeQualification ?? await detectNodeQualification({ execFile });
+      const nq = nodeQualification?.ok === true ? nodeQualification : await detectNodeQualification({ execFile }); // 缓存仅命中已达标态;未达标恒复检(旧 ?? 对恒有值缓存是死代码)
       const depsOk = fs.existsSync(path.join(paths.codeIndexRoot, 'node_modules', '@huggingface', 'transformers'));
       const mode = machine.getState().runMode;
       const cfgModels = (() => { try { return JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8')).models ?? {}; } catch { return {}; } })();
@@ -197,7 +197,13 @@ export function createWizardController(deps) {
   });
 
   let nodeQualification = { ok: false, version: null, reason: 'unchecked' };
-  const refreshNodeForm = async () => { nodeQualification = await detectNodeQualification({ execFile }); envelope.nodeForm = nodeQualification; return nodeQualification; };
+  const refreshNodeForm = async () => {
+    // 2026-11-19 修(env 快照层):复检前重读注册表 PATH+标准目录兜底,把「向导运行中才装的 Node」带进本进程
+    await refreshPathForNodeDiscovery({ execFile });
+    nodeQualification = await detectNodeQualification({ execFile });
+    envelope.nodeForm = nodeQualification;
+    return nodeQualification;
+  };
 
   /** gpu 模式:向导代写 Ollama 并发驻留上限(2026-11-18 用户裁决,方案 A 客户端化)——
    *  OLLAMA_MAX_LOADED_MODELS 默认 3,聊天模型挤入即 LRU 逐走调用最稀疏的嵌入模型(keep_alive 24h 救不了 LRU);
@@ -294,6 +300,9 @@ export function createWizardController(deps) {
    *  load 复检与手动「重新自检」都必须走这里——此前激活逻辑只在 start-env-check case,
    *  load 复检发现缺模型后不激活(用户删模型进向导等不到自动拉取的根因)。 */
   async function refreshEnvChecks() {
+    await refreshNodeForm(); // 2026-11-19 修(缓存层):「重新自检」真复检 node——旧版 envProbe 读 load 时缓存的
+    // nodeQualification(?? 兜底对恒有值缓存是死代码),用户装完 Node 点重新自检永远红。refreshNodeForm 内
+    // 还会重读注册表 PATH(进程 env 是启动快照,安装器写注册表进不了运行中进程)。
     const r = await machine.runEnvChecks();
     const env = r.state?.envChecks ?? [];
     const mode = r.state?.runMode;

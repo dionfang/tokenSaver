@@ -50,6 +50,66 @@ export async function appendDirToUserPath(dir, { execFile } = {}) {
   return { changed: true, userPath: set.stdout.trim() };
 }
 
+/** 展开 %VAR%(纯):查注入 env;未定义原样保留(死段对 PATH 无害)。 */
+export function expandEnvRefs(v, env = process.env) {
+  return String(v || '').replace(/%([^%;]+)%/g, (m, k) => { const val = env[k]; return val != null ? String(val) : m; });
+}
+
+/** 合并 PATH 段(纯):fresh 段在前、current 段补尾;忽略大小写去重、去空、去尾斜杠。 */
+export function mergePathSegments(fresh, current) {
+  const out = []; const seen = new Set();
+  for (const seg of [...(Array.isArray(fresh) ? fresh : []), ...(Array.isArray(current) ? current : [])]) {
+    const s = String(seg || '').trim().replace(/[\\/]+$/, '');
+    if (!s) continue;
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k); out.push(s);
+  }
+  return out;
+}
+
+/** 标准 Node 安装目录候选(MSI 默认位:Program Files(x64/x86)+每用户 LOCALAPPDATA\Programs\nodejs)。 */
+export function standardNodeDirs(env = process.env) {
+  const raw = [];
+  if (env.ProgramFiles) raw.push(path.join(env.ProgramFiles, 'nodejs'));
+  if (env['ProgramFiles(x86)']) raw.push(path.join(env['ProgramFiles(x86)'], 'nodejs'));
+  if (env.LOCALAPPDATA) raw.push(path.join(env.LOCALAPPDATA, 'Programs', 'nodejs'));
+  return [...new Set(raw.map((d) => { try { return path.resolve(d); } catch { return d; } }))];
+}
+
+/** 复检前刷新 node 可见性(2026-11-19 修「装完 Node 点重新自检仍红」的 env 快照层):
+ *  进程 PATH 是启动时快照,安装器写注册表+广播 WM_SETTINGCHANGE 进不了已运行进程——重读
+ *  Machine/User PATH(PowerShell;UTF-8 输出防中文用户名 mojibake,.NET 读注册表已展开 %VAR%,
+ *  再过 expandEnvRefs 兜底)+ 直探标准安装目录(装了但 PATH 没接上的形态)。
+ *  追加进 env.PATH(不删,幂等);非 win32 no-op;任何失败只返回不抛。 */
+export async function refreshPathForNodeDiscovery({ execFile, env = process.env, existsSync = fs.existsSync } = {}) {
+  if (process.platform !== 'win32') return { ok: true, changed: false, skipped: 'non-win32' };
+  try {
+    const read = async (scope) => {
+      const r = await sh(execFile, 'powershell', ['-NoProfile', '-Command',
+        `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;[Environment]::GetEnvironmentVariable('Path','${scope}')`]);
+      if (!r.ok) return null;
+      const v = expandEnvRefs(r.stdout.trim(), env);
+      return v ? v.split(';') : null;
+    };
+    const machine = await read('Machine');
+    const user = await read('User');
+    const fresh = [];
+    for (const segs of [machine, user]) if (segs) fresh.push(...segs);
+    for (const d of standardNodeDirs(env)) {
+      try { if (existsSync(path.join(d, 'node.exe'))) fresh.push(d); } catch { /* 尽力 */ }
+    }
+    if (!fresh.length) return { ok: false, changed: false, error: '注册表与标准目录均未取到 PATH 增量' };
+    const cur = String(env.PATH || env.Path || '');
+    const next = mergePathSegments(fresh, cur.split(';')).join(';');
+    if (next === cur) return { ok: true, changed: false };
+    env.PATH = next;
+    return { ok: true, changed: true };
+  } catch (e) {
+    return { ok: false, changed: false, error: String(e?.message || e) };
+  }
+}
+
 /** 托盘自身 spawn 用的 node(§17.1-7:检测胜出者优先,不依赖 PATH):达标 node → 'node';
  *  否则若 data/runtime/node/node.exe 在(下载解压后)用绝对路径;再退 'node'。 */
 export function pickNodeBin({ dataDir, qualified, exists = fs.existsSync }) {
