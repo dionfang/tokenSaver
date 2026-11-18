@@ -238,6 +238,36 @@ export function readSessionSavings() {
   return readSavingsState().savedTokens;
 }
 
+/** 检索节约的原文分母(纯):命中块正文按文件行区间**并集去重**拼接。
+ *  块文本首行是 header,正文第 k 行对应 s+k;索引相邻块有 overlapLines 重叠,
+ *  直接拼接会把重叠行重复计入 → 原文分母偏大 → 节约高估(2026-11-18 节约口径审查修)。
+ *  同文件按 s 升序,跳过已被前块覆盖的行;不同文件各自累计。 */
+export function mergeHitBodies(chunks, kept) {
+  const byFile = new Map();
+  for (const i of kept || []) {
+    const c = chunks?.[i];
+    if (!c) continue;
+    const raw = String(c.t || '');
+    const nl = raw.indexOf('\n');
+    const body = nl >= 0 ? raw.slice(nl + 1) : raw;
+    const arr = byFile.get(c.p) || [];
+    arr.push({ s: Number(c.s) || 0, e: Number(c.e) || 0, lines: body.split('\n') });
+    byFile.set(c.p, arr);
+  }
+  const parts = [];
+  for (const arr of byFile.values()) {
+    arr.sort((a, b) => a.s - b.s);
+    let covered = -1;
+    for (const b of arr) {
+      const from = Math.max(0, covered - b.s + 1);
+      const seg = b.lines.slice(from).join('\n');
+      if (seg.trim()) parts.push(seg);
+      covered = Math.max(covered, b.e);
+    }
+  }
+  return parts.join('\n');
+}
+
 /** 一次请求:原文 token、压缩后 token。节约 = 原文 − 压缩后。 */
 export function savingsFromCounts(originalTokens, compressedTokens) {
   const original = Math.max(0, Math.round(Number(originalTokens) || 0));
@@ -1318,17 +1348,18 @@ export function decideOllamaRestart({ unhealthy, streak = 0, lastRestartAt = 0, 
   return { restart: true, streak: 0, reason: '连判≥2 且过冷却' };
 }
 
-const ollamaHealthStatePath = () => path.join(DATA_DIR, 'routing', 'ollama-health.json');
-const ollamaRestartLogPath = () => path.join(DATA_DIR, 'routing', 'ollama-restart.log');
+// S14-F3(20261118):dataDir 可注入(默认 DATA_DIR)——自愈回归测试必须密闭,不写真实 data。
+const ollamaHealthStatePath = (dataDir = DATA_DIR) => path.join(dataDir, 'routing', 'ollama-health.json');
+const ollamaRestartLogPath = (dataDir = DATA_DIR) => path.join(dataDir, 'routing', 'ollama-restart.log');
 
-function readOllamaHealthState() {
-  try { const j = JSON.parse(fs.readFileSync(ollamaHealthStatePath(), 'utf8')); return j && typeof j === 'object' ? j : {}; } catch { return {}; }
+function readOllamaHealthState(dataDir = DATA_DIR) {
+  try { const j = JSON.parse(fs.readFileSync(ollamaHealthStatePath(dataDir), 'utf8')); return j && typeof j === 'object' ? j : {}; } catch { return {}; }
 }
-function writeOllamaHealthState(s) {
-  try { fs.mkdirSync(path.dirname(ollamaHealthStatePath()), { recursive: true }); atomicWriteFileSync(ollamaHealthStatePath(), JSON.stringify(s)); } catch { /* 状态写失败不影响 */ }
+function writeOllamaHealthState(s, dataDir = DATA_DIR) {
+  try { fs.mkdirSync(path.dirname(ollamaHealthStatePath(dataDir)), { recursive: true }); atomicWriteFileSync(ollamaHealthStatePath(dataDir), JSON.stringify(s)); } catch { /* 状态写失败不影响 */ }
 }
-function logOllamaRestart(rec) {
-  try { fs.mkdirSync(path.dirname(ollamaRestartLogPath()), { recursive: true }); fs.appendFileSync(ollamaRestartLogPath(), JSON.stringify(rec) + '\n'); } catch { /* 留痕失败不影响 */ }
+function logOllamaRestart(rec, dataDir = DATA_DIR) {
+  try { fs.mkdirSync(path.dirname(ollamaRestartLogPath(dataDir)), { recursive: true }); fs.appendFileSync(ollamaRestartLogPath(dataDir), JSON.stringify(rec) + '\n'); } catch { /* 留痕失败不影响 */ }
 }
 
 /** Ollama server.log 路径(Windows: %LOCALAPPDATA%\Ollama\server.log;非 win 走 ~/.ollama/logs)。 */
@@ -1337,13 +1368,30 @@ export function ollamaServerLogPath(home = os.homedir(), env = process.env) {
   return path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ollama', 'server.log');
 }
 
+/** 定长尾读(S3-F3/S14-F2 20261118 P2):readFileSync 无 {start,end} 选项语义——此前生产行静默忽略
+ *  坐标参数整读 server.log(MB/GB 级,每轮健康评估一次)。openSync+readSync 只取末 maxBytes;
+ *  文件缺失/读失败返回 ''(调用方按"无 runner 异常证据"处理)。 */
+export function readFileTail(lp, maxBytes = 64 * 1024) {
+  try {
+    const st = fs.statSync(lp);
+    const from = Math.max(0, st.size - maxBytes);
+    const fd = fs.openSync(lp, 'r');
+    try {
+      const len = st.size - from;
+      const buf = Buffer.alloc(len);
+      const n = fs.readSync(fd, buf, 0, len, from);
+      return buf.toString('utf8', 0, n);
+    } finally { fs.closeSync(fd); }
+  } catch { return ''; }
+}
+
 /** 触发重启:Windows 下 taskkill serve(托盘自动拉回,2026-11-17 实测路径);随后 detached warm 回拉。 */
-export function restartOllamaNow({ now = Date.now(), spawnFn = null, taskkillFn = null } = {}) {
+export function restartOllamaNow({ now = Date.now(), spawnFn = null, taskkillFn = null, dataDir = DATA_DIR } = {}) {
   if (process.platform !== 'win32') return { restarted: false, reason: '非 Windows,跳过(交系统服务管理)' };
   try {
     const r = taskkillFn ? taskkillFn() : spawnSync('taskkill', ['//F', '//IM', 'ollama.exe'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
-    logOllamaRestart({ at: now, status: r?.status === 0 || r?.status == null ? 'killed' : `taskkill rc=${r?.status}`, note: 'ollama runner 异常自愈(默认开)' });
-    writeOllamaHealthState({ unhealthyStreak: 0, lastRestartAt: now });
+    logOllamaRestart({ at: now, status: r?.status === 0 || r?.status == null ? 'killed' : `taskkill rc=${r?.status}`, note: 'ollama runner 异常自愈(默认开)' }, dataDir);
+    writeOllamaHealthState({ unhealthyStreak: 0, lastRestartAt: now }, dataDir);
     console.error('[ollama-heal] 已重启 ollama serve(托盘自动拉回),随后后台回拉模型');
     const warmPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'warm.mjs');
     try {
@@ -1356,7 +1404,7 @@ export function restartOllamaNow({ now = Date.now(), spawnFn = null, taskkillFn 
 }
 
 /** 每轮健康评估触发(ollama=up 分支):读状态→检测→决策→执行。注入 spawnFn/taskkillFn 供测试密闭。 */
-function ollamaRunnerSelfHeal({ running, models, decisionWanted, now = Date.now(), spawnFn = null, taskkillFn = null } = {}) {
+export function ollamaRunnerSelfHeal({ running, models, decisionWanted, now = Date.now(), spawnFn = null, taskkillFn = null, dataDir = DATA_DIR } = {}) {
   const c = loadConfig();
   if (c.ollamaAutoRestart === false) return { action: 'off' };
   const want = decisionWanted ? [models.embedding, models.reranker, models.decision] : [models.embedding, models.reranker];
@@ -1364,15 +1412,20 @@ function ollamaRunnerSelfHeal({ running, models, decisionWanted, now = Date.now(
   let logText = '';
   try {
     const lp = ollamaServerLogPath();
-    const st = fs.statSync(lp);
-    logText = fs.readFileSync(lp, { encoding: 'utf8', start: Math.max(0, st.size - 64 * 1024), end: st.size });
+    logText = readFileTail(lp, 64 * 1024); // S3-F3/S14-F2(20261118):定长尾读替代 readFileSync{start,end} 静默整读
   } catch { /* 无日志=无 runner 异常证据 */ }
   const probe = ollamaRunnerUnhealthy({ missingModels: missing, logText, now, errWindowMs: 5 * 60 * 1000 });
-  const prev = readOllamaHealthState();
-  const cooldown = Math.max(1000, Math.floor(Number(c.ollamaRestartCooldownMs) || 30 * 60 * 1000));
-  const dec = decideOllamaRestart({ unhealthy: probe.unhealthy, streak: Number(prev.unhealthyStreak) || 0, lastRestartAt: Number(prev.lastRestartAt) || 0, now, cooldownMs: cooldown });
-  if (dec.restart) { restartOllamaNow({ now, spawnFn, taskkillFn }); return { action: 'restarted', ...probe, decision: dec.reason }; }
-  if (dec.streak !== (Number(prev.unhealthyStreak) || 0)) writeOllamaHealthState({ unhealthyStreak: dec.streak, lastRestartAt: Number(prev.lastRestartAt) || 0 });
-  if (probe.unhealthy) console.error(`[ollama-heal] runner 异常候选(缺 ${probe.missing.join(',')};${dec.reason})`);
-  return { action: 'probe', ...probe, decision: dec.reason };
+  // S14-F3(20261118):读-判-写原为无锁 RMW——两路并发(代理自愈 + 托盘轮询)可各读到旧 streak,
+  // 双双判 restart → 双重 taskkill 生产 ollama + 双预热。改为持锁(锁语义:wx 优先 + 陈旧接管 + 所有权释放)。
+  const lockPath = `${ollamaHealthStatePath(dataDir)}.lock`;
+  if (!takeJsonLock(lockPath)) return { action: 'locked', reason: '并发自愈进行中,本次跳过', ...probe };
+  try {
+    const prev = readOllamaHealthState(dataDir);
+    const cooldown = Math.max(1000, Math.floor(Number(c.ollamaRestartCooldownMs) || 30 * 60 * 1000));
+    const dec = decideOllamaRestart({ unhealthy: probe.unhealthy, streak: Number(prev.unhealthyStreak) || 0, lastRestartAt: Number(prev.lastRestartAt) || 0, now, cooldownMs: cooldown });
+    if (dec.restart) { restartOllamaNow({ now, spawnFn, taskkillFn, dataDir }); return { action: 'restarted', ...probe, decision: dec.reason }; }
+    if (dec.streak !== (Number(prev.unhealthyStreak) || 0)) writeOllamaHealthState({ unhealthyStreak: dec.streak, lastRestartAt: Number(prev.lastRestartAt) || 0 }, dataDir);
+    if (probe.unhealthy) console.error(`[ollama-heal] runner 异常候选(缺 ${probe.missing.join(',')};${dec.reason})`);
+    return { action: 'probe', ...probe, decision: dec.reason };
+  } finally { releaseJsonLock(lockPath, process.pid); }
 }

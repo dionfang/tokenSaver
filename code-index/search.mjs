@@ -25,7 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, resolveBase } from './ollamaGuard.mjs';
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
-import { assessModelStatus, addInputSavings, appendReadEvent, countInputTokensPair, ollamaHasModel } from './modelStatus.mjs';
+import { assessModelStatus, addInputSavings, appendReadEvent, countInputTokensPair, ollamaHasModel, mergeHitBodies } from './modelStatus.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
 import { embedBusy, EMBED_BUSY_REASON } from './embedGate.mjs';
 import { residentEmbed, residentScorePairs } from './localResident.mjs';
@@ -179,6 +179,14 @@ if (canVector) {
     if (vectorSignatureStale(vmeta) && !vecSnapshot) {
       throw new Error('向量与块清单不一致(代码已变更未重嵌入),请运行 node embed.mjs');
     }
+    // S4-F1(20261118):非过期分支也校验字节数=块数×dim×4——崩溃窗口 EMB/PAIRED 错位时
+    // 原静默读出错位向量(NaN);现拒绝并交外层降 bm25。
+    {
+      const dimN = Number(vmeta.dim);
+      const expectBytes = chunks.length * dimN * 4;
+      const actualBytes = fs.statSync(embPath).size;
+      if (dimN > 0 && Math.abs(actualBytes - expectBytes) > 4) throw new Error('向量字节数与块清单×dim 不符(对组错位),降级 bm25');
+    }
     let q = null;
     const be = vmeta.backend || indexBackend;
     if (be === 'local') {
@@ -212,6 +220,8 @@ if (canVector) {
           options: { num_ctx: OLLAMA_NUM_CTX, ...gpuOptions() },
           keep_alive: OLLAMA_KEEP_ALIVE,
         }),
+        // S4-F2(20261118):查询侧嵌入 fetch 补超时——无 signal 时 Ollama 挂起=检索无限等待
+        signal: AbortSignal.timeout(30000),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       q = (await resp.json()).embeddings[0];
@@ -318,7 +328,8 @@ async function rerankCandidates(query, pool, firstStage, chunks) {
   try {
     // 固定模型,不做其他 reranker 的探测/回退;名字只来自 config.mjs
     const rrModel = getOpt('--rr-model', null) || loadConfig().models.reranker;
-    const tags = await (await fetch(`${base}/api/tags`)).json();
+    // S4-F2(20261118 同族):同文件另一处无超时 fetch 一并补(全仓扫尾,防同类挂起)
+    const tags = await (await fetch(`${base}/api/tags`, { signal: AbortSignal.timeout(10000) })).json();
     if (!ollamaHasModel(tags, rrModel)) {
       throw new Error(`未安装 ${rrModel},请先运行: ollama pull ${rrModel}`);
     }
@@ -392,7 +403,9 @@ if (AS_JSON) {
   // S4-F3(2026-11-10 夜审):包 mode 字段——实际生效臂(bm25 降级/--rerank 均可见),
   // 回归指标可据此甄别"被降级臂污染的指标";消费方沿用 hits 数组(regress 的数组提取不受外层对象影响)。
   const jsonMode = (MODE === 'bm25' || !vecScores) ? 'bm25' : MODE;
-  toolOutput = JSON.stringify({ mode: jsonMode + (rrScores ? '+rerank' : ''), hits: kept.map(i => ({
+  // S4-F3(20261118):加 corpus 字段——签名过期切嵌入时快照时 mode 仍是 hybrid,消费方无法分辨
+  // 「跑的是旧语料」→ 回归指标被静默污染。corpus=snapshot 即表示命中优先跑的是快照语料。
+  toolOutput = JSON.stringify({ mode: jsonMode + (rrScores ? '+rerank' : ''), corpus: vecSnapshot ? 'snapshot' : 'current', hits: kept.map(i => ({
     score: Number((rrScores ? rrScores.get(i) : scores[i]).toFixed(4)),
     ...(rrScores ? { firstStage: Number(scores[i].toFixed(4)) } : {}),
     file: chunks[i].p,
@@ -411,12 +424,8 @@ if (AS_JSON) {
 }
 
 if (vecScores && kept.length) {
-  // shortcut: 按命中块正文计原文,块间重叠行会重复计入,避免再读整文件
-  const original = kept.map((i) => {
-    const raw = String(chunks[i]?.t || '');
-    const nl = raw.indexOf('\n');
-    return nl >= 0 ? raw.slice(nl + 1) : raw;
-  }).join('\n');
+  // shortcut: 按命中块正文并集去重计原文(重叠行只计一次,防节约高估),避免再读整文件
+  const original = mergeHitBodies(chunks, kept);
   try {
     // 入口一次:命中原文 vs 实际结果;同时落 Search 事件,read-nudge 的 PostToolUse(Bash)按命令认领回会话后,
     // modelStatus 才能按 rollout 做"会话累计"口径修正(命中原文的反事实同样逐请求重复计费)。
