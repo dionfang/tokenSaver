@@ -21,6 +21,7 @@ export function createUpdateBase(deps = {}) {
     paths,
     cmdRun,
     fetchText,
+    url = null, // S18-F1(20261118):basepack URL 可注入(默认 BASEPACK_URL),联调/迁移直连 mock 源
     downloader,
     readState = () => ({}),
     writeState = () => {},
@@ -56,12 +57,12 @@ export function createUpdateBase(deps = {}) {
     if (!dataDir) return { outcome: 'no-paths', message: '无法定位数据目录(paths.mjs 无响应)' };
     // 同意门禁(§18-D1=c 互惠):false/null 一律拒,不发任何网络请求
     if (!t4Allowed(readConsent(dataDir))) {
-      return { outcome: 'consent-required', message: '未同意上传本地向量(互惠约定),公共决策包更新不可用;可在面板勾选同意解锁' };
+      return { outcome: 'consent-required', message: '未同意上传本地向量(互惠约定),公共决策包更新不可用;请重开安装向导在「数据上传」步勾选同意' };
     }
     busy = true;
     try {
       emit('manifest', { message: '拉取清单…' });
-      const m = await fetchBasepackManifest(BASEPACK_URL, { fetchText, clientVersion });
+      const m = await fetchBasepackManifest(url || BASEPACK_URL, { fetchText, clientVersion }); // S18-F1:url 缝
       if (!m.ok) return { outcome: m.error === 'network' ? 'network' : 'manifest-rejected', error: m.error, message: m.message };
       const health = readHealthCache(dataDir)?.health ?? null; // 缓存形 {at,health},与 poller 同口径
       const model = currentEmbedModelName(health);

@@ -13,13 +13,10 @@ contextBridge.exposeInMainWorld('trayPanel', {
   repairHooks: () => ipcRenderer.invoke('tray:repair-hooks'),
   syncEmbed: () => ipcRenderer.invoke('tray:sync-embed'),
   syncVectors: () => ipcRenderer.invoke('tray:sync-vectors'),
-  // M4(2026-11-17):T4 更新公共决策包 + 同意开关(D5 撤回/补同意);进度/结果单向推送
+  // M4/M5(2026-11-18 交互裁决):「更新公共决策包」=互惠动作(先上传本地已签向量再下载),
+  // 上传/同意不再单独暴露(同意唯一入口=安装向导数据上传步);进度/结果单向推送。
   updateBase: () => ipcRenderer.invoke('tray:update-base'),
-  setConsent: (on) => ipcRenderer.invoke('tray:set-consent', on === true),
   onBaseEvent: (cb) => ipcRenderer.on('tray:base-update', (_e, ev) => cb(ev)),
-  // M5(2026-11-17):T6 上传本地向量(已签条目/信封/分片/回执游标)
-  uploadKnn: () => ipcRenderer.invoke('tray:upload-knn'),
-  onUploadEvent: (cb) => ipcRenderer.on('tray:upload-event', (_e, ev) => cb(ev)),
 });
 
 contextBridge.exposeInMainWorld('trayRoots', {

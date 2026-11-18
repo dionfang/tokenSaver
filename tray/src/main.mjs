@@ -12,13 +12,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCmdRunner } from './cmdRunner.mjs';
 import { createPoller } from './poller.mjs';
-import { resolvePaths, hfWeightCached } from './util/paths.mjs';
+import { resolvePaths, hfWeightCached, localWeightCached } from './util/paths.mjs';
+import { createWeightsAuto } from './wizard/weightsAuto.mjs';
+import { downloadWeights } from './wizard/weightsOnline.mjs';
 import { modelTooltip } from './util/lamps.mjs';
 import { createWizardController } from './wizard/controller.mjs';
 import { createUpdateBase } from './updateBase.mjs';
 import { createUploadKnn } from './uploadKnn.mjs';
 import { createDownloader, httpRequest } from './downloader.mjs';
-import { readConsent, writeConsent, t4Allowed } from './consent.mjs';
+import { readConsent, t4Allowed } from './consent.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ICON = path.join(here, '..', 'assets', 'tray.png');
@@ -50,7 +52,12 @@ function writeTrayState(patch) {
   try {
     const dir = ctx.paths?.dataDir;
     if (!dir) return;
-    fs.writeFileSync(path.join(dir, 'tray-state.json'), JSON.stringify({ ...readTrayState(), ...patch }, null, 1));
+    const file = path.join(dir, 'tray-state.json');
+    // S14-F7(20261118):原子写(tmp+rename,同文件 writeConfig 模板)——该文件承载上传游标,
+    // 崩溃留半文件会丢游标致重传(服务端 pkey dedup 兜底,但仍白付带宽)。
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ ...readTrayState(), ...patch }, null, 1));
+    try { fs.renameSync(tmp, file); } catch { fs.copyFileSync(tmp, file); fs.unlinkSync(tmp); }
   } catch { /* 状态写失败不影响主流程 */ }
 }
 
@@ -163,7 +170,7 @@ function activateTray() {
       paths: ctx.paths,
       cmdRun: runner.run.bind(runner),
       onSnapshot: applySnapshot,
-      hfWeightCached,
+      hfWeightCached: localWeightCached, // 2026-11-18:strands 决策权重须用 localWeightCached(hfWeightCached 对 strands 恒 null)
     });
     poller.fastTick();
     const loop = () => {
@@ -171,7 +178,8 @@ function activateTray() {
       setTimeout(() => { poller.fastTick(); loop(); }, d);
     };
     loop();
-    powerMonitor.on('resume', () => poller.slowRefresh('resume'));
+    // S14-F8(20261118):slowRefresh 是 async,fire-and-forget 未接 catch → 内部抛错即未处理 rejection
+    powerMonitor.on('resume', () => { poller.slowRefresh('resume').catch(() => {}); });
     tray = new Tray(nativeImage.createFromPath(ICON));
     tray.setToolTip('TokenSaver');
     tray.setContextMenu(buildMenu());
@@ -288,6 +296,20 @@ function getBaseUpdater() {
   return baseUpdater;
 }
 async function runUpdateBase(fromMenu) {
+  // 互惠口径(2026-11-18 用户裁决):先上传本地已签向量,成功(或无新增)后才下载公共决策包;
+  // 上传不再是独立入口,菜单项未同意时整个隐藏(撤回/补同意唯一入口=重开向导数据上传步)。
+  let up;
+  try { up = await getUploadKnn().run(); }
+  catch (e) { up = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
+  pushBase({ phase: 'result', ...up });
+  if (up.outcome === 'updated') await poller?.slowRefresh('upload-knn').catch(() => {});
+  if (!['updated', 'nothing-new'].includes(up.outcome)) {
+    if (fromMenu) {
+      if (['consent-required', 'busy', 'nothing-new'].includes(up.outcome)) dialog.showMessageBox({ message: up.message, buttons: ['知道了'] });
+      else dialog.showErrorBox('上传本地向量(互惠前置)', up.message || up.outcome);
+    }
+    return up;
+  }
   let r;
   try { r = await getBaseUpdater().run(); }
   catch (e) { r = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; } // 菜单路径兜底:意外异常不再裸抛(未处理 rejection)
@@ -299,9 +321,8 @@ async function runUpdateBase(fromMenu) {
   }
   return r;
 }
-// ---------- T6 上传本地向量(M5,§5.6/§19.6):面板入口,进度/回执经 tray:upload-event 推面板 ----------
+// ---------- T6 上传本地向量(M5,§5.6/§19.6;2026-11-18 交互裁决:不再独立入口,仅作互惠前置) ----------
 let uploadKnn = null;
-function pushUpload(ev) { if (panel && !panel.isDestroyed()) panel.webContents.send('tray:upload-event', ev); }
 function getUploadKnn() {
   if (uploadKnn) return uploadKnn;
   uploadKnn = createUploadKnn({
@@ -309,33 +330,9 @@ function getUploadKnn() {
     cmdRun: runner.run.bind(runner),
     readState: readTrayState,
     writeState: writeTrayState,
-    onEvent: pushUpload,
+    onEvent: (ev) => pushBase({ ...ev, phase: ev.phase === 'facts' || ev.phase === 'upload' ? 'manifest' : ev.phase }), // 复用面板 base 进度行
   });
   return uploadKnn;
-}
-async function runUploadKnn(fromMenu) {
-  let r;
-  try { r = await getUploadKnn().run(); }
-  catch (e) { r = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; } // 菜单路径兜底:意外异常不再裸抛
-  pushUpload({ phase: 'result', ...r });
-  if (r.outcome === 'updated') await poller?.slowRefresh('upload-knn').catch(() => {});
-  if (fromMenu) {
-    if (['updated', 'nothing-new', 'consent-required', 'busy'].includes(r.outcome)) dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
-    else dialog.showErrorBox('上传本地向量', r.message || r.outcome);
-  }
-  return r;
-}
-
-/** 同意开关(D5 撤回/补同意解锁 T4):写 consent 文件→重建菜单(门禁联动)→推面板→快刷快照。 */
-function setConsent(on) {
-  const dataDir = ctx.paths?.dataDir;
-  if (!dataDir) return { ok: false, error: 'no-paths' };
-  writeConsent(dataDir, on === true);
-  ctx.consent = readConsent(dataDir);
-  if (tray) tray.setContextMenu(buildMenu());
-  pushBase({ phase: 'consent', consent: ctx.consent });
-  poller?.fastTick();
-  return { ok: true, consent: ctx.consent };
 }
 
 // ---------- 菜单 ----------
@@ -346,9 +343,7 @@ function buildMenu() {
   return Menu.buildFromTemplate([
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
-    { label: '更新公共决策包', enabled: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
-    { label: '上传本地向量', enabled: t4Allowed(ctx.consent), click: () => { openPanel(); runUploadKnn(true); } },
-    { label: `上传本地向量(互惠)    ${t4Allowed(ctx.consent) ? '━●' : '○━'}`, click: () => { setConsent(!t4Allowed(ctx.consent)); } },
+    { label: '更新公共决策包(先上传本地向量)', visible: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
     { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
     { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
@@ -361,8 +356,18 @@ function buildMenu() {
   ]);
 }
 
+let weightsAuto = null, autoDownloader = null; // 2026-11-18 托盘自动补权重
 function applySnapshot(snapshot) {
   ctx.snapshot = snapshot;
+  // 2026-11-18:local 权重缺失且向导已完成时,托盘自动发起补下载(节流+防与向导并发)
+  if (!weightsAuto && ctx.paths?.hfCacheDir) {
+    autoDownloader = createDownloader({});
+    weightsAuto = createWeightsAuto({ downloadWeights, downloader: autoDownloader, getBaseDir: () => ctx.paths?.hfCacheDir, log: (l) => { try { fs.appendFileSync(path.join(ctx.paths.dataDir, 'weights-auto.log'), l + '\n'); } catch { /* 日志失败不阻断 */ } } });
+  }
+  if (weightsAuto) {
+    const busy = wizardCtl ? wizardCtl.machine.getState().status !== 'DONE' : false;
+    weightsAuto.maybe(snapshot.localWeights, snapshot.modelIn, { busy }).catch(() => {});
+  }
   ctx.consent = snapshot.consent;
   if (tray) {
     tray.setContextMenu(buildMenu());
@@ -469,14 +474,6 @@ if (!gotLock) {
     ipcMain.handle('tray:update-base', async () => {
       try { return await runUpdateBase(false); }
       catch (e) { return { ok: false, outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
-    });
-    ipcMain.handle('tray:upload-knn', async () => {
-      try { return await runUploadKnn(false); }
-      catch (e) { return { ok: false, outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
-    });
-    ipcMain.handle('tray:set-consent', (_e, on) => {
-      try { return setConsent(on); }
-      catch (e) { return { ok: false, error: String(e?.message || e).slice(0, 200) }; }
     });
     ipcMain.handle('tray:roots-list', () => {
       try { return { ok: true, roots: listRoots() }; }
