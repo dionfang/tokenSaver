@@ -3,6 +3,13 @@
 ; 注意:本文件先于 WinMessages.nsh 被 include,故**不得 !define HWND_BROADCAST/WM_SETTINGCHANGE**
 ; (会与 WinMessages 内置定义冲突致 makensis abort,2026-11-17 首 build 实测)——System::Call 用字面量。
 
+!macro customInit
+  ; 覆盖安装/升级:托盘守护常驻(X=最小化不退出)会触发 NSIS「无法关闭」弹窗——
+  ; 安装/卸载前静默强杀本应用进程树(2026-11-18 用户实测覆盖安装弹窗;数据均原子写,强杀安全)。
+  nsExec::Exec 'taskkill /F /T /IM TokenSaver.exe'
+  Sleep 800
+!macroend
+
 !macro customInstall
   WriteRegStr HKCU "Environment" "CODE_INDEX_DATA_DIR" "$LOCALAPPDATA\TokenSaver\data"
   ; 广播环境变量变更(HWND_BROADCAST=0xFFFF, WM_SETTINGCHANGE=0x1A);新启动进程继承,已开 IDE 需重启
