@@ -244,7 +244,6 @@ function renderEnvCheck(w) {
       ${hardBad.length ? `<div class="err">请先补齐硬性缺项:${esc(hardBad.map((c) => c.label).join(', '))}</div>` : ''}
       ${installBlock}
       ${installing ? '<div class="sub">安装中,完成后自动重新自检</div>' : ''}
-      <div class="sub">自检通过后即可进入安装接线(init 现场组装:deps 缺失自动 npm install,cpu 权重缺失自动下载到 hf-cache)。</div>
     </div>`;
   // 2026-11-16 用户裁决:「重新自检」挪到底部导航(上一步|重新自检|下一步);checking/installing 均禁用
   const rc = $('btnRecheck');
