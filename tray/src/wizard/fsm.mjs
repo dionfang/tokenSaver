@@ -142,7 +142,10 @@ export function createWizard(deps) {
 
   const getState = () => JSON.parse(JSON.stringify(state));
 
-  function goto(step) { state.status = step; state.lastError = null; save(); return { ok: true, state: getState() }; }
+  // 进入 INIT_RUN 清空 initLog:失败后「上一步→下一步」重进须重新自动接线;
+  // 旧版只清 lastError 保留失败 initLog → UI running=false 不自动跑、lastError=null 无重试块、
+  // 全局 initRunning=true 恒「正在接线…」=死锁(2026-11-18 测试机实测)。
+  function goto(step) { state.status = step; state.lastError = null; if (step === 'INIT_RUN') state.initLog = []; save(); return { ok: true, state: getState() }; }
 
   /** 前进一步(守卫拦截);ENVCHECK 进入后 UI 调 start-env-check;INIT_RUN 不经 next 完成。
    *  2026-11-16 用户裁决:ENVCHECK 移到 CONSENT 之前(先确认环境能装,再谈数据上传)。 */

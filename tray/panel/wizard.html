@@ -47,7 +47,7 @@
 </style>
 </head>
 <body>
-<h1>TokenSaver 在线安装 / 首次配置</h1>
+<h1 id="wizTitle">TokenSaver 在线安装 / 首次配置</h1>
 <div class="sub" id="subtitle">按步骤完成安装;中途退出会记住进度,下次打开继续。</div>
 <div class="steps" id="steps"></div>
 <div id="body"></div>
@@ -109,6 +109,8 @@ function stepIndex(status) {
 
 function render() {
   const w = S.w || { status: 'INIT', roots: [], downloads: {} };
+  // Bug1(2026-11-18):首装=首次配置;曾 DONE 经托盘重入(secondRun)=重置配置
+  const t = $('wizTitle'); if (t) t.textContent = w.secondRun ? 'TokenSaver 在线安装 / 重置配置' : 'TokenSaver 在线安装 / 首次配置';
   const cur = stepIndex(w.status);
   $('steps').innerHTML = STEPS.map(([k, label], i) =>
     `<span class="${i < cur ? 'done' : i === cur ? 'on' : ''}">${i + 1}. ${label}</span>`).join('');
@@ -118,10 +120,14 @@ function render() {
   // 2026-11-15 修复:load 推送到达前按钮禁用(S.w=null 时点击会被旧逻辑静默吞掉——加载竞态)
   // 2026-11-17 修复:busy 禁用门**只作用于对应步骤**——旧全局门使下载中回退到 MODE 后
   // 下一步仍被禁,用户回不到 ENVCHECK(页面切换死锁)。下载/自检只关 ENVCHECK,接线只关 INIT_RUN。
-  const initRunning = w.status === 'INIT_RUN' && !w.lastError;
+  const initFailed = (w.initLog || []).some((l) => l.code !== 0);
+  const initRunning = w.status === 'INIT_RUN' && !w.lastError && !initFailed;
   const envBusy = w.status === 'ENVCHECK' && (!!S.installing || !!S.checking);
-  $('btnNext').disabled = envBusy || initRunning || !S.w || !gate.ok;
-  $('btnNext').textContent = !S.w ? '加载中…' : (envBusy ? (S.installing ? '下载中…' : '检测中…') : (initRunning ? '正在接线…' : (w.status === 'DONE' ? '已完成' : '下一步')));
+  // 2026-11-18 修复(测试机慢网卡死):软项(cpu 权重/deps)自动下载**不阻**下一步——权重缺失只降级
+  // (检索 bm25/决策弃权),不该把安装挡在下载上;硬项(node/gpu 模型)仍由 gate.ok 把关。
+  // 旧版 envBusy 进 disabled,慢网/受限网络下 440MB 权重长期在途→页面永停「安装中」无法继续。
+  $('btnNext').disabled = initRunning || !S.w || !gate.ok;
+  $('btnNext').textContent = !S.w ? '加载中…' : (initRunning ? '正在接线…' : (w.status === 'DONE' ? '已完成' : (envBusy && !gate.ok ? (S.installing ? '下载中…' : '检测中…') : (envBusy ? '下一步(后台下载中)' : '下一步'))));
   const rc = $('btnRecheck'); if (rc) { rc.style.display = w.status === 'ENVCHECK' ? '' : 'none'; rc.disabled = !!S.installing || !!S.checking; rc.textContent = S.checking ? '检测中…' : '重新自检'; } // 重新自检仅 ENVCHECK 步显示于导航
   if (w.status === 'INIT') {
     $('body').innerHTML = '<div class="card"><b>欢迎使用 TokenSaver。</b><br>本向导将完成:选择要语义索引的目录 → 选择运行模式(cpu模型/gpu模型) → 环境自检(缺项自动安装/拉取) → 数据上传同意 → 安装接线(写入所选目录的工具说明段并配置 IDE 钩子)。<div class="hint" style="margin-top:8px">不索引任何目录也可以完成安装(只装工具与钩子)。</div></div>';
@@ -250,12 +256,16 @@ function renderEnvCheck(w) {
 function renderInitRun(w) {
   const logs = (w.initLog || []).map((l) => `<li>${esc(l.label)} — ${l.code === 0 ? '<span class="ok">成功</span>' : '<span class="err">失败</span>'}</li>`).join('');
   const running = !w.initLog?.length && !w.lastError && w.status === 'INIT_RUN';
+  // 失败证据独立于 lastError:旧持久态可能 initLog 有失败行而 lastError 被 back/next 清掉(死锁态),
+  // 仍须显示 stderr+重试,不得恒「正在接线…」(2026-11-18)。
+  const failedEntry = (w.initLog || []).slice().reverse().find((l) => l.code !== 0);
+  const errText = w.lastError || (failedEntry ? `${failedEntry.label} 失败:${failedEntry.stderrTail || '(无 stderr 留痕)'}` : '');
   $('body').innerHTML = `
     <div class="card">
       <b>安装接线</b>
       <div class="sub">逐目录执行 init 接线(写入 AGENTS.md 工具说明段+配置 IDE 用户级钩子+设置运行模式)。roots 为空时只设置运行模式。</div>
       <ul>${logs || (running ? '<li class="sub">正在接线…</li>' : '<li class="sub">尚未开始</li>')}</ul>
-      ${w.lastError ? `<pre class="stderr">${esc(w.lastError)}</pre><div class="row"><button onclick="act('run-init')">重试接线</button></div>` : ''}
+      ${errText ? `<pre class="stderr">${esc(errText)}</pre><div class="row"><button onclick="act('run-init')">重试接线</button></div>` : ''}
     </div>`;
   // 2026-11-16 用户裁决:接线自动驱动——进入 INIT_RUN 即自动执行,删除「执行安装接线」按钮(仅失败时保留重试)
   if (running && !S.initRunning) { S.initRunning = true; act('run-init').finally(() => { S.initRunning = false; }); }
