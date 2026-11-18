@@ -217,7 +217,9 @@ function renderEnvCheck(w) {
   const installing = S.installing;
   // 2026-11-17 用户裁决:不再显示 CMD 滚动文字——进度条 + 条下一行动态文字说明当前在做什么
   const lastLine = (S.installLog || []).slice(-1)[0] || '';
-  const failLine = !installing && lastLine.startsWith('[fail]') ? lastLine : '';
+  // 重新自检全绿(所有检查项 ok)后,旧的 [fail] 留痕不再显示(2026-11-18 用户指令)
+  const allOk = checks.length && checks.every((c) => c.ok);
+  const failLine = !installing && !allOk && lastLine.startsWith('[fail]') ? lastLine : '';
   let installBlock = '';
   if (installing) {
     const isPull = String(installing).startsWith('pull');
