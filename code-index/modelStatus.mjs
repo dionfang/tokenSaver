@@ -769,6 +769,15 @@ export function isUuidSession(session) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(session));
 }
 
+/** 源端会话盖章(PU-003,2026-11-18):宿主把会话 id 注入 Bash 子进程环境
+ *  (实测 ZCode 主会话与子代理各自注入 ZCODE_SESSION_ID/CLAUDE_CODE_SESSION_ID,子代理=sess_subagent_agent_*)。
+ *  检索事件出生即有主 → 子代理检索也能按 db/agent-usage 的该会话 iteration 放大,无需消费侧启发式认领。
+ *  无 env(plain 终端/未注入宿主)返回 null,回落 read-nudge 命令认领兜底。 */
+export function sessionFromEnv(env = process.env) {
+  const sid = String(env?.ZCODE_SESSION_ID || env?.CLAUDE_CODE_SESSION_ID || env?.CLAUDE_SESSION_ID || '').trim();
+  return sid || null;
+}
+
 /** 该会话的 iteration 行(边界之后);null=数据源不可用/会话无记录。 */
 export function sessionIterationRows(session, sinceMs, { dbPath = ZCODE_DB_PATH, agentUsagePath = AGENT_USAGE_PATH } = {}) {
   if (isUuidSession(session)) return agentUsageSessionRows(agentUsagePath, session, sinceMs);

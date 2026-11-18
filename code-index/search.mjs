@@ -25,7 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureOllama, gpuOptions, resolveGpuMode, ensureModelPlacement, resolveBase } from './ollamaGuard.mjs';
 import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX } from './config.mjs';
-import { assessModelStatus, addInputSavings, appendReadEvent, countInputTokensPair, ollamaHasModel, mergeHitBodies } from './modelStatus.mjs';
+import { assessModelStatus, addInputSavings, appendReadEvent, countInputTokensPair, ollamaHasModel, mergeHitBodies, sessionFromEnv } from './modelStatus.mjs';
 import { loadLocalReranker, scorePair } from './localRerank.mjs';
 import { embedBusy, EMBED_BUSY_REASON } from './embedGate.mjs';
 import { residentEmbed, residentScorePairs } from './localResident.mjs';
@@ -423,7 +423,9 @@ if (AS_JSON) {
   toolOutput = lines.join('\n');
 }
 
-if (vecScores && kept.length) {
+// bm25 降级同样记账(2026-11-18 审查:旧门控 vecScores&&kept 使纯词法模式检索节约漏记);
+// 原文分母=命中块并集去重,与向量模式同口径,不依赖 vecScores。
+if (kept.length) {
   // shortcut: 按命中块正文并集去重计原文(重叠行只计一次,防节约高估),避免再读整文件
   const original = mergeHitBodies(chunks, kept);
   try {
@@ -431,7 +433,8 @@ if (vecScores && kept.length) {
     // modelStatus 才能按 rollout 做"会话累计"口径修正(命中原文的反事实同样逐请求重复计费)。
     const { original: oTok, compressed: cTok } = await countInputTokensPair(original, toolOutput);
     addInputSavings(oTok, cTok);
-    appendReadEvent({ at: Date.now(), session: null, kind: 'Search', file: query.slice(0, 120), originalTokens: oTok, compressedTokens: cTok });
+    // 源端盖章(PU-003):env 有会话 id(含子代理)即有主,子代理检索也进放大链;无 env 回落 read-nudge 认领
+    appendReadEvent({ at: Date.now(), session: sessionFromEnv(), kind: 'Search', file: query.slice(0, 120), originalTokens: oTok, compressedTokens: cTok });
   } catch (e) {
     console.error(`[warn] 输入 token 记账跳过(${e.message})`);
   }
