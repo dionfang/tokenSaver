@@ -129,7 +129,7 @@ export function createWizardController(deps) {
       const cfgModels = (() => { try { return JSON.parse(fs.readFileSync(path.join(paths.dataDir, 'code-index.config.json'), 'utf8')).models ?? {}; } catch { return {}; } })();
       const checks = [
         { id: 'node', label: 'Node 运行时(≥20)', ok: nq?.ok === true, hard: true,
-          hint: nq?.ok ? `已就绪${nq.version ? `(${nq.version})` : ''}` : '未检测到达标 Node——请自行安装 Node.js 20+ 后点「重新自检」' },
+          hint: nq?.ok ? `已就绪${nq.version ? `(${nq.version})` : ''}` : '未检测到达标 Node——请自行安装 Node.js 20+(推荐 22 LTS,下载:npmmirror.com/mirrors/node/ 或 nodejs.org),装完点「重新自检」' },
       ];
       // 2026-11-16 用户裁决:推理依赖(transformers/onnxruntime)仅 cpu 模式显示——gpu 推理走 Ollama,不需要它
       if (mode !== 'gpu') {

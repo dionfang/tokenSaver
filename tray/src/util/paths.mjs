@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { WEIGHT_MODELS } from '../wizard/weightsOnline.mjs'; // Bug2:完成判定单源(文件清单+字节数)
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEV_CODE_INDEX = path.resolve(here, '..', '..', '..', 'code-index'); // 开发布局兜底(tray/src/util → 仓根/code-index)
@@ -26,9 +27,22 @@ export function detectNodeBin() {
       let out = '';
       p.stdout.on('data', (d) => { out += d; });
       p.on('error', () => resolve('node'));
-      p.on('close', (c) => resolve(c === 0 && /^v\d/.test(out.trim()) ? 'node' : 'node'));
+      // S14-F9(20261118):原表达式两分支同值('node'/'node')=死表达式,版本校验形同虚设。
+      // 实况:本探测只确认 PATH 上有 node 可用,解析出的二进制恒为 'node'(PATH 解析交 spawn),故版本校验不影响返回值。
+      p.on('close', () => resolve('node'));
     } catch { resolve('node'); }
   });
+}
+
+/** packed 规范布局兜底(纯,DI 可测):微 CLI 不可达(典型=机器未装 Node)时,
+ *  dataDir/hfCacheDir 仍是静态已知的(与双保险/安装器 env 同源口径)——无 Node 机器上
+ *  向导能打开并展示「请安装 Node」硬项,而不是双错误框死胡同(2026-11-18 用户实测)。 */
+export function packedFallbackLayout({ localAppData, home = os.homedir(), platform = process.platform, mkdir = () => {} } = {}) {
+  const dataDir = platform === 'win32'
+    ? path.join(localAppData || path.join(home, 'AppData', 'Local'), 'TokenSaver', 'data')
+    : path.join(home, '.tokensaver', 'data');
+  try { mkdir(dataDir); } catch { /* 兜底 mkdir 尽力 */ }
+  return { packed: true, dataDir, hfCacheDir: path.join(home, '.tokensaver', 'hf-cache') };
 }
 
 /** spawn paths.mjs(30s 超时,失败时开发布局兜底并标 degraded)。幂等缓存。 */
@@ -50,8 +64,19 @@ export async function resolvePaths({ force = false } = {}) {
   let j = null;
   try { j = out ? JSON.parse(out) : null; } catch { j = null; }
   if (!j) {
-    // paths.mjs 不可达(部署形态异常):以当前布局兜底,标 degraded 供 UI 提示
-    cached = { dataDir: null, hfCacheDir: null, codeIndexRoot: CODE_INDEX_ROOT, packed: CODE_INDEX_ROOT === PACKED_CODE_INDEX, version: null, nodeBin, degraded: true };
+    // paths.mjs 不可达(典型=机器未装 Node):packed 布局规范路径静态可知(与双保险同源),
+    // 直接兜底+建目录+回填 env——向导可开、自检展示「请安装 Node」硬项,不再是死胡同;
+    // 开发布局无规范兜底,维持 degraded 供 UI 提示(开发机必有 node,degraded=真异常)。
+    if (PACKED_CODE_INDEX && CODE_INDEX_ROOT === PACKED_CODE_INDEX) {
+      const fb = packedFallbackLayout({
+        localAppData: process.env.LOCALAPPDATA, home: os.homedir(), platform: process.platform,
+        mkdir: (d) => fs.mkdirSync(d, { recursive: true }),
+      });
+      process.env.CODE_INDEX_DATA_DIR = fb.dataDir;
+      cached = { ...fb, codeIndexRoot: CODE_INDEX_ROOT, version: null, nodeBin, degraded: false };
+    } else {
+      cached = { dataDir: null, hfCacheDir: null, codeIndexRoot: CODE_INDEX_ROOT, packed: false, version: null, nodeBin, degraded: true };
+    }
   } else {
     cached = { ...j, nodeBin, degraded: false };
     // R1 双保险:packed 形态数据必须在 %LOCALAPPDATA%\TokenSaver\data(升级不清);
@@ -68,12 +93,25 @@ export async function resolvePaths({ force = false } = {}) {
 /** hf-cache 权重目录存在性(local 模式模型灯红/黄分界,§5.3.1):
  *  兼容两种缓存布局(2026-11-16 实测修正):<hfCacheDir>/<org>/<name>/ 或 <hfCacheDir>/<org>--<name>/;
  *  hfCacheDir 未知时返回 null(不判红)。 */
+// Bug2(20261118):完成判定=该模型**全部**清单文件存在且字节数相符。
+// 旧 hfWeightCached 只查目录存在(下载器先 mkdir)→中断也判已缓存;strands 只查小图文件→_data 未下完也判已缓存。
+function weightFilesComplete(hfCacheDir, prefix) {
+  const entry = WEIGHT_MODELS.find((m) => (m.files || []).some((f) => f.dest.startsWith(prefix)));
+  if (!entry) return null;
+  return entry.files.every((f) => {
+    try { const st = fs.statSync(path.join(hfCacheDir, f.dest)); return f.bytes == null || st.size === f.bytes; } catch { return false; }
+  });
+}
 export function hfWeightCached(hfCacheDir, modelId) {
   if (!hfCacheDir || typeof modelId !== 'string' || !modelId.includes('/')) return null;
   const [org, name] = modelId.split('/');
-  try {
-    return fs.existsSync(path.join(hfCacheDir, org, name)) || fs.existsSync(path.join(hfCacheDir, `${org}--${name}`));
-  } catch { return null; }
+  const entry = WEIGHT_MODELS.find((m) => (m.files || []).some((f) => f.dest.startsWith(`${org}/${name}/`)));
+  if (!entry) return null;
+  const check = (map) => entry.files.every((f) => {
+    try { const st = fs.statSync(path.join(hfCacheDir, map(f.dest))); return f.bytes == null || st.size === f.bytes; } catch { return false; }
+  });
+  // 嵌套(Xenova/<name>/)与扁平(Xenova--<name>/)两种 transformers.js 缓存布局都认
+  return check((d) => d) || check((d) => d.replace(`${org}/${name}/`, `${org}--${name}/`));
 }
 
 /** 本地权重缓存判定(向导自检与下载完成轮询共用单源,2026-11-17):
@@ -85,9 +123,5 @@ export function localWeightCached(hfCacheDir, modelId) {
   if (!modelId.startsWith('strands:')) return hfWeightCached(hfCacheDir, modelId);
   const parts = modelId.split(':'); // [strands, dir, quant?]
   const dir = parts[1] ?? '';
-  const quant = parts[2] ?? 'quantized';
-  try {
-    return fs.existsSync(path.join(hfCacheDir, dir, `model_${quant}.onnx`))
-      || fs.existsSync(path.join(hfCacheDir, dir, 'model_quantized.onnx'));
-  } catch { return null; }
+  return weightFilesComplete(hfCacheDir, `${dir}/`); // Bug2:图+_data+tokenizer 全齐且字节相符才判已缓存
 }
