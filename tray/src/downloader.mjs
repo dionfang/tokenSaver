@@ -174,7 +174,8 @@ export function createDownloader(deps = {}) {
         // 已知期望大小且 .part 已满(或更大):不再发 Range,直接校验;坏件删掉重下
         if (startFrom > 0 && item.bytes != null && startFrom >= Number(item.bytes)) {
           try { await finalizeIfComplete(item, part, final); return resolve(); }
-          catch (e) { startFrom = 0; }
+          // S7-F5(20261118):原静默归零(重下但无痕)——补 stderr 日志,便于定位「为何反复重下」
+          catch (e) { console.error(`[downloader] .part 校验失败,丢弃并从头重下: ${e?.message || e}`); startFrom = 0; }
         }
         const headers = startFrom > 0 ? { Range: `bytes=${startFrom}-` } : {};
         const { status, headers: rh, res, req } = await httpReq(url, { headers });
@@ -226,17 +227,10 @@ export function createDownloader(deps = {}) {
           ended = true;
           ws.end(async () => {
             if (stopped()) return reject(new Error('aborted'));
-            try {
-              emit({ itemId: item.id, pct: 100, bytesDone: done, bytesTotal, phase: 'verify' });
-              const got = await sha256File(part);
-              if (got !== item.sha256.toLowerCase()) {
-                try { fs.unlinkSync(part); } catch { /* 尽力 */ }
-                return reject(new Error(`sha256 校验失败(期望 ${item.sha256.slice(0, 12)}… 实得 ${got.slice(0, 12)}…)`));
-              }
-              atomicRename(part, final);
-              emit({ itemId: item.id, pct: 100, bytesDone: done, bytesTotal, phase: 'done' });
-              resolve();
-            } catch (e) { reject(e); }
+            // 完成校验单源 finalizeIfComplete(sha/bytes/皆无三口径):旧版硬依赖 item.sha256,
+            // 全在线权重清单不预置 sha → 缺失文件真下载完成即 TypeError → 重试换源全败永远补不齐
+            // (2026-11-18 测试机「已存在跳过正常/缺文件恒未缓存/进度冻 100%」根因)。
+            try { await finalizeIfComplete(item, part, final); resolve(); } catch (e) { reject(e); }
           });
         });
       })().catch(reject);
