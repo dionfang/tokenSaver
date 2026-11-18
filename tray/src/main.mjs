@@ -298,30 +298,35 @@ function getBaseUpdater() {
   return baseUpdater;
 }
 async function runUpdateBase(fromMenu) {
-  // 互惠口径(2026-11-18 用户裁决):先上传本地已签向量,成功(或无新增)后才下载公共决策包;
+  // 互惠口径(2026-11-18 用户裁决修订):**先下载公共决策包 → 再上传本地向量**——
+  // 初始安装本地还没有向量文件,先上传会失败导致无法下载;下载后上传为尽力而为:
+  // 无本地向量文件/无新增 → 忽略跳过;其余上传失败仅提示,不回滚已完成的下载。
   // 上传不再是独立入口,菜单项未同意时整个隐藏(撤回/补同意唯一入口=重开向导数据上传步)。
-  let up;
-  try { up = await getUploadKnn().run(); }
-  catch (e) { up = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
-  pushBase({ phase: 'result', ...up });
-  if (up.outcome === 'updated') await poller?.slowRefresh('upload-knn').catch(() => {});
-  if (!['updated', 'nothing-new'].includes(up.outcome)) {
-    if (fromMenu) {
-      if (['consent-required', 'busy', 'nothing-new'].includes(up.outcome)) dialog.showMessageBox({ message: up.message, buttons: ['知道了'] });
-      else dialog.showErrorBox('上传本地向量(互惠前置)', up.message || up.outcome);
-    }
-    return up;
-  }
   let r;
   try { r = await getBaseUpdater().run(); }
   catch (e) { r = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; } // 菜单路径兜底:意外异常不再裸抛(未处理 rejection)
   pushBase({ phase: 'result', ...r });
-  if (r.outcome === 'updated' || r.outcome === 'already-latest') await poller?.slowRefresh('update-base').catch(() => {});
-  if (fromMenu) {
-    if (r.outcome === 'updated' || r.outcome === 'already-latest' || r.outcome === 'consent-required' || r.outcome === 'busy') dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
-    else dialog.showErrorBox('更新公共决策包', r.message || r.outcome);
+  const dlOk = r.outcome === 'updated' || r.outcome === 'already-latest';
+  if (dlOk) await poller?.slowRefresh('update-base').catch(() => {});
+  if (!dlOk) {
+    if (fromMenu) {
+      if (['consent-required', 'busy'].includes(r.outcome)) dialog.showMessageBox({ message: r.message, buttons: ['知道了'] });
+      else dialog.showErrorBox('更新公共决策包', r.message || r.outcome);
+    }
+    return r;
   }
-  return r;
+  let up;
+  try { up = await getUploadKnn().run(); }
+  catch (e) { up = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
+  if (up.outcome === 'updated') await poller?.slowRefresh('upload-knn').catch(() => {});
+  const skipUpload = ['no-local-layer', 'nothing-new', 'consent-required', 'no-paths', 'busy'].includes(up.outcome);
+  const upMsg = up.outcome === 'updated'
+    ? `已上传 ${up.accepted ?? 0} 条`
+    : skipUpload ? '跳过(本地向量尚未生成或无新增)' : `失败:${up.message || up.outcome}`;
+  const summary = `${r.outcome === 'updated' ? `公共决策包已更新(${r.accepted ?? '?'} 条)` : '公共决策包已是最新'};上传本地向量:${upMsg}`;
+  pushBase({ phase: 'result', outcome: up.outcome === 'updated' ? 'updated' : r.outcome, message: summary });
+  if (fromMenu) dialog.showMessageBox({ message: summary, buttons: ['知道了'] });
+  return { ...r, upload: up, message: summary };
 }
 // ---------- T6 上传本地向量(M5,§5.6/§19.6;2026-11-18 交互裁决:不再独立入口,仅作互惠前置) ----------
 let uploadKnn = null;
