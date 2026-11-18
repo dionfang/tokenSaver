@@ -1148,7 +1148,7 @@ export function renderModelStatus(p) {
     : '';
   const relay = healthy
     ? `⚙ ${modelTag}本地模型已启动成功，今日累计节约 ${formatTokenCount(today)} tokens，总计节约 ${formatTokenCount(total)} tokens(${names})${progClause}`
-    : `⚙ ${modelTag}本地模型未启动成功,最可能原因:${likelyReason(p, emb, rr)}(${names})`;
+    : `⚙ ${modelTag}本地模型未启动成功,最可能原因:${likelyReason(p, emb, rr)}(${names});今日累计节约 ${formatTokenCount(today)} tokens，总计节约 ${formatTokenCount(total)} tokens${progClause}`;
   return { relay, detail: relay, healthy };
 }
 
