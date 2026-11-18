@@ -9,10 +9,13 @@ import crypto from 'node:crypto';
 
 export const MANIFEST_URL = 'https://crisvado.com/tokensaver/manifest/components.json';
 
-/** 验签公钥钉扎(dev-pins:kid=dev-2026Q4,私钥仅存 test/tray/fixtures/dev-signing-key.json)。 */
+/** 验签公钥钉扎(S4 双钥窗口 §18-D2):dev-2026Q4(私钥仅存 test/tray/fixtures)+生产 base-2026Q4(私钥只在发行方开发机,绝不进仓/进客户端)。 */
 export const PINS = {
   dev: true,
-  publicKeys: { 'dev-2026Q4': 'MCowBQYDK2VwAyEAVFkBka0w2B/x59MMxk4QncqWHBK+CGPvYKe4IC3VYYM=' },
+  publicKeys: {
+    'dev-2026Q4': 'MCowBQYDK2VwAyEAVFkBka0w2B/x59MMxk4QncqWHBK+CGPvYKe4IC3VYYM=',
+    'base-2026Q4': 'MCowBQYDK2VwAyEAaOZeDXUCPkNy1WgykMmKPhFSyf+3FK5ziv5HMcl0J7U=',
+  },
 };
 
 /** 签名载荷(纯函数):删去 signature 键后的确定性 JSON 字节。 */
