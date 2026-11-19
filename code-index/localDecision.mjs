@@ -12,7 +12,7 @@
  *   {answers:{q1:{choice,confidence,probabilities}}} 交给上层 parseAnswers 做值域四防线。
  * 本模块无挂架副作用:不 import decisionModel.mjs(避免环),状态与断路都留给调用方。
  */
-import { loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
+import { DATA_DIR, loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
 import { residentDecide } from './localResident.mjs';
 import { gpuOptions } from './ollamaGuard.mjs';
 import { embedBusy, EMBED_BUSY_REASON } from './embedGate.mjs';
@@ -144,7 +144,11 @@ export function localBackendOf(cfg) {
  *  S2-F4(2026-11-10 夜审):原恒 true 进程内永久粘性——Ollama 热升级/换版本后端点回来也永不恢复;
  *  改时间戳 + TTL,窗口过后自动重探自愈。 */
 let systemoneUnsupportedAt = 0;
+let lastChunkFailure = ''; // S12-1(20261119 夜审):记录最近一次分片失败原因,供 judgeLocal 细化错误归因(死端口/挂起超时/HTTP 码不再同报"未 pull")
 const SYSTEMONE_STICKY_TTL_MS = 10 * 60 * 1000;
+// S12-2(20261119 夜审):decision 能力模型(tev1 家族)只暴露 /v1/systemone——systemone 已败不再空跑 generate
+// 回退(免 2×timeoutMs 死等);普通 LLM 判定模型(qwen3 等)仍走"systemone 失败 → generate"降级老路。
+const SYS_ONLY_MODEL_RE = /^tev1(?![A-Za-z0-9_])/;
 
 /** 判定分片(systemone 协议):POST {base}/v1/systemone → {answers:{qN:{choice,probabilities,confidence}}}。
  *  成功返回 {shaped,usage},失败 null。 */
@@ -157,22 +161,23 @@ async function runChunkSystemone({ items, criteria, valid, modelName, fetchFn, o
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(timeoutMs),
       });
-      if (resp.status === 404) { systemoneUnsupportedAt = Date.now(); return null; }
-      if (!resp.ok) continue;
+      if (resp.status === 404) { lastChunkFailure = 'http404(systemone 路由不存在)'; systemoneUnsupportedAt = Date.now(); return null; }
+      if (!resp.ok) { lastChunkFailure = 'http:' + resp.status; continue; }
       const j = await resp.json();
       const shaped = shapeAnswers(j, valid);
       if (shaped && Object.keys(shaped.answers || {}).length) return { shaped, usage: j.usage || null };
-    } catch { /* 单次失败重试 */ }
+    } catch (e) { lastChunkFailure = 'net:' + String((e && (e.code || e.name)) || 'unknown'); /* 单次失败重试 */ }
   }
   return null;
 }
 
 /** 本地判定分片:ollama generate(文本+JSON 解析)。成功返回 {text} 原始文本,失败 null。 */
-async function runChunk({ items, criteria, valid, modelName, fetchFn, ollamaBase, retries, timeoutMs }) {
+async function runChunk({ items, criteria, valid, modelName, fetchFn, ollamaBase, retries, timeoutMs, sysOnly = false }) {
   // decision 能力模型(tev1:0.8b)只吃 systemone;普通 LLM 判定模型才走文本生成(端点 404 后 10 分钟降级,过期重探)。
   if (!(Date.now() - systemoneUnsupportedAt < SYSTEMONE_STICKY_TTL_MS)) {
     const sys = await runChunkSystemone({ items, criteria, valid, modelName, fetchFn, ollamaBase, retries, timeoutMs });
     if (sys) return sys;
+    if (sysOnly) return null; // S12-2(20261119 夜审):decision 能力模型只支持 systemone,systemone 已败不再空跑 generate 回退(免 2×timeoutMs 死等)
   }
   const prompt = buildLocalPrompt({ items, criteria });
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -185,7 +190,7 @@ async function runChunk({ items, criteria, valid, modelName, fetchFn, ollamaBase
         }),
         signal: AbortSignal.timeout(timeoutMs),
       });
-      if (!resp.ok) continue;
+      if (!resp.ok) { lastChunkFailure = 'http:' + resp.status; continue; }
       const j = await resp.json();
       const r = String(j && j.response ? j.response : '');
       if (j && j.done === false) continue;
@@ -193,7 +198,7 @@ async function runChunk({ items, criteria, valid, modelName, fetchFn, ollamaBase
       const shaped = shapeAnswers(extractJson(r), valid)
         || fallbackFromText(r, items, valid);
       if (shaped) return { text: r };
-    } catch { /* 单次失败重试 */ }
+    } catch (e) { lastChunkFailure = 'net:' + String((e && (e.code || e.name)) || 'unknown'); /* 单次失败重试 */ }
   }
   return null;
 }
@@ -249,7 +254,7 @@ export async function warmDecisionModel({ base, model, fetchFn = fetch, timeoutM
  * 返回 {rawChunks:[{chunk,text}], usage, latencyMs, endpoint, chunks, failedChunks, error?, backend}。
  * config 缺省 loadConfig();fetchFn 可注入(测试,ollama 路径用)。
  */
-export async function judgeLocal({ items, criteria = null, valid = null, config = null, fetchFn = fetch, timeoutMs = 30000, retries = 1 } = {}) {
+export async function judgeLocal({ items, criteria = null, valid = null, config = null, dataDir = DATA_DIR, fetchFn = fetch, timeoutMs = 30000, retries = 1 } = {}) {
   if (!items || !items.length) return { rawChunks: [], usage: null, backend: 'local:未触发' };
   // S12-C13(2026-11-10 夜审落地):判定热路径禁用 process.exit——坏 config 时判定层返回 error,
   // 上层(modelRouteProxy catch)fail-open 到词法定档;CLI 面 loadConfig 默认仍硬 exit 提醒修复。
@@ -263,7 +268,7 @@ export async function judgeLocal({ items, criteria = null, valid = null, config 
   if (!modelName) return { rawChunks: [], error: 'config.mjs 未配置本地决策模型名(decision/localDecision)', backend: 'local:未配置' };
   // 批量嵌入让行(2026-11-10):ollama 单队列,重嵌期间判定票主动跳过——带上 skipped 标记,
   // 调用方据此**不触发断路器**(忙跳过≠故障),三票照常、完全离线可签。
-  if (isOllama && embedBusy()) {
+  if (isOllama && embedBusy(dataDir)) {
     return { rawChunks: [], usage: null, latencyMs: 0, endpoint: null, chunks: items.length, failedChunks: items.length, retriedChunks: 0, backend: `ollama:${modelName}`, error: EMBED_BUSY_REASON, skipped: true };
   }
   const started = Date.now();
@@ -272,7 +277,7 @@ export async function judgeLocal({ items, criteria = null, valid = null, config 
   let usage = null;
   for (const chunk of items) {
     if (ollamaBase) {
-      const got = await runChunk({ items: chunk, criteria, valid, modelName, fetchFn, ollamaBase, retries, timeoutMs });
+      const got = await runChunk({ items: chunk, criteria, valid, modelName, fetchFn, ollamaBase, retries, timeoutMs, sysOnly: SYS_ONLY_MODEL_RE.test(String(modelName)) });
       if (!got) { failedChunks += 1; continue; }
       // 只透传原始文本:分片 id 还原与值域四防线由调用方(decisionModel.parseAnswers)统一做
       rawChunks.push({ chunk, text: got.text || '', shaped: got.shaped || null });
@@ -299,7 +304,7 @@ export async function judgeLocal({ items, criteria = null, valid = null, config 
   const endpoint = ollamaBase ? `${ollamaBase}${SYSTEMONE_LOCAL_PATH}` : 'http://127.0.0.1:(resident)/decision';
   const elapsed = Date.now() - started;
   if (rawChunks.length === 0) {
-    return { rawChunks: [], usage: null, latencyMs: elapsed, endpoint, chunks: items.length, failedChunks, retriedChunks: 0, backend, error: `本地决策模型不可用(${modelName}):${ollamaBase ? 'Ollama 未就绪或模型未 pull(decision 能力模型只走 systemone 端点)' : 'local 常驻进程未就绪(重跑 node init.mjs 或 node warm.mjs 预热)'}` };
+    return { rawChunks: [], usage: null, latencyMs: elapsed, endpoint, chunks: items.length, failedChunks, retriedChunks: 0, backend, error: `本地决策模型不可用(${modelName}):${ollamaBase ? (lastChunkFailure ? `后端请求失败(${lastChunkFailure})——先查连接/超时/端口,再查模型是否 pull` : 'Ollama 未就绪或模型未 pull(decision 能力模型只走 systemone 端点)') : 'local 常驻进程未就绪(重跑 node init.mjs 或 node warm.mjs 预热)'}` };
   }
   return { rawChunks, usage, latencyMs: elapsed, endpoint, chunks: items.length, failedChunks, retriedChunks: 0, backend };
 }

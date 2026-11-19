@@ -57,7 +57,7 @@ export const TIER_CRITERIA = {
 //     signing.min=0.4(可签 63→100 条、真 R2 召回 0.265→0.306,质量下限由 quorum 保证);
 //   strands(CPU 常驻,**~1.1s/题 q4f16**(2026-11-09 用户切换:q4f16 全面胜出 q8——73.3% vs 70.0%、1.77s vs 3.76s、1.04GB vs 1.72GB 同批 60 条)):
 //     arm1.minConf=**0.5**/ambiguous 窗——q4f16 置信口径相对 q8 有偏移,ambiguous 窗内操作点从 0.6(1/0)移到 0.5(命中 3/误救 1,精准 0.75);
-//     全窗曲线 0.7+ 无票;延迟 1.1s 仍不容 all-r1(≈60% 轮挂 1.1s,维持 ambiguous,未来若提速可复评);
+//     曲线 0.7+ 仅 1 票(20261118 夜复算,S9-F2 更正旧注「无票」);all-r1/0.7-0.8=prec 1.0 平台区;延迟 1.1s 仍不容 all-r1(≈60% 轮挂 1.1s,维持 ambiguous,未来若提速可复评);
 //     signing.min=0.4(可签 115 条、multiRecall 0.462,与 q8 同构)。
 //   两后端 maxChars=2000(本地零成本;评测语料 >1200 字 0 条);arm2.r3MinConf=0.85 保持——
 //     2026-11-10 全量基准用**真实四档判定**复验:strands 判出 106 张 R3 票但最高置信 <0.85(零触发),
@@ -73,7 +73,7 @@ export const TIER_CRITERIA = {
 //     存档 data/routing/profile-calibration-strands-q8.md(两档置信口径有偏移,不可混用门槛)。
 export const DECISION_PROFILES_DEFAULT = {
   'ollama:tev1:*': { signing: { min: 0.4, twoVote: 0.85 }, arm1: { live: true, minConf: 0.6, window: 'all-r1', maxChars: 2000 }, arm2: { rescue: true, r3MinConf: 0.85 } },
-  'local:strands:*': { signing: { min: 0.4, twoVote: 0.85 }, arm1: { live: true, minConf: 0.5, window: 'ambiguous', maxChars: 2000, maxLatencyMs: 3000 }, arm2: { rescue: true, r3MinConf: 0.85 } }, // maxLatencyMs: 判定延迟预算(S9 实测 p95=1232,4.1× 余量;2026-11-10 落地)
+  'local:strands:*': { signing: { min: 0.4, twoVote: 0.85 }, arm1: { live: true, minConf: 0.5, window: 'ambiguous', maxChars: 2000, maxLatencyMs: 3000 }, arm2: { rescue: true, r3MinConf: 0.85 } }, // maxLatencyMs: 判定延迟预算(20261109 批测旧声明已过期:20261119 夜审生产台账 strands type 票 n=6650 实测 p95=3569、超 3000 占 5.71%、超 5000 占 0.56%;arm1 tier 票样本仅 1,3000 预算余量待 kind=tier 影子样本复核;超时 fail-open 维持词法定档,2026-11-10 落地)
 };
 export const DECISION_PROFILE_FALLBACK = { signing: { min: 0.6, twoVote: 0.9 }, arm1: { live: false, minConf: 0.75, window: 'ambiguous', maxChars: 1200 }, arm2: { rescue: true, r3MinConf: 0.85 } }; // S2-F4(2026-11-10 夜审):未建档模型恒影子(live:false),不实弹救回
 
@@ -265,7 +265,10 @@ export async function judgeBatch(args = {}) {
     let usage = null;
     const parsedAll = [];
     for (const chunk of chunks) {
-      const lr = await judgeLocal({ items: [chunk], criteria, valid, config, fetchFn: fetchFn || fetch, timeoutMs: args.timeoutMs || 30000, retries: args.retries ?? 1 });
+      const lr = await judgeLocal({
+        items: [chunk], criteria, valid, config, dataDir: args.dataDir || DATA_DIR,
+        fetchFn: fetchFn || fetch, timeoutMs: args.timeoutMs || 30000, retries: args.retries ?? 1,
+      });
       endpoint = endpoint || lr.endpoint;
       backend = backend || lr.backend;
       if (lr.skipped) skipped = true;
@@ -280,9 +283,9 @@ export async function judgeBatch(args = {}) {
       if (!raw) { failedChunks += 1; continue; }
       // ONNX 打分路径直接给归一答案图(shaped);ollama systemone 路径直接给归一答案图;文本路径走 extractJson+shapeAnswers
       const shaped = raw.shaped || shapeAnswers(extractJson(raw.text || ''), valid);
-      const parsed = parseAnswers(shaped || {}, chunk, { valid: valid || undefined });
-      if (!shaped) { failedChunks += 1; continue; }
-      for (const a of parsed) a.id = chunk[a.id - 1] ? chunk[a.id - 1].id : a.id;
+      const parsed = parseAnswers(shaped || {}, chunk, { valid: valid || undefined });      if (!shaped) { failedChunks += 1; continue; }
+      // S2-F5(20261118):原有一行二次重映射(把 a.id 当「位置+1」再查 chunk)——parseAnswers 已按
+      // items 位置解析出真实 id,再重写会在 id≠position+1 时把答案安到别的条目头上(生产 chunkSize=1 零暴露)。
       parsedAll.push(...parsed);
     }
     parsedAll.sort((a, b) => a.id - b.id);
@@ -350,14 +353,14 @@ export async function classifyBatch(prompts, { criteria = TYPE_CRITERIA, ...opts
  * 热路径调用方(代理)自管断路器/开关/缓存,本函数只做"一题一判"。
  * fetchFn 缺省不注入 → judgeBatch 走本地判定(2026-11-08 本地化);注入时走显式远程。
  */
-export async function judgeTier(prompt, { context = null, config = null, fetchFn = null, timeoutMs = 8000, chunkSize = 1, concurrency = 1, retries = 1, baseDelay = 150 } = {}) {
+export async function judgeTier(prompt, { context = null, config = null, dataDir = DATA_DIR, fetchFn = null, timeoutMs = 8000, chunkSize = 1, concurrency = 1, retries = 1, baseDelay = 150 } = {}) {
   // 上下文并入(S3,2026-11-09 v3 方案):调用方传入"前轮人类 prompt 摘要",在拼接层实现——零协议改动,
   // ollama systemone/文本生成/ONNX 打分三条判定路径同效(判的是同一份全文)。指代类("刚才的测试…")不再盲判。
   // S4-F3(2026-11-11 夜审):provider/providers/local 三个死参数清理——v4 判定恒本地,传入即被忽略。
   const text = context ? `【前文摘要】${String(context).slice(0, 400)}\n【本轮任务】${String(prompt || '')}` : String(prompt || '');
   const r = await judgeBatch({
     items: [{ id: 1, text }], criteria: TIER_CRITERIA,
-    valueRe: /^R[1-4]$/i, config, fetchFn: fetchFn || undefined, timeoutMs, chunkSize, concurrency, retries, baseDelay,
+    valueRe: /^R[1-4]$/i, config, dataDir, fetchFn: fetchFn || undefined, timeoutMs, chunkSize, concurrency, retries, baseDelay,
   });
   return { ...r, answer: r.answers && r.answers.length ? r.answers[0] : null };
 }

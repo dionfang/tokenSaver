@@ -60,8 +60,21 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
     l1Tier: r.l1Tier || 'R1', l1Conf: Number(r.l1TierConf ?? 0),
     dmType: r[COL] || null, dmConf: Number(r[COL + 'Conf'] ?? 0),
     dmTier: r[COL] ? (TYPE2TIER[r[COL]] || null) : null,
-    text: String(r.text || ''),
+    // decision-model-report 保留 text 预览(120 字)，真实长度在 promptChars；旧行才回退预览长度，
+    // 并在报告中明确标成低可信，不能再用“>1200 字为 0”支撑参数变更。
+    promptChars: Number.isFinite(Number(r.promptChars)) ? Number(r.promptChars) : String(r.text || '').length,
+    hasPromptChars: Number.isFinite(Number(r.promptChars)),
   })).filter((r) => r.truth === 'R1' || r.truth === 'R2');
+
+  // S2-F3(20261118 P2):判定列覆盖率守卫——tev1/knn 列大面积空(曾 8/240)时网格数字无代表性,
+  // 静默出报告会误导标定。覆盖率 <80% 拒出网格并报数(refused 结果,CLI 面显式报错退出)。
+  const dmTotal = rows.length;
+  const dmNonEmpty = rows.filter((r) => r.dmType != null && r.dmType !== '').length;
+  const coverage = dmTotal ? dmNonEmpty / dmTotal : 0;
+  if (coverage < 0.8) {
+    console.error(`[guard] 判定列 ${COL} 覆盖率 ${(coverage * 100).toFixed(1)}%(${dmNonEmpty}/${dmTotal})< 80%——网格无代表性,拒出(修好判定链后重跑)`);
+    return { refused: true, backend: COL, coverage, nonEmpty: dmNonEmpty, total: dmTotal };
+  }
 
   // ---- arm1 网格:窗口 × 置信闸 ----
   const arm1 = [];
@@ -113,8 +126,9 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
       });
     }
   }
-  // maxChars:prompt 长度分布(截断影响)
-  const lens = rows.map((r) => r.text.length).sort((a, b) => a - b);
+  // maxChars:用原始 prompt 长度，而不是报告预览 text(后者固定截到 120 字)。
+  const lens = rows.map((r) => r.promptChars).sort((a, b) => a - b);
+  const legacyLengthRows = rows.filter((r) => !r.hasPromptChars).length;
   const over = (n) => lens.filter((l) => l > n).length;
 
   const lines = [
@@ -143,7 +157,7 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
     '',
     '## 4. maxChars(prompt 长度截断)',
     '',
-    `样本长度中位 ${lens[Math.floor(lens.length / 2)] ?? 0} 字;>1200 字 ${over(1200)} 条;>800 字 ${over(800)} 条;>600 字 ${over(600)} 条。`,
+    `样本原始 prompt 长度中位 ${lens[Math.floor(lens.length / 2)] ?? 0} 字;>1200 字 ${over(1200)} 条;>800 字 ${over(800)} 条;>600 字 ${over(600)} 条。${legacyLengthRows ? ` ⚠ ${legacyLengthRows} 条旧评测行缺 promptChars，仅按 120 字预览计，长度结论待重跑。` : ''}`,
     '',
     '## 5. 标定结论(已落地的默认档案值)',
     '',
@@ -151,7 +165,7 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
     '|---|---|---|---|',
     '| `ollama:tev1:*` arm1.minConf | 0.4 | **0.6** | 0.4 精准率 0.625(3 条误救=白付 R2 溢价);0.6 处精准 1.0 零误救,较 0.4 仅损 1 条真 R2 召回 |',
     '| `ollama:tev1:*` arm1.window | all-r1 | **all-r1**(保持) | 0.6 闸下 all-r1 救 4 条 vs 窄缝(≤0.5)仅 1 条,且零误救 |',
-    '| `ollama:tev1:*` arm1.maxChars | 1200 | **2000** | 1200 是远程省成本遗产;本地零成本,评测语料 >1200 字 0 条 ⇒ 放宽无负担 |',
+    '| `ollama:tev1:*` arm1.maxChars | 1200 | **2000**(暂维持) | 1200 是远程省成本遗产;先前“>1200 字 0 条”受 120 字预览截断污染，待含 promptChars 的评测重跑后再定 |',
     '| `ollama:tev1:*` signing.min | 0.6 | **0.4** | 可签 63→100(+59%),真 R2 召回 0.265→0.306;质量下限由 quorum 保证(凡签出必决策票∧行为票同向,行为一致率 1.0) |',
     '| `ollama:tev1:*` signing.twoVote | 0.85 | **0.85**(保持) | 网格显示 0.8/0.85/0.9/0.95 结果完全相同(tev1 票置信极少 ≥0.85,2 票权重几乎不触发)⇒ 保留作尖峰票特权位 |',
     '| `ollama:tev1:*` arm2.r3MinConf | 0.85 | **0.85**(保持) | 三档判定投不出 R3,本语料候选 0 条 ⇒ **不可标定**,待 R3 真值样本积累后复评 |',
@@ -162,7 +176,7 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
   ].join('\n');
   const out = path.join(dataDir, 'routing', `profile-calibration-${COL}.md`);
   try { fs.mkdirSync(path.dirname(out), { recursive: true }); fs.writeFileSync(out, lines); } catch { /* 报告写不上不影响结论 */ }
-  return { out, arm1, signing, arm2Candidates, arm2Rows: arm2Rows.length, over1200: over(1200), over800: over(800), backend: COL };
+  return { out, arm1, signing, arm2Candidates, arm2Rows: arm2Rows.length, over1200: over(1200), over800: over(800), legacyLengthRows, backend: COL };
 }
 
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
@@ -170,5 +184,6 @@ if (directRun) {
   const i = process.argv.indexOf('--data');
   const b = process.argv.indexOf('--backend');
   const r = calibrateProfile({ dataDir: i > 0 ? process.argv[i + 1] : DATA_DIR, backend: b > 0 ? process.argv[b + 1] : 'tev1' });
+  if (r.refused) { console.error(`[exit] 判定列覆盖率不足(${(r.coverage * 100).toFixed(1)}%),未产出标定报告`); process.exit(1); } // S2-F3 守卫贯通到 CLI
   console.log(JSON.stringify({ report: r.out, backend: r.backend, arm1Rows: r.arm1.length, signingRows: r.signing.length, arm2Candidates: r.arm2Candidates, over1200: r.over1200 }, null, 1));
 }

@@ -41,6 +41,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import { fileURLToPath } from 'node:url';
@@ -48,7 +49,7 @@ import { DATA_DIR, loadConfig } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
-import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS } from './thresholds.mjs'; // S1-F4:歧义窗/上梯表单源(thresholds.mjs);S1-F2(2026-11-17):门控两值并入单源
+import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, RREF_CONSULT_TIMEOUT_MS, CACHE_TTL_MS as THRESHOLD_CACHE_TTL_MS } from './thresholds.mjs'; // S1-F4 单源;S1-F2 门控两值并入;S2-F1(20261118) 咨询超时并入
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
 import { resolveDecisionProfile } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
@@ -78,7 +79,7 @@ const GATE_COMPRESS_RATIO = 0.7;
 
 // 缓存热窗口(修正#4):显式缓存有效期 5min 确定性过期;隐式缓存 TTL 不确定,按同值保守处理。
 // 距上一轮超过该窗口 → 宽限/粘住偏好全部关闭(热缓存假设不成立,换档不再有额外税,黏旧档只是多花钱)。
-const CACHE_TTL_MS = 5 * 60 * 1000;
+const CACHE_TTL_MS = THRESHOLD_CACHE_TTL_MS; // S1-F4(20261118):并入 thresholds 单源(原字面量双写)
 
 // ---------- R-ref 预兜底票(v2.1 2026-11-08) ----------
 // 判定缓存:同 prompt 判一次,按 pkey 缓存(进程级,代理长驻);TTL 6h、容量 200,简单 LRU。
@@ -87,16 +88,19 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 // RREF_AMB_CONF 已单源化(S1-F4):import 自 thresholds.mjs(R1_AMBIGUOUS_CONF as RREF_AMB_CONF)
 const RREF_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const RREF_CACHE_MAX = 200;
-const rRefCache = new Map(); // key = pkey|decisionModel(2026-11-09 加模型身份):切换决策模型后旧模型结果不再被命中,防 6h 缓存串味
-function rRefCacheGet(pkey, decisionModel = '') {
-  const k = pkey ? `${pkey}|${decisionModel}` : null;
+const rRefCache = new Map(); // key = pkey|decisionModel|contextHash:前文不同不得复用 6h 判定票
+function contextHash(context) {
+  return crypto.createHash('sha256').update(String(context || '')).digest('hex').slice(0, 16);
+}
+function rRefCacheGet(pkey, decisionModel = '', ctxHash = '') {
+  const k = pkey ? `${pkey}|${decisionModel}|${ctxHash}` : null;
   const e = k ? rRefCache.get(k) : null;
   if (!e) return null;
   if (Date.now() - Number(e.at || 0) > RREF_CACHE_TTL_MS) { rRefCache.delete(k); return null; }
   return e;
 }
-function rRefCacheSet(pkey, v, decisionModel = '') {
-  const k = `${pkey}|${decisionModel}`;
+function rRefCacheSet(pkey, v, decisionModel = '', ctxHash = '') {
+  const k = `${pkey}|${decisionModel}|${ctxHash}`;
   rRefCache.delete(k); // 先删后插 = 简单 LRU(插入序即新鲜序)
   if (rRefCache.size >= RREF_CACHE_MAX) { const old = rRefCache.keys().next().value; if (old) rRefCache.delete(old); }
   rRefCache.set(k, { ...v, at: Date.now() });
@@ -687,6 +691,9 @@ export function pickUpstream({ providerId, model, upstreams } = {}) {
     if (ingress.length) {
       const q = ok(ingress[0]);
       if (q) return { providerId: ingress[0], ...q, modelNotListed: true };
+      // S1-F2(20261118):ingress 存在但全部不可用(disabled/无 key)→ 空上游走 502,
+      // 绝不按模型名漂到同宿主其他账户(H4 红线;原 fallthrough 到 resolveUpstreamForModel 会越权)。
+      return { baseUrl: '', apiKey: '', anthropic: true, models: [] };
     }
     return resolveUpstreamForModel(model, upstreams) || fallbackUpstream(upstreams);
   }
@@ -697,6 +704,8 @@ export function pickUpstream({ providerId, model, upstreams } = {}) {
   if (ingress.length) {
     const q = ok(ingress[0]);
     if (q) return { providerId: ingress[0], ...q, modelNotListed: true };
+    // S1-F2(20261118):无钉住路径同口径——ingress 全坏 → 空上游 502,不漂别账户
+    return { baseUrl: '', apiKey: '', anthropic: true, models: [] };
   }
   return resolveUpstreamForModel(model, upstreams) || fallbackUpstream(upstreams);
 }
@@ -882,7 +891,12 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
     const est = estimateContextTokens(contextBytes);
     // 切换税门控对死循环证据豁免(2026-11-06):门控假设"升档可能不必要",而死循环按定义不会自愈,
     // 拦住升档=R1 空烧到人来救;errStreak 类证据(可能自愈)仍受门控,提前一拍同属此类,受门控约束。
-    if (g.enabled && loopStreak === 0 && est > g.maxContextTokens) return { mark: false, decision: null };
+    // S1-F1(20261118):errStreak 上梯被切换税门控拦时,原直接 mark:false 返回——不累进 suppressedCount
+    // 也不认 releaseByFatigue,厚上下文长会话永远等不到疲劳放行(难度门 :981 两者都有,此处不对称)。
+    // 现与难度门同口径:疲劳满则豁免放行;否则累进计数交由调用方写入 nextPhase。
+    if (g.enabled && loopStreak === 0 && est > g.maxContextTokens && !releaseByFatigue) {
+      return { mark: false, decision: null, gateSuppressed: { suppressedCount: (Number(phase?.suppressedCount) || 0) + 1, suppressedEst: gateCompressed ? est : (Number(phase?.suppressedEst) || est), suppressedTier: escTarget, at: Date.now() } };
+    }
     const nextPhase = {
       model, providerId: target.providerId,
       baseRequested: phase?.baseRequested ?? requestedModel,
@@ -901,15 +915,17 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   };
 
   if (lastKind !== 'human') {
+    let escGate = null; // S1-F1:errStreak 上梯被门控拦时的累进计数,随工具续接 nextPhase 落盘
     if (escalate || eagerR3) {
       const e = tryEscalate();
       if (e.decision) return e.decision;
+      if (e.gateSuppressed) escGate = { ...(inPhase ? phase : {}), ...e.gateSuppressed };
       // 已封顶(R3/R4 服务档)/目标档不可达/门控抑制 → 普通工具续接(errStreak 保持;门控抑制轮上下文变薄后下轮重试)
     }
-    if (inPhase) return { model: phase.model, providerId: phase.providerId, switched: phase.model !== baseModel, reason: '阶段延续(工具续接沿用升级档)', nextPhase: phase };
+    if (inPhase) return { model: phase.model, providerId: phase.providerId, switched: phase.model !== baseModel, reason: '阶段延续(工具续接沿用升级档)', nextPhase: escGate || phase };
     // auto 且无阶段:sticky 基准=R1 解析(工具续接不重新解析,保持上一发的一致性)
-    if (isAuto && baseModel !== requestedModel) return { model: baseModel, ...provKey(baseProvider), switched: baseModel !== requestedModel, reason: 'auto→R1 档(工具续接 sticky)', nextPhase: gateTomb() };
-    return { model: requestedModel, switched: false, reason: 'tool-continuation-sticky', nextPhase: gateTomb() };
+    if (isAuto && baseModel !== requestedModel) return { model: baseModel, ...provKey(baseProvider), switched: baseModel !== requestedModel, reason: 'auto→R1 档(工具续接 sticky)', nextPhase: escGate || gateTomb() };
+    return { model: requestedModel, switched: false, reason: 'tool-continuation-sticky', nextPhase: escGate || gateTomb() };
   }
   if (inPhase && !isAuto && phase.baseRequested && requestedModel !== phase.baseRequested) {
     return { model: requestedModel, switched: false, reason: '人工改档,阶段结束', nextPhase: null };
@@ -1110,7 +1126,7 @@ function retryConfig(configPath) {
 
 // ---------- 转发与用量旁路 ----------
 
-function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthropicAdapter, opts = {}) {
+export function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter = anthropicAdapter, opts = {}) {
   // opts.allowRetry:运行时 429/5xx 同轮重选开关。为 true 时,遇到仅凭状态码即可判定的可冷却错误
   // (shouldCoolDown 任一非 null 族)不向客户端提交(writeHead 延后),丢弃错误体并 resolve {retry:true},
   // 交回上层冷却失败模型→重跑 resolveTier(档内滑/降档)→换模型重发。allowRetry=false 时行为与旧版一致。
@@ -1269,7 +1285,7 @@ function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG, configPath = null) {
 
 // ---------- HTTP 服务 ----------
 
-export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE, basePath = '/apps/anthropic', chainsOverride = null, usageFile = PROXY_USAGE_LOG, healthDataDir = DATA_DIR, configPath = path.join(DATA_DIR, 'code-index.config.json') } = {}) {
+export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE, basePath = '/apps/anthropic', chainsOverride = null, usageFile = PROXY_USAGE_LOG, healthDataDir = DATA_DIR, configPath = path.join(DATA_DIR, 'code-index.config.json'), l2Override = null } = {}) {
   // chainsOverride:测试注入的四档位链(生产恒走快照派生)
   const state = new Map(); // convKey → {model,baseRequested,humanTurns}:升档阶段驻留(#1/#5 阶段粘住)
   const sessionL2 = { embedFn: undefined, vectors: undefined }; // L2 融合票缓存(l2Live 关着时永不初始化)
@@ -1344,15 +1360,18 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         // 档案(mtime 缓存,默认 disabled)⇒ 人工 --enable 后这里真的改判;读不到/未启用 = 纯词法,零影响
         if (lastKind === 'human') {
           try { diffDecision = classifyDifficulty(adapter.lastHumanText(bodyObj.messages), { calibration: loadTierCalibration() }); } catch { diffDecision = null; }
+          // S2-F2(20261118):词法原始快照必须在 L2 融合/r3Lexical/臂改档**之前**取——l2Live 现恒开,
+          // 事后读 diffDecision 会把融合救回后的档/置信记成词法档,污染 D4/D5 门禁对账。
+          const lexSnapshot = diffDecision ? { tier: diffDecision.tier, confidence: Number(diffDecision.confidence) } : null;
           // L2 融合票(2026-11-06 进化回路接通):词法判 R1 但 kNN 投 multi 且置信过 l2Live.minConf ⇒ 救回 R2。
           // v2(2026-11-08):词法判 R2 + kNN 高置信投 R3 ⇒ 救回 R3(向量库无 R3 类时自然投不出,fail-open)。
           // modelRouting.l2Live.{enabled,minConf} 门控(ro 每请求现读,改配置即时生效),全程 fail-open:
           // 向量表缺失/嵌入失败/任何异常 = 维持词法定档,零影响。embedFn/vectors 按会话缓存(热路径不重载)。
           if (diffDecision && (diffDecision.tier === 'R1' || diffDecision.tier === 'R2') && ro.l2Live.enabled) {
             try {
-              const l2fn = sessionL2.embedFn || (sessionL2.embedFn = await l2EmbedFn({ dataDir: DATA_DIR }));
+              const l2fn = sessionL2.embedFn || (sessionL2.embedFn = l2Override?.embedFn || await l2EmbedFn({ dataDir: DATA_DIR })); // S2-F2 测试注入缝
               if (l2fn) {
-                const doc = sessionL2.vectors || (sessionL2.vectors = loadVectors(DATA_DIR));
+                const doc = sessionL2.vectors || (sessionL2.vectors = l2Override?.vectors || loadVectors(DATA_DIR)); // S2-F2 测试注入缝
                 if (doc && doc.vectors) {
                   const vec = await l2fn(adapter.lastHumanText(bodyObj.messages));
                   const knn = knnClassify(vec, doc);
@@ -1379,8 +1398,8 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           // D4 快照(2026-11-09 审查修):原始词法档 + 临界 flags 必须在**臂改档之前**取——
           // 臂1/arm2 救回会改写 diffDecision.tier,事后直读会把"救回后的档"记成词法档,污染 flags 分布对账。
           const d4Flags = diffDecision && diffDecision.flags && typeof diffDecision.flags === 'object' ? diffDecision.flags : null;
-          const d4L1Tier = diffDecision ? diffDecision.tier : null;
-          const d4L1Conf = diffDecision ? Number(diffDecision.confidence) : null;
+          const d4L1Tier = lexSnapshot ? lexSnapshot.tier : null; // S2-F2:词法原始(融合前)
+          const d4L1Conf = lexSnapshot ? lexSnapshot.confidence : null;
           const rRefArm1 = !!(diffDecision && diffDecision.tier === 'R1'
             && (ro.rRef.window === 'all-r1' || Number(diffDecision.confidence) <= RREF_AMB_CONF)
             && ro.decisionOn);
@@ -1390,7 +1409,8 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             if (consultText.length <= ro.rRef.maxChars) {
               // 前轮摘要已在人类轮公共处提取(prevHuman):指代类 prompt("刚才的测试…")盲判是决策模型漏判主因
               const cKey = promptHeadLog ? promptKey(promptHeadLog) : null;
-              const cached = rRefCacheGet(cKey, ro.decisionModel);
+              const cHash = contextHash(prevHuman);
+              const cached = rRefCacheGet(cKey, ro.decisionModel, cHash);
               let vote = cached ? { tier: cached.tier, confidence: cached.confidence, cached: true } : null;
               let voteLatency = null;
               if (!vote) {
@@ -1398,11 +1418,11 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                   const dm = await import('./decisionModel.mjs');
                   // 断路器按该实例配置目录隔离(生产=DATA_DIR,隔离测试=注入临时目录,互不绑架)
                   if (!dm.breakerOpen(path.dirname(configPath))) {
-                    const jr = await dm.judgeTier(consultText, { context: prevHuman, config: readJson(configPath), timeoutMs: Math.min(5000, ro.rRef.maxLatencyMs || 5000) });
+                    const jr = await dm.judgeTier(consultText, { context: prevHuman, config: readJson(configPath), dataDir: path.dirname(configPath), timeoutMs: Math.min(RREF_CONSULT_TIMEOUT_MS, ro.rRef.maxLatencyMs || RREF_CONSULT_TIMEOUT_MS) }); // S2-F1:超时兜底单源(thresholds)
                     if (jr.answer && /^R[1-4]$/.test(String(jr.answer.type))) {
                       vote = { tier: String(jr.answer.type), confidence: Number(jr.answer.confidence) || 0, cached: false };
                       voteLatency = Number(jr.latencyMs) || null;
-                      if (cKey) rRefCacheSet(cKey, vote, ro.decisionModel);
+                      if (cKey) rRefCacheSet(cKey, vote, ro.decisionModel, cHash);
                     }
                   }
                 } catch { /* 判定失败/超时/异常 = fail-open,维持词法定档 */ }
@@ -1415,9 +1435,9 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 const arm2Rescue = rRefArm2 && vote.tier === 'R3' && conf >= ro.rRef.r3MinConf;
                 const rescueTier = arm2Rescue ? 'R3' : (arm1Rescue ? 'R2' : null);
                 logRRefShadow(path.dirname(usageFile || PROXY_USAGE_LOG), {
-                  ts: Date.now(), pkey: cKey, promptHead: promptHeadLog,
+                  ts: Date.now(), pkey: cKey, contextHash: cHash, promptHead: promptHeadLog,
                   arm: rRefArm2 ? 'r3-rescue' : 'r1-amb',
-                  l1Tier: rRefArm2 ? 'R2' : 'R1', l1Conf: Number(diffDecision.confidence),
+                  l1Tier: rRefArm2 ? 'R2' : 'R1', l1Conf: lexSnapshot ? lexSnapshot.confidence : Number(diffDecision.confidence), // S2-F2:影子 l1Conf 用词法原始
                   rTier: vote.tier, rConf: conf, cached: vote.cached === true, rescueTier,
                   live: rRefArm2 ? true : !!ro.rRef.live, applied: !!rescueTier, host: reqHost,
                   latencyMs: voteLatency, window: rRefArm2 ? null : ro.rRef.window, // v3:D3 参与度入账(延迟/触发窗)
@@ -1441,25 +1461,26 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             const consultText4 = String(adapter.lastHumanText(bodyObj.messages) || '');
             if (consultText4.length <= ro.rRef.maxChars) {
               const cKey4 = promptHeadLog ? promptKey(promptHeadLog) : null;
-              const cached4 = rRefCacheGet(cKey4, ro.decisionModel);
+              const cHash4 = contextHash(prevHuman);
+              const cached4 = rRefCacheGet(cKey4, ro.decisionModel, cHash4);
               let vote4 = cached4 ? { tier: cached4.tier, confidence: cached4.confidence, cached: true } : null;
               let latency4 = null;
               if (!vote4) {
                 try {
                   const dm4 = await import('./decisionModel.mjs');
                   if (!dm4.breakerOpen(path.dirname(configPath))) {
-                    const jr4 = await dm4.judgeTier(consultText4, { context: prevHuman, config: readJson(configPath), timeoutMs: Math.min(5000, ro.rRef.maxLatencyMs || 5000) });
+                    const jr4 = await dm4.judgeTier(consultText4, { context: prevHuman, config: readJson(configPath), dataDir: path.dirname(configPath), timeoutMs: Math.min(RREF_CONSULT_TIMEOUT_MS, ro.rRef.maxLatencyMs || RREF_CONSULT_TIMEOUT_MS) }); // S2-F1:超时兜底单源(thresholds)
                     if (jr4.answer && /^R[1-4]$/.test(String(jr4.answer.type))) {
                       vote4 = { tier: String(jr4.answer.type), confidence: Number(jr4.answer.confidence) || 0, cached: false };
                       latency4 = Number(jr4.latencyMs) || null;
-                      if (cKey4) rRefCacheSet(cKey4, vote4, ro.decisionModel);
+                      if (cKey4) rRefCacheSet(cKey4, vote4, ro.decisionModel, cHash4);
                     }
                   }
                 } catch { /* D4 影子 fail-open */ }
               }
               if (vote4) {
                 logRRefShadow(path.dirname(usageFile || PROXY_USAGE_LOG), {
-                  ts: Date.now(), pkey: cKey4, promptHead: promptHeadLog, arm: 'd4-critical',
+                  ts: Date.now(), pkey: cKey4, contextHash: cHash4, promptHead: promptHeadLog, arm: 'd4-critical',
                   flags: d4Flags, l1Tier: d4L1Tier, l1Conf: d4L1Conf,
                   rTier: vote4.tier, rConf: Number(vote4.confidence), cached: vote4.cached === true,
                   rescueTier: null, live: false, applied: false, host: reqHost,
@@ -1721,7 +1742,10 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
 function fallbackUpstream(upstreams) {
   const entries = Object.entries(upstreams.providers || {});
   for (const [providerId, p] of entries) if (p.enabled !== false && p.apiKey) return { providerId, ...p };
-  return entries[0]?.[1] ? { providerId: entries[0][0], ...entries[0][1] } : { baseUrl: '', apiKey: '', anthropic: true, models: [] };
+  // S1-F3(20261118):末笔兜底原取 entries[0](不校验 enabled)——全池 disabled 时仍向禁用条目发请求(白付 401 往返)。
+  // 改为:优先 enabled 条目(缺 key 也好过禁用条目,401 能暴露真实配置问题);全池 disabled → 空哨兵(不路由)。
+  for (const [providerId, p] of entries) if (p.enabled !== false) return { providerId, ...p };
+  return { baseUrl: '', apiKey: '', anthropic: true, models: [] };
 }
 
 // inventory 统一由 modelRoute.mjs 的 inventoryFromUpstreams 提供(查询端/改写端同一份口径)。
@@ -1769,7 +1793,7 @@ export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.co
         live: prof.arm1.live !== false,
         minConf: Number.isFinite(Number(prof.arm1.minConf)) ? Number(prof.arm1.minConf) : 0.75,
         maxChars: Number.isFinite(Number(prof.arm1.maxChars)) ? Math.max(200, Math.floor(Number(prof.arm1.maxChars))) : 1200,
-        maxLatencyMs: Number.isFinite(Number(prof.arm1.maxLatencyMs)) ? Math.max(1000, Math.floor(Number(prof.arm1.maxLatencyMs))) : 5000, // S9-F1: 档案可配的判定延迟预算,judgeTier 超时上限
+        maxLatencyMs: Number.isFinite(Number(prof.arm1.maxLatencyMs)) ? Math.max(1000, Math.floor(Number(prof.arm1.maxLatencyMs))) : RREF_CONSULT_TIMEOUT_MS, // S9-F1: 档案可配的判定延迟预算,judgeTier 超时上限;S2-F1 默认值单源(thresholds)
         r3Rescue: prof.arm2.rescue !== false,
         r3MinConf: Number.isFinite(Number(prof.arm2.r3MinConf)) ? Number(prof.arm2.r3MinConf) : 0.85,
         window: prof.arm1.window === 'all-r1' ? 'all-r1' : 'ambiguous',
