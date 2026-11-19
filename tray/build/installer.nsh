@@ -5,8 +5,9 @@
 
 !macro customInit
   ; 覆盖安装/升级:托盘守护常驻(X=最小化不退出)会触发 NSIS「无法关闭」弹窗——
-  ; 安装/卸载前静默强杀本应用进程树(2026-11-18 用户实测覆盖安装弹窗;数据均原子写,强杀安全)。
-  nsExec::Exec 'taskkill /F /T /IM TokenSaver.exe'
+  ; 安装/卸载前静默强杀本应用进程(手工覆盖安装的兜底)。
+  ; 禁止 /T：自动更新时 installer 从旧 app 启动，/T 会连同安装器自身一并终止。
+  nsExec::Exec 'taskkill /F /IM TokenSaver.exe'
   Sleep 800
 !macroend
 
