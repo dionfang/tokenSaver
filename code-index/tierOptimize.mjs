@@ -59,7 +59,18 @@ const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
 const r3 = (v) => (Number.isFinite(Number(v)) ? Number(Number(v).toFixed(3)) : null);
 
 const f = (dataDir, k) => path.join(dataDir, FILES[k]);
-function readJsonl(p) { try { return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; } }
+// S10-F2(20261118):坏行原被静默丢弃——被截断的冷却行会让「冷却保护」静默蒸发(不炸不乱,但看不见)。
+// 改为:丢弃仍丢(保持原语义),但打 stderr 警示,让坏数据可见。
+function readJsonl(p) {
+  try {
+    const lines = fs.readFileSync(p, 'utf8').split('\n').filter(Boolean);
+    const out = [];
+    let bad = 0;
+    for (const l of lines) { try { out.push(JSON.parse(l)); } catch { bad += 1; } }
+    if (bad) console.error(`[warn] ${p}: ${bad} 行无法解析已丢弃(半行/损坏——被截断的冷却行会让保护静默蒸发)`);
+    return out;
+  } catch { return []; }
+}
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 function writeJson(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); atomicWriteFileSync(p, JSON.stringify(obj, null, 1) + '\n'); }
 function appendJsonl(p, obj) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.appendFileSync(p, JSON.stringify(obj) + '\n'); }
@@ -398,8 +409,17 @@ export function promoteCandidate({ dataDir = DATA_DIR, reason = 'manual', now = 
     return { file: f(dataDir, 'profile'), enabled: true, prevBackedUp: false, unchanged: true };
   }
   if (cur) writeJson(f(dataDir, 'prev'), { ...cur, backedUpAt: now });
-  writeJson(f(dataDir, 'profile'), { ...cand, enabled: true, promotedAt: now, promotedBy: String(reason || 'manual') });
-  appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'promote', reason: String(reason || 'manual'), signature: profileSignature(cand), buildAt: cand.builtAt || null });
+  // S10-F1(20261118):台账先行——原 live 先写、append 后写,append 失败=live 已启用但零台账行,
+  // 回滚纠错网失明。现 append 失败则不动 live;live 写失败则补警示行,台账始终可审计。
+  try {
+    appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'promote', reason: String(reason || 'manual'), signature: profileSignature(cand), buildAt: cand.builtAt || null });
+  } catch (e) { return { error: `晋升台账写入失败,未改 live:${e && e.message ? e.message : e}` }; }
+  try {
+    writeJson(f(dataDir, 'profile'), { ...cand, enabled: true, promotedAt: now, promotedBy: String(reason || 'manual') });
+  } catch (e) {
+    try { appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'promote-live-write-failed', signature: profileSignature(cand), reason: String(e && e.message ? e.message : e) }); } catch { /* 尽力留痕 */ }
+    return { error: `live 写入失败(台账已留警示行):${e && e.message ? e.message : e}` };
+  }
   return { file: f(dataDir, 'profile'), enabled: true, prevBackedUp: !!cur };
 }
 
@@ -556,6 +576,8 @@ export function renderReport({ cost, rows, legacy, cv, mined, learned, profilePa
   L.push('- 词表永不自动改,自动的只有逐信号倍数与四个门槛(critMin/editMin/verifyMin/verifyOverride);档案 enabled 默认 false,不改现网。');
   L.push('- 词法 R3(顶格词+独立印证同击,R3_SIGNS)不在黄金集点值里评:真值表仍无 R3,词法 R3 的质量看区间证据行的硬下界漏升数 + routing-shadow 审计;R4 只认显式点名,误升只能看 shadow。');
   L.push('- 质量惩罚是人工定价旋钮:调到 0 时"恒 R1"就是最优解(纯 token 口径的事实),要谈升档价值必须先给它定价。');
+  L.push('- 折外改善含 **8 选 1 组合选择偏差**(S5-F4):对折外最优组合的挑选本身会虚高泛化预期;CV 解与晋升签名不同一,晋升看签名级连续接受而非 CV 单轮。');
+  L.push('- verifyMin/verifyOverride 是**升档方向旋钮**(S5-F5):调紧可压升档,靠 R1 召回门与硬下界门兜底约束,不构成降档路径(只升不降红线不变)。');
   L.push('');
   return L.join('\n');
 }
@@ -567,6 +589,8 @@ export async function runIteration({
   allowBoost = DEFAULTS.allowBoost, truth = DEFAULTS.truth, qualityPenalty = null,
   dry = false, enable = false, spawnGrow = null,
 } = {}) {
+  if (allowBoost) console.error('[warn] allowBoost=true 突破「只降不升」红线(倍率上限2),请确认有意为之'); // S5-3
+  if (dry) console.error('[info] dry=true 干跑:不写候选/报告,但回写 state 保持节流'); // S5-3
   let growResult = null;
   if (grow) {
     try {
@@ -583,7 +607,7 @@ export async function runIteration({
   if (qualityPenalty !== null) cost.qualityPenaltyPerStepM = Number(qualityPenalty);
   const loaded = loadEvalRows({ dataDir, truth });
   const rows = loaded.rows;
-  if (!rows.length) return { state: 'skipped', reason: `黄金集无可评估行(truth=${truth})` };
+  if (!rows.length) { try { writeJson(f(dataDir, 'state'), { at: now, rows: 0, accepted: false }); } catch { /* 状态写失败不掩盖 */ } return { state: 'skipped', reason: `黄金集无可评估行(truth=${truth})` }; } // S5-2:早退也回写 state,节流生效
   const legacy = evaluate({ rows, calibration: null, cost });
   // live 对照腿(2026-11-06 P0):现网 live 已启用才作为对照基准(关着时与基线同物,无对照意义)
   const liveRaw = readJson(f(dataDir, 'profile'));
@@ -604,6 +628,7 @@ export async function runIteration({
     foldImprovement: cv.legacy && cv.best && cv.legacy.total > 0
       ? Number(((cv.legacy.total - cv.best.total) / cv.legacy.total).toFixed(4)) : null,
     accepted: !!cv.accepted,
+    signature: cv.best ? profileSignature({ thresholds: cv.best.thresholds, signals: learned.signals }) : null, // 20261111-S5-F3:接受轮签名留痕
     candidateWritten: !!(cv.accepted && cv.best && !dry),
     over: legacy.over, under: legacy.under, grow: growResult && growResult.state,
   };
@@ -628,8 +653,9 @@ export async function runIteration({
       atomicWriteFileSync(f(dataDir, 'report'), renderReport({ cost, rows, legacy, cv, mined, learned, profilePath: f(dataDir, 'candidate'), liveEnabled: readJson(f(dataDir, 'profile'))?.enabled === true, grow: growResult, history: history.concat([summary]) }));
       fs.appendFileSync(f(dataDir, 'history'), JSON.stringify(summary) + '\n');
       writeJson(f(dataDir, 'state'), { at: now, rows: rows.length, accepted: !!cv.accepted });
-    } catch (e) { return { state: 'grown_report_failed', reason: String(e && e.message ? e.message : e), summary }; }
+    } catch (e) { try { writeJson(f(dataDir, 'state'), { at: now, rows: rows.length, accepted: false }); } catch { /* 尽力 */ } return { state: 'grown_report_failed', reason: String(e && e.message ? e.message : e), summary }; } // S5-2:报告失败也回写 state
   }
+  else { try { writeJson(f(dataDir, 'state'), { at: now, rows: rows.length, accepted: !!cv.accepted, dry: true }); } catch { /* 尽力 */ } } // S5-3:dry 也回写 state,节流不失效
   return { state: 'done', summary, legacy, cv, mined, learned, cost, rows: rows.length, grow: growResult };
 }
 
@@ -694,6 +720,12 @@ export async function maybePromoteTier({ dataDir = DATA_DIR, lastRun = null, opt
     const cand = readJson(f(dataDir, 'candidate'));
     if (!cand) return { state: 'skipped', reason: '候选档案缺失' };
     const sig = profileSignature(cand);
+    // 20261111-S5-F3(20261118):连续接受轮须同签名——旧只看时间戳,两个不同解法各过一轮即凑满连续 N。
+    // 旧 history 行无 signature(undefined)不校验(向后兼容);新行带 signature 才 enforce。
+    const lastNAccepts = accepts.slice(-consecutive);
+    if (lastNAccepts.length >= consecutive && lastNAccepts.some((h) => h.signature && h.signature !== sig)) {
+      return { state: 'skipped', reason: '连续接受轮签名不一致(不同解法各过一轮不算连续稳定)' };
+    }
     const ledger = readJsonl(f(dataDir, 'promotion'));
     // 回滚冷却全量扫描(2026-11-09 夜审 S5-F2):旧实现只看台账最后一条 rollback——
     // 另一签名完成一轮 promote+rollback 后,先前已回滚签名的冷却即失效,可在冷却期内被重新晋升。
@@ -766,7 +798,7 @@ export async function maybeRollbackTier({ dataDir = DATA_DIR, opt = {}, now = Da
     const cp = loadCostProfile({ dataDir });
     const cost = (row) => normalizedRowCost(row, cp, tierOf);
     const pre = rows.filter((r) => r.ts >= wentLiveAt - win && r.ts < wentLiveAt).map(cost).filter((v) => v !== null);
-    const post = rows.filter((r) => r.ts >= wentLiveAt && r.ts <= now).map(cost).filter((v) => v !== null);
+    const post = rows.filter((r) => r.ts >= wentLiveAt && r.ts <= Math.min(now, wentLiveAt + win)).map(cost).filter((v) => v !== null); // S5-4:post 封顶 win,与 pre 等长(防滞后漂移)
     const minRows = Math.max(1, num(p.minRows, 20));
     if (pre.length < minRows || post.length < minRows) return { state: 'skipped', reason: `样本不足(前 ${pre.length}/后 ${post.length},各需 ${minRows}),不拿噪声当恶化` };
     const med = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor((s.length - 1) / 2)]; };
@@ -780,7 +812,10 @@ export async function maybeRollbackTier({ dataDir = DATA_DIR, opt = {}, now = Da
     if (prev) writeJson(f(dataDir, 'profile'), { ...prev, rolledBackAt: now });
     else if (cur) { cur.enabled = false; cur.rolledBackAt = now; writeJson(f(dataDir, 'profile'), cur); }
     const cooldownUntil = now + num(p.rollbackCooldownMs, 7 * 24 * 60 * 60 * 1000);
-    appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'rollback', signature: cur ? profileSignature(cur) : null, beforeMedian: r3(beforeM), afterMedian: r3(afterM), cooldownUntil });
+    // S5-F2(20261118):live 损坏/缺失时 cur=null → signature=null,冷却过滤 e.signature===sig 永不命中,
+    // 同解法可绕冷却再晋升。归因最近一次 promote 的签名,冷却保护不蒸发。
+    const lastPromoteSig = cur ? null : ([...readJsonl(f(dataDir, 'promotion'))].reverse().find((e) => e && e.type === 'promote' && e.signature) || {}).signature || null;
+    appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'rollback', signature: cur ? profileSignature(cur) : lastPromoteSig, beforeMedian: r3(beforeM), afterMedian: r3(afterM), cooldownUntil });
     return { state: 'rolled-back', before: r3(beforeM), after: r3(afterM), restoredPrev: !!prev };
   } catch (e) { return { state: 'failed', reason: String(e && e.message ? e.message : e) }; }
 }
@@ -797,7 +832,7 @@ export function rollbackNow({ dataDir = DATA_DIR, reason = 'manual', now = Date.
   // S5-F2(2026-11-11 夜审,2026-11-14 补修):手动回滚与自动回滚同权——台账带 cooldownUntil
   // (默认同自动 7 天),否则晋升门控读不到冷却期,同一签名可绕过冷却直接复活。
   const cooldownUntil = now + 7 * 24 * 60 * 60 * 1000;
-  appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'rollback', reason: String(reason || 'manual'), signature: cur ? profileSignature(cur) : null, cooldownUntil });
+  appendJsonl(f(dataDir, 'promotion'), { ts: now, type: 'rollback', reason: String(reason || 'manual'), signature: cur ? profileSignature(cur) : (lastPromote.signature || null), cooldownUntil }); // S5-1:live 缺失归因最近 promote,冷却不蒸发
   return { state: 'rolled-back', restoredPrev: !!prev, cooldownUntil };
 }
 

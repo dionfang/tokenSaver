@@ -14,7 +14,8 @@ export const VECTORS_LEGACY_FILE = 'exemplars-vectors.json';          // 更早�
 
 /** 当前嵌入模型全名(backend/model),层级指纹与内容键都用它。 */
 export function currentEmbedModel() {
-  const emb = wantEmbedModel(loadConfig());
+  // S1-F1(20261120 夜):后台/钩子路径一律 soft——坏 JSON 按默认档回落,不再 process.exit 击穿调用方
+  const emb = wantEmbedModel(loadConfig({ soft: true }));
   return `${emb.backend}/${emb.model}`;
 }
 

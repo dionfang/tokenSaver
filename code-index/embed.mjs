@@ -26,6 +26,12 @@ import { loadConfig, DATA_DIR, HF_CACHE_DIR, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, 
 import { vectorPaths, readVectorMeta, writeVectorMeta, wantEmbedModel } from './vectorStore.mjs';
 import { ensureLocalResident, residentEmbed } from './localResident.mjs';
 import { takeJsonLock, releaseJsonLock, pidAlive } from './proc.mjs';
+import { onnxWeightsJson } from './onnxWeights.mjs';
+
+// 20261120(测试机静默死亡修复):未捕获级失败也必须留 stderr——弹窗 tail=stderr||stdout,stderr 空时
+// 死因全丢。原生级崩溃仍接不住,那条路走 onnxProbe 子进程隔离(见 makeEmbedder local 分支)。
+process.on('uncaughtException', (e) => { console.error(`[err] 未捕获异常:${e && e.stack ? e.stack : e}`); process.exit(1); });
+process.on('unhandledRejection', (e) => { console.error(`[err] 未处理拒绝:${e && e.stack ? e.stack : e}`); process.exit(1); });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHUNKS_PATH = path.join(DATA_DIR, 'chunks.jsonl');
@@ -105,7 +111,7 @@ if (!FORCE && meta.signature === curSig && fs.existsSync(EMB_PATH) && meta.model
   try { prev = JSON.parse(fs.readFileSync(PIDFILE, 'utf8')); } catch { /* 无锁或损坏 */ }
   if (!takeJsonLock(PIDFILE)) {
     console.log(`[warn] 已有嵌入进程在运行(pid ${Number(prev?.pid) || '?'},ts ${Number(prev?.ts) || '?'}),本次退出`);
-    process.exit(0);
+    process.exit(3); // S4-3(20261119 夜审):锁忙退出码与「已是最新」(0)区分,查退出码的编排不再把没嵌当成功;消费方 auto/tray 均 fire-and-forget 不分支退出码
   }
   if (prev && Number.isFinite(Number(prev.pid)) && !pidAlive(Number(prev.pid))) {
     console.log(`[info] 接管过期嵌入锁(原 pid ${prev.pid} 已不在)`);
@@ -114,7 +120,7 @@ if (!FORCE && meta.signature === curSig && fs.existsSync(EMB_PATH) && meta.model
 }
 
 // ---------- 复用表:旧配对快照 × 旧向量,md5(块文本) → 向量 ----------
-function buildReuse() {
+function buildReuse(expectedDim = null) { // S4-F1(20261118):expectedDim 传入当前嵌入 dim,旧代际不符拒复用
   try {
     if (!fs.existsSync(PAIRED_PATH) || !fs.existsSync(EMB_PATH)) return null;
     const paired = fs.readFileSync(PAIRED_PATH, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
@@ -122,6 +128,7 @@ function buildReuse() {
     const f32 = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
     if (!paired.length || f32.length % paired.length !== 0) return null;
     const dimOld = f32.length / paired.length;
+    if (expectedDim != null && dimOld !== expectedDim) return null; // S4-F1:代际不符拒复用(防 NaN/余弦错位)
     const map = new Map();
     for (let i = 0; i < paired.length; i++) map.set(md5(paired[i].t), f32.subarray(i * dimOld, (i + 1) * dimOld));
     return { map, dimOld };
@@ -208,26 +215,89 @@ async function makeEmbedder() {
         },
       };
     }
-    const { env, pipeline } = await import('@huggingface/transformers');
+    const { env, pipeline } = await (await import('./transformersLoader.mjs')).loadTransformers();
     env.cacheDir = HF_CACHE_DIR;
-    env.allowLocalModels = false;
+    env.allowLocalModels = true; // 2026-11-19 修(测试机同步报错):packed 布局权重已由向导/托盘下载到 hf-cache,
+    // 允许本地命中,离线/受限网络不再强制远端解析;transformers 自行下载时仍会落同一 cacheDir。
     // 常驻进程不在时才在本进程加载。jina 不需要输入前缀,也不访问 Ollama
     console.log(`[info] local 常驻进程不可用,改为本进程加载 ${MODEL_ID},threads=${EMBED_THREADS || '全核'}`);
     const sopt = EMBED_THREADS > 0 ? { session_options: { intraOpNumThreads: EMBED_THREADS, interOpNumThreads: 1 } } : {};
-    let pipe;
-    try {
-      try {
-        pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8', ...sopt });
-      } catch (e) {
-        console.warn(`[warn] HuggingFace 下载失败(${e.message}),切换 hf-mirror.com 重试...`);
-        env.remoteHost = 'https://hf-mirror.com';
-        pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8', ...sopt });
+    // 2026-11-19 修(测试机同步报错):加载前核嵌入权重完整——不完整给明确指引(托盘会自动补下载),
+    // 不裸抛 transformers 下载异常;完整才进 pipeline(allowLocalModels=true 本地命中优先,受限网络不强制远端)。
+    {
+      // 完整性门=存在+字节数(20261120 测试机回归:双写竞态/懒下载中断留半截文件,存在性门放过→
+      // onnx 原生崩 0xC0000005、探针误判静默死。期望字节单源 onnx-weights.json(S14-F3 20261120 夜:
+      // 原三处字面量双写收敛;tray weightsOnline 字面量由 embedProbe.test 三方一致性门对账);
+      // config* 无预置字节只查存在。
+      const jinaBytes = onnxWeightsJson()['Xenova/jina-embeddings-v2-base-zh'] || {};
+      const WFILES = [
+        ...Object.entries(jinaBytes).map(([f, bytes]) => ({ f, bytes })),
+        { f: 'config.json' },
+        { f: 'tokenizer_config.json' },
+      ];
+      const miss = WFILES.filter(({ f, bytes }) => {
+        let st; try { st = fs.statSync(path.join(HF_CACHE_DIR, MODEL_ID, f)); } catch { return true; }
+        return bytes ? st.size !== bytes : false;
+      });
+      if (miss.length) {
+        console.error(`[err] 嵌入权重未齐或不完整(${MODEL_ID}: ${miss.map((m) => m.f).join(', ')};目录 ${HF_CACHE_DIR})。`);
+        console.error('      请等待托盘自动补权重完成(面板模型灯转绿),或重开安装向导重新下载;权重齐后再次「立即同步」。');
+        console.error('      检索暂以 bm25 词法模式服务,不影响其他功能。');
+        process.exit(1);
       }
-    } catch (e) {
-      console.error(`[err] local 嵌入模型拉起失败(${e.message})。本次嵌入失败,检索降级 bm25。不改换 Ollama 路径。`);
-      process.exit(1);
     }
-    // 维度不猜测——探测推理实测(不同家族/规格输出维度不同,硬编码会导致 vec.set 越界)
+    let pipe;
+    // onnx 崩溃隔离探针(20261120 测试机静默死亡修复):本进程 native 会话创建的原生级死亡(stderr 空)
+    // 任何 try/catch 接不住 ⇒ 先在子进程创建一次会话:静默死=隔离回退 wasm EP(纯 wasm 不 dlopen 原生 .node);
+    // 带错死=stderr 原样 surfaced 定罪;活=本进程照旧 native(零回归)。结论按 ort+node 版本缓存,稳态零开销。
+    const onnxProbe = await import('./onnxProbe.mjs');
+    let useWasm = false; // 20261120:原生崩⇒纯 wasm 后路(wasmEmbed 接管);'cpu' 不是出路——transformers v4 node 的 cpu EP 仍走 onnxruntime-node 原生库,该机必崩(干净文件复锤)
+    const pKey = onnxProbe.probeKey();
+    const pCache = onnxProbe.readProbeCache(DATA_DIR, pKey);
+    if (pCache) {
+      if (pCache.action === 'wasm') { useWasm = true; console.log('[info] onnx 探针缓存:native 曾静默崩溃/超时 → 纯 wasm 后路(wasmEmbed 接管)'); }
+      else console.log('[info] onnx 探针缓存:native 可用');
+    } else {
+      console.log('[info] onnx native 探针(子进程崩溃隔离,仅首跑,结论缓存)…');
+      const pr = await onnxProbe.runOnnxProbe({ modelId: MODEL_ID, cacheDir: HF_CACHE_DIR, threads: EMBED_THREADS });
+      const dec = onnxProbe.decideProbeOutcome(pr);
+      if (dec.action === 'fail') {
+        console.error(`[err] onnx native 探针失败:${dec.reason}`);
+        console.error('      本次嵌入失败,检索降级 bm25。不改换 Ollama 路径。');
+        process.exit(1);
+      }
+      if (dec.action === 'wasm') { useWasm = true; console.warn(`[warn] ${dec.reason}(回退纯 wasm 后路)`); }
+      else console.log('[info] onnx native 探针通过');
+      onnxProbe.writeProbeCache(DATA_DIR, pKey, dec.action);
+    }
+    if (useWasm) {
+      // 纯 wasm 后路(20261120 测试机复锤:干净文件仍 0xC0000005 ⇒ onnxruntime-node 原生库在该机必崩,
+      // 而 transformers v4 node 构建无可用 wasm 后端,cpu EP=同一原生库)。tokenizers+onnxruntime-web
+      // 直推 model_quantized.onnx,零原生 .node,绕开 CPU 指令集/注入/驱动三变量。仅探针实证崩才走,原生优先不变。
+      console.log('[info] 切换纯 wasm 后路(tokenizers+onnxruntime-web 直推,零原生 .node)…');
+      try {
+        const we = await (await import('./wasmEmbed.mjs')).createWasmEmbedder({ modelId: MODEL_ID, cacheDir: HF_CACHE_DIR, threads: EMBED_THREADS || 2 });
+        console.log(`[info] 纯 wasm 后路就绪(dim=${we.dim})`);
+        return { model: MODEL_ID, dim: we.dim, embed: we.embed };
+      } catch (e) {
+        console.error(`[err] 纯 wasm 后路就绪失败(${e.message})。本次嵌入失败,检索降级 bm25。不改换 Ollama 路径。`);
+        process.exit(1);
+      }
+    }
+    const failPipe = (e) => {
+      console.error(`[err] local 嵌入模型拉起失败(${e.message},device=native)。本次嵌入失败,检索降级 bm25。不改换 Ollama 路径。`);
+      console.error('      若为离线/受限网络:确认托盘权重灯为绿(权重已齐)后重试;仍失败请把本段报错与弹窗退出码反馈维护者。');
+      process.exit(1);
+    };
+    console.log('[info] 创建 onnx session(device=native cpu)…');
+    try {
+      pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8', ...sopt });
+    } catch (e) {
+      console.warn(`[warn] HuggingFace 下载失败(${e.message}),切换 hf-mirror.com 重试...`);
+      env.remoteHost = 'https://hf-mirror.com';
+      try { pipe = await pipeline('feature-extraction', MODEL_ID, { dtype: 'q8', ...sopt }); } catch (e2) { failPipe(e2); }
+    }
+    console.log('[info] session ok,dim 探针…');
     const probe = await pipe(['dim probe'], { pooling: 'mean', normalize: true });
     const dim = probe.tolist()[0].length;
     return {
@@ -253,7 +323,7 @@ const t0 = Date.now();
 const emb = await makeEmbedder();
 
 let reuseMap = null;
-const reuse = FORCE ? null : buildReuse();
+const reuse = FORCE ? null : buildReuse(emb.dim); // S4-F1:传入当前 dim
 if (reuse) {
   if (reuse.dimOld === emb.dim) reuseMap = reuse.map;
   else console.warn(`[warn] 旧向量维度 ${reuse.dimOld} ≠ 本次 ${emb.dim},改为全量嵌入`);
@@ -270,9 +340,11 @@ chunks.forEach((c, i) => {
 console.log(`[info] 增量:复用 ${hit} / 待嵌入 ${misses.length}(共 ${chunks.length})`);
 
 if (misses.length) {
-  // 分批 + 部分落盘(2026-11-10):每 8 批把已嵌入行写到正式路径(paired 只含已完成块)。
+  // 分批 + 部分落盘(2026-11-10):每 16 批把已嵌入行写到正式路径(paired 只含已完成块)。
   // 崩溃后 rerun 的复用表(md5(块文本)→向量)会跳过已完成块,只补剩余——不再从 0 重来。
   // 完成后的全量写仍在下方(全量 vec + 全量 chunks 配对),部分文件只存在于中途。
+  // 20261120-S4-F4:间隔 8→16——每 8 批全量重写已完成行,4000 块全量重嵌累计 IO≈15×全量(写放大);
+  // 崩溃可续语义不变(EMB/PAIRED 对组非原子窗由 buildReuse 字节数校验+代际守卫兜底)。
   const doneRows = []; const doneIdx = [];
   const flushPartial = () => {
     fs.mkdirSync(store.dir, { recursive: true });
@@ -292,7 +364,7 @@ if (misses.length) {
       rowsPart.forEach((row, k) => { vec.set(row, idxs[k] * emb.dim); doneRows.push(row); });
       doneIdx.push(...idxs);
       console.log(`[progress] 嵌入 ${doneRows.length}/${misses.length}`);
-      if ((b + 1) % 8 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
+      if ((b + 1) % 16 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
       if (PACE_MS && (b + 1) * BATCH < misses.length) await new Promise(r => setTimeout(r, PACE_MS)); // 批间喘息(WHEA 缓解)
     }
   } catch (e) {

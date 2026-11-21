@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS } from './thresholds.mjs'; // S1-F4:阈值单源(thresholds.mjs,叶子无环)
+import { MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, L2_LAYER_WEIGHTS } from './thresholds.mjs'; // S1-F4:阈值单源(thresholds.mjs,叶子无环)
 export { MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS }; // 供 init 播种骨架引用同一单源
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -137,7 +137,9 @@ export const DEFAULT_CONFIG = {
   // data/code-index.config.json 的 exemplars 段可覆盖(深合并)。
   // 2026-11-14:base+local 双层向量合并生效 ⇒ 本地层**不限比例**——capPerLabel/totalCap 默认
   //   **0=不生效**(全量入库);显式配正数才重新启用配额治理(两键可独立生效,见 buildExemplars)。
-  exemplars: { capPerLabel: 0, totalCap: 0, dynamicQuota: true, authority: 'local' },
+  // knnLocalWeight(PU-001 A,2026-11-17 用户批准):混合向量库中 local 层邻居票权(base 恒 1.0);
+  //   仅 base 层有数据时生效,纯 local 库不降权(行为与改前一致)。系统域标定参数,不播种到用户配置面。
+  exemplars: { capPerLabel: 0, totalCap: 0, dynamicQuota: true, authority: 'local', knnLocalWeight: L2_LAYER_WEIGHTS.local }, // S14-F4(20261118):默认取 thresholds 单源(原 0.6 字面量双写)
   // 非 git root 的保鲜回退阈值(git root 走 HEAD 比对,不用时间)
   staleNonGitMs: 24 * 60 * 60 * 1000,
   // 模型部署只写在本文件(入库)。不读 OLLAMA_EMBEDDING / OLLAMA_RERANKER / OLLAMA_BASE / OLLAMA_FORCE_*。
@@ -218,7 +220,8 @@ export const DEFAULT_CONFIG = {
   //   minIntervalMs=节流间隔(默认 6h);folds/minN/priorN=折数/最小支持/平滑先验,量尺小时加大 priorN 更保守;
   //   grow=false 只评不扩样;fitCost=true 从 proxy-usage.jsonl 反标定冷热轮实测值(默认用人工画像);
   //   dry=true 只出报告不落档案;allowBoost=false 学到的高纯度信号也只降不升(升档代价 8 倍,升权是加杠杆)。
-  modelRouting: { enabled: false, retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }] }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: MAX_PHASE_TURNS, switchGuard: { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
+  modelRouting: { enabled: true, // 20261120 裁定A:路由记账/样本生长闭环全新安装默认开(注入行仅多一行提示);人工改 false 原样保留
+ retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }] }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: MAX_PHASE_TURNS, switchGuard: { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
 };
 
 export function loadConfig({ soft = false } = {}) {

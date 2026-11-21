@@ -6,21 +6,39 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { HF_CACHE_DIR } from './config.mjs';
+import { onnxWeightsJson } from './onnxWeights.mjs';
 
-/** q8 权重是否已在 hf-cache。嵌入(jina)与精排(bge)共用;决策模型 strands:<dir> 前缀
- *  指 hf-cache/<dir>/model_quantized.onnx(2026-11-09 切换 Strands-Decider-2B 后的布局)。 */
+/** 权重是否已在 hf-cache 且字节数完整(20261120 测试机回归:双写竞态/懒下载中断留半截文件,
+ *  存在性门放过→onnx 原生崩 0xC0000005、探针误判静默死)。期望字节单源 onnx-weights.json
+ *  (S14-F3 20261120 夜:原三处字面量双写收敛;tray weightsOnline 字面量由 embedProbe.test 三方一致性门对账);
+ *  strands 为 q4f16 external-data 双件(图 528KB+同目录 _data 1.09GB,缺一不可)。
+ *  未知模型(清单外)维持旧口径:存在且非零。 */
+const WEIGHTS = onnxWeightsJson();
+const ONNX_BYTES = Object.fromEntries(Object.entries(WEIGHTS).filter(([k]) => !k.startsWith('strands:')));
+const STRANDS_BYTES = WEIGHTS['strands:strands-decider-2B-hobson-v19'] || {};
+
 export function localOnnxCached(modelId) {
   const s = String(modelId);
-  const file = s.startsWith('strands:')
-    ? path.join(HF_CACHE_DIR, s.slice('strands:'.length), 'model_quantized.onnx')
-    : path.join(HF_CACHE_DIR, ...s.split('/'), 'onnx', 'model_quantized.onnx');
-  try { return fs.statSync(file).size > 0; } catch { return false; }
+  if (s.startsWith('strands:')) {
+    const dir = path.join(HF_CACHE_DIR, s.slice('strands:'.length));
+    return Object.entries(STRANDS_BYTES).every(([f, n]) => {
+      try { return fs.statSync(path.join(dir, f)).size === n; } catch { return false; }
+    });
+  }
+  const expect = ONNX_BYTES[s];
+  const dir = path.join(HF_CACHE_DIR, ...s.split('/'));
+  if (!expect) {
+    try { return fs.statSync(path.join(dir, 'onnx', 'model_quantized.onnx')).size > 0; } catch { return false; }
+  }
+  return Object.entries(expect).every(([f, n]) => {
+    try { return fs.statSync(path.join(dir, f)).size === n; } catch { return false; }
+  });
 }
 
 async function loadOnce(modelId) {
-  const { env, AutoTokenizer, AutoModelForSequenceClassification } = await import('@huggingface/transformers');
+  const { env, AutoTokenizer, AutoModelForSequenceClassification } = await (await import('./transformersLoader.mjs')).loadTransformers();
   env.cacheDir = HF_CACHE_DIR;
-  env.allowLocalModels = false;
+  env.allowLocalModels = true; // S4-F2(20261120 夜):与 2026-11-19 embed 修同口径统一——本地 cacheDir 命中优先,离线/受限网络不强制远端解析
   const tokenizer = await AutoTokenizer.from_pretrained(modelId);
   const model = await AutoModelForSequenceClassification.from_pretrained(modelId, { dtype: 'q8' });
   return { tokenizer, model };
@@ -31,7 +49,7 @@ export async function loadLocalReranker(modelId, onWarn = console.error) {
     return await loadOnce(modelId);
   } catch (e) {
     onWarn(`[warn] HuggingFace 下载失败(${e.message}),切换 hf-mirror.com 重试...`);
-    const { env } = await import('@huggingface/transformers');
+    const { env } = await (await import('./transformersLoader.mjs')).loadTransformers();
     env.remoteHost = 'https://hf-mirror.com';
     return await loadOnce(modelId);
   }

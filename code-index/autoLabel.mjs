@@ -117,7 +117,13 @@ export function voteLabel(voters = {}) {
   const topSources = (detail[top] || []).length; // 支持最高票标签的**不同投票源**数
   // 唯一领先 + 权重 ≥2 + 最高票标签有 ≥2 个不同投票源 ⇒ 可签
   const ok = !tied && n >= 2 && topSources >= 2;
-  return { type: ok ? top : null, votes: n, sources: topSources, total, agreement: Math.round(agreement * 100) / 100, voters: detail, contested: !ok };
+  // 1B(20261119 用户裁定):行为票否决权——行为票是四票里唯一的结果侧证据。当最高票标签由
+  // ≥2 个非行为票(L1/L2/决策)联盟撑起、而行为票明确指向另一类时,不签(降级 contested),
+  // 防文本/检索联盟压掉真实行为证据。行为票缺席或同意最高票时不触发。
+  const behaviorOpposes = ok && voters.behavior && voters.behavior.type
+    && normalizeType(String(voters.behavior.type)) !== normalizeType(top);
+  const okFinal = ok && !behaviorOpposes;
+  return { type: okFinal ? top : null, votes: n, sources: topSources, total, agreement: Math.round(agreement * 100) / 100, voters: detail, contested: !okFinal };
 }
 
 /**
@@ -200,9 +206,10 @@ export function mergeAutoSigned(freshRows, existing = []) {
       }
       continue;
     }
-    seen.add(k);
-    // S12-F1(2026-11-17 夜审,纵深):fresh 行入库前复检 isSigned/值域——非法标签不穿透(上游 autoSignGolden 已预过滤,此为兜底)
+    // S14-F6(20261118):isSigned 先验后占坑——同 key 先非法后合法时,合法行不再被 seen 挡在池外
+    // (S12-F1 兜底的正序化:先复检再进 seen;非法行不消费坑位)。
     if (!isSigned(r)) continue;
+    seen.add(k);
     out.push({ ...r, pkey: k });
   }
   return out;

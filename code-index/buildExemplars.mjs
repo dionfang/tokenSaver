@@ -154,11 +154,11 @@ export function selectGolden(pool, plan = {}) {
 }
 
 /**
- * prompt 归一键:折叠空白 + 小写 + 截 400 字后取 32 位哈希,附长度做碰撞区分。
- * 重跑后 id 会变(位置编号),已签标签只能按内容匹配才保得住。
+ * prompt 归一键:折叠空白 + 小写 + 截 maxChars(默认 400;join 口径传 200 与 proxy promptHead 对齐,20261119-2-S4-F2)
+ * 后取 32 位哈希,附长度做碰撞区分。重跑后 id 会变(位置编号),已签标签只能按内容匹配才保得住。
  */
-export function promptKey(prompt) {
-  const norm = String(prompt || '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 400);
+export function promptKey(prompt, maxChars = 400) {
+  const norm = String(prompt || '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, maxChars);
   let h = 0;
   for (let i = 0; i < norm.length; i += 1) h = (h * 31 + norm.charCodeAt(i)) | 0;
   return `${(h >>> 0).toString(36)}:${norm.length}`;

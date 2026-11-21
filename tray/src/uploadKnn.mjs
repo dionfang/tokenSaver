@@ -64,7 +64,8 @@ export function selectUploadEntries(vectors, cursor = {}) {
 
 /** 分片(纯):≤2000 条且 gzip 前明文≤8MB(贪心累加 JSON 字节)。单条超过明文上限的直接丢弃
  *  (无法分片装下;硬上传必被服务端拒收并阻断全片,丢弃不影响其余条目)。返回 {chunks,dropped}。 */
-export function chunkEntries(entries, { maxEntries = MAX_ENTRIES_PER_PART, maxPlainBytes = MAX_PLAIN_BYTES } = {}) {
+export const MAX_PART_TOTAL = 200; // S17-F6:与服务端 partTotal 上限同源
+export function chunkEntries(entries, { maxEntries = MAX_ENTRIES_PER_PART, maxPlainBytes = MAX_PLAIN_BYTES, maxParts = MAX_PART_TOTAL } = {}) {
   const chunks = [];
   let cur = [];
   let bytes = 16; // {"entries":[]} 骨架
@@ -77,6 +78,7 @@ export function chunkEntries(entries, { maxEntries = MAX_ENTRIES_PER_PART, maxPl
     bytes += add;
   }
   if (cur.length) chunks.push(cur);
+  if (chunks.length > maxParts) throw new Error(`本地层过大(${chunks.length} 片>上限 ${maxParts}),拒绝上传(与服务端 partTotal 上限同源)`); // S17-F6
   return { chunks, dropped };
 }
 

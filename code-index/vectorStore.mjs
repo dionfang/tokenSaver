@@ -10,14 +10,17 @@ import crypto from 'node:crypto';
 import { DATA_DIR, loadConfig } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 
-export function activeBackend() {
-  return loadConfig().modelIn === 'local' ? 'local' : 'ollama';
+export function activeBackend(cfg = null) {
+  // S1-F1(20261120 夜):后台/钩子路径一律 soft——坏 JSON 按默认档回落,不再 process.exit 击穿调用方
+  const c = cfg || loadConfig({ soft: true });
+  return c.modelIn === 'local' ? 'local' : 'ollama';
 }
 
 /** 当前路径要嵌入的模型名(local 用 jina,ollama 用 config.models.embedding)。 */
-export function wantEmbedModel(cfg = loadConfig()) {
-  const backend = activeBackend();
-  return { backend, model: backend === 'local' ? cfg.models.localEmbedding : cfg.models.embedding };
+export function wantEmbedModel(cfg = null) {
+  const merged = cfg || loadConfig({ soft: true }); // S1-F1:soft 化(坏 JSON 回落默认档)
+  const backend = activeBackend(merged);
+  return { backend, model: backend === 'local' ? merged.models.localEmbedding : merged.models.embedding };
 }
 
 export function vectorPaths(backend) {

@@ -53,14 +53,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot, KNOWN_ANNOTATIONS_PATH, loadKnownAnnotations, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS } from './config.mjs';
+import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot, KNOWN_ANNOTATIONS_PATH, loadKnownAnnotations, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, resolveLayout } from './config.mjs';
 import { localOnnxCached } from './localRerank.mjs';
 import { spawnLogged } from './proc.mjs';
 
 const here = fs.realpathSync.native(path.dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 export const HOOK_TOOLS = ['cursor', 'zcode', 'qoder'];
-const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"(并入,可重复)  --set-roots "D:/a,D:/b"(整表替换,可重复;传空=清空)  --model-in ollama|local  --hooks all|cursor|zcode|qoder。等号写法也认。';
+const INIT_USAGE = '可用参数: --roots "D:/a,D:/b"(并入,可重复)  --set-roots "D:/a,D:/b"(整表替换,可重复;传空=清空)  --model-in ollama|local  --hooks all|cursor|zcode|qoder  --routing-on(显式开路由记账,向导完成携带)。等号写法也认。';
 
 /**
  * 从进程环境判断当前是哪个 agent。认不出返回 null。
@@ -98,12 +98,14 @@ export function parseInitArgs(argv) {
     }
     let name = token;
     let value;
+    // 20261120 裁定A:无值旗标(向导 DONE 携带)——显式开路由记账
+    if (token === '--routing-on') { out.routingOn = true; continue; }
     const eq = token.indexOf('=');
     if (eq !== -1) {
       name = token.slice(0, eq);
       value = token.slice(eq + 1);
     }
-    if (name !== '--roots' && name !== '--set-roots' && name !== '--model-in' && name !== '--hooks') {
+    if (name !== '--roots' && name !== '--set-roots' && name !== '--model-in' && name !== '--hooks' && name !== '--routing-on') {
       unknown.push(name);
       continue;
     }
@@ -301,10 +303,10 @@ function upsertDiet(agentsPath) {
   ok(content.includes('output-diet') ? `[output-diet] 已按 output-diet.md 更新文末段落` : `[output-diet] 已追加到 AGENTS.md 末尾`);
 }
 
-/** modelRouting 配置骨架(#11):结构就位、开关默认关闭;四档链由运行时快照自动派生,无 chains 配置。人工配置后 init 绝不覆盖。配置方法见 部署使用说明.txt 与 README。 */
+/** modelRouting 配置骨架(#11):结构就位、开关默认开启(20261120 裁定A:样本闭环全新安装即通电);四档链由运行时快照自动派生,无 chains 配置。人工配置后 init 绝不覆盖。配置方法见 部署使用说明.txt 与 README。 */
 export function modelRoutingScaffold() {
   return {
-    enabled: false,
+    enabled: true, // 20261120 裁定A:全新安装默认开;人工配置过(含显式 false)原样保留不覆盖
     // 实弹路由(2026-11-03 用户终裁):role 两档制已废,tier 四档难度制唯一(classifyDifficulty 定档 →
     // resolveTier 降档级联;routeMode/roles/chains 配置键已删,不再被读取)。
     // 运行时 429/5xx 同轮重选(2026-11-03):默认 true——转发拿到可重试错误(429/500/502/503/529)时不向客户端
@@ -400,6 +402,15 @@ export function resolveRepoRoot(moduleDir, cwd) {
 }
 const { root: repoRoot, fallback: repoRootFallback } = resolveRepoRoot(here, process.cwd());
 if (repoRootFallback) console.error('[note] 未发现工具仓 .git(打包/复制部署),以模块上级目录为锚;roots 以参数/config 为准');
+
+/** 工具仓自身是否自动并入接线名单(20261120 测试机 Program Files 安装 EPERM 修复,纯函数可测):
+ *  - packed 部署:repoRoot 回退锚=安装目录(resources/node_modules),不是代码仓——写 AGENTS.md/.zcode
+ *    进安装目录无意义,且 Program Files 等只读安装位置直接 EPERM abort 整个 init(修复钩子按钮死在这);
+ *  - alien DATA_DIR+真 git 仓(N82):防临时数据直跑真仓 init 污染真仓 AGENTS.md;
+ *  两种情况都只接显式 roots(用户登记的代码目录),不接工具仓/安装目录自身。 */
+export function shouldAutoWireRepoRoot({ packed, alienDataDir }) {
+  return !packed && !alienDataDir;
+}
 if (directRun) {
 const parsedArgs = parseInitArgs(args);
 if (parsedArgs.error) {
@@ -514,11 +525,18 @@ if (configExisted) {
   if (mr.seeded) {
     cfgOld.modelRouting = mr.cfg.modelRouting;
     dirty = true;
-    ok('[user] data 配置已建 modelRouting 骨架(开关关闭,四档链运行时自动派生)');
+    ok('[user] data 配置已建 modelRouting 骨架(开关开启=路由记账/样本闭环通电,20261120 裁定A;四档链运行时自动派生)');
   } else if (mr.patched) {
     cfgOld.modelRouting = mr.cfg.modelRouting;
     dirty = true;
     ok('[user] data 配置 modelRouting 缺可选子键(decisionModel/tierOptimize/blendNotice/modelTiers/lightSuffixes/l2),已补默认骨架(其余键原样保留,不覆盖人工配置)');
+  }
+  // 20261120 裁定A:向导完成显式开路由记账(覆盖旧脚手架播种 enabled:false 的已装机;重跑向导即翻 true,幂等)。
+  // 人工此后显式改回 false 的机器:仅再次重跑向导才会再翻——无向导动作不碰人工值。
+  if (args.includes('--routing-on') && cfgOld.modelRouting && cfgOld.modelRouting.enabled !== true) {
+    cfgOld.modelRouting.enabled = true;
+    dirty = true;
+    ok('[user] modelRouting.enabled=true(路由记账/样本生长闭环开启,20261120 裁定A 向导显式开)');
   }
   if (dirty) fs.writeFileSync(configPath, JSON.stringify(cfgOld, null, 2));
 } else {
@@ -584,11 +602,13 @@ if (!configExisted || modelInArg) {
     try {
       const KEY = 'OLLAMA_MAX_LOADED_MODELS', WANT = '5';
       if (process.platform === 'win32') {
-        const q = spawnSync('reg', ['query', 'HKCU\\Environment', '/v', KEY], { windowsHide: true, encoding: 'utf8' });
-        if (!(q.status === 0 && String(q.stdout || '').includes(KEY) && String(q.stdout || '').includes(WANT))) {
-          const set = spawnSync('reg', ['add', 'HKCU\\Environment', '/v', KEY, '/t', 'REG_SZ', '/d', WANT, '/f'], { windowsHide: true, encoding: 'utf8' });
+        // S14-3(20261119 夜审):reg/powershell 三发带 10s 超时(挂死不再阻塞 CLI 安装主流程);已配判定解析 REG_SZ 实际值数值比较(旧 includes('5') 把 15/50/25 误判已配)
+        const q = spawnSync('reg', ['query', 'HKCU\\Environment', '/v', KEY], { windowsHide: true, encoding: 'utf8', timeout: 10_000 });
+        const cur = Number((/REG_SZ\s+(\S+)/.exec(String(q.stdout || '')) || [])[1]);
+        if (!(q.status === 0 && String(q.stdout || '').includes(KEY) && cur === Number(WANT))) {
+          const set = spawnSync('reg', ['add', 'HKCU\\Environment', '/v', KEY, '/t', 'REG_SZ', '/d', WANT, '/f'], { windowsHide: true, encoding: 'utf8', timeout: 10_000 });
           if (set.status === 0) {
-            try { spawnSync('powershell', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","5","User")'], { windowsHide: true, encoding: 'utf8' }); } catch { /* 广播尽力 */ }
+            try { spawnSync('powershell', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","5","User")'], { windowsHide: true, encoding: 'utf8', timeout: 10_000 }); } catch { /* 广播尽力 */ }
             console.error(`  [ok] 已写入用户级 OLLAMA_MAX_LOADED_MODELS=${WANT}(防嵌入模型被 LRU 驱逐)——对已在运行的 Ollama 需重启后生效`);
           } else console.error(`  [warn] OLLAMA_MAX_LOADED_MODELS 写入失败(可手工设:系统环境变量同名=${WANT}),不影响安装`);
         } else console.error(`  [ok] Ollama 并发驻留上限已配置(OLLAMA_MAX_LOADED_MODELS=${WANT})`);
@@ -1189,7 +1209,7 @@ export function disciplineItems({ rel, dataRel, packed = false }) {
     P(2, '**无条件先走索引**:定位/阅读/修改代码前先执行至少一次 `' + searchCmd + '`(默认混合检索,**不要加 --rerank**,精排要加载 reranker 会拖慢会话)。即使已有 file:行号也先检索核对;Grep 作补充。确需精排时再手动加 `--rerank`'),
     P(3, '按返回的 `file:起-止行` 用 Read 精读目标区间(offset/limit);定位阶段禁止未检索就整文件通读 500 行以上的大文件。Cursor/ZCode/Qoder 下超上限的全量 Read 与 Bash 里 cat 整读大文件都会被钩子拦下:三端的全量 Read 都默认改写为语义最相关区间(按提问选段),选不出区间才拒绝(拒绝信息自带检索/区间读/grep 替代方案);改走检索+区间读;同一目标 5 分钟内重试一次即放行。**修改类任务改动完成后,对所涉及文件做一次较大范围复查**(捕捉跨中间件/跨函数的副作用)'),
     P(4, pathHint),
-    P(5, '**模型状态提示(整句照抄,禁止截短)**:每轮 UserPromptSubmit 会注入一句 `[code-index] 状态(本轮实时值,回复末尾原样附上):⚙ …`;轮内工具执行后可能再用同一句式注入更新的一条(此时句首已是本轮实际调用的模型,数字也已结算)。把其中 ⚙ 开头的**整句**原样附在每次回复末尾——从 ⚙ 一直到句末,包括句首的"【当前远程模型名】"段(该会话最近一轮实际服务的远程模型;查无记录时该段省略)与"今日累计节约 … tokens，总计节约 … tokens"两段,一个字都不能省;只抄前半句、截掉数字段、或沿用前几轮数字都算违规。**以最新注入的那一条为准**,会话开始时注入的那句仅作首轮兜底。该句只含:句首【当前远程模型名】、是否启动成功、嵌入/精排/决策模型名、失败时的最可能原因,或成功时今日累计/总计两个 tokens 数(总计为全历史日求和)。不要加长、不要改写、不要拼接不同轮次的片段;没有这句输出时不得虚构'),
+    P(5, '**模型状态提示(整句照抄,禁止截短)**:每轮 UserPromptSubmit 会注入一句 `[code-index] 状态(本轮实时值,回复末尾原样附上):⚙ …`;轮内工具执行后可能再用同一句式注入更新的一条(句首已是【本轮:…】,数字也已结算)。句首【】段按注入相位区分:**【上轮:模型名】**(UserPromptSubmit/会话开始注入——本轮请求尚未发出,取该会话最近完成轮实际服务的模型)与**【本轮:模型名】**(轮内工具后的注入——本轮实际路由到的真实模型);查无记录时该段省略。把其中 ⚙ 开头的**整句**原样附在每次回复末尾——从 ⚙ 一直到句末,包括句首【】段与"今日累计节约 … tokens，总计节约 … tokens"两段,一个字都不能省;只抄前半句、截掉数字段、或沿用前几轮数字都算违规。**以最新注入的那一条为准**,会话开始时注入的那句仅作首轮兜底。该句只含:句首【上轮/本轮:模型名】、是否启动成功、嵌入/精排/决策模型名、失败时的最可能原因,或成功时今日累计/总计两个 tokens 数(总计为全历史日求和)。不要加长、不要改写、不要拼接不同轮次的片段;没有这句输出时不得虚构'),
     P(6, '**知识沉淀**:完成某文件的深挖/修复/排查后,若 `' + dataRel + '/known-annotations.json` 无该文件条目,追加一条(格式:`"项目名/相对路径": "一句话职责+关键机制"`,≤50 字);仅真实读码理解后写入,禁止批量生成;写后必跑 `' + annotationCmd + '` 体检——键必须命中索引路径(死链在 details.mjs 里永不显示,先改键名或删条),文本 ≤50 字,JSON 保持合法'),
     P(7, '**提交后保鲜**:执行 `git commit` 后,运行 `' + autoCmd + '`(HEAD 没变秒级跳过;有变更时 build 内联约 10s+嵌入转后台)——有 PostToolUse hook 的环境已自动做,重复触发零成本'),
     P(8, '索引保鲜由会话 hook 自动判定(git 仓库按 HEAD,非 git 目录 24h 回退;嵌入路径或模型变更则重嵌)。手动重建:`' + rebuildCmd + '`。向量过期或切换嵌入模型时运行 `' + embedCmd + '`(只更新当前路径 data/vectors;维度不一致或 `--force` 时该目录全量),完成后以 `' + statusCmd + '` 验证。所选嵌入路径(init --model-in ollama|local)拉起失败时检索降级 bm25;显式 `--mode bm25` 可主动选用'),
@@ -1199,7 +1219,7 @@ export function disciplineItems({ rel, dataRel, packed = false }) {
     P(12, '**缺陷文档回写**:按缺陷文档(如 `agent_reports/failures.md`)修完 bug 后,必须回写该文档——逐条标注已修/未修与修复位置,并把该文档标记为「已处理」;同一份文档不得再作为待修清单二次下发,重复下发时先核对文档内的已修标记,只处理仍未修的条目'),
     P(13, '**修复复盘自更新**:按缺陷文档修完 bug 后,除回写缺陷文档(第 12 条)与归档修复日志(第 14 条)外,还须复盘本轮踩到的问题(缺陷可能已在工作区修过/断言空跑/守卫没进门禁链/文档行号漂移/范围外的坑等),把可互鉴的教训写成「触发条件→下次先做什么」追加进本仓 `bugfix-sop.md` 的「注意事项」(定位顺序:仓根目录,无则 `tools/`;只增不删,失效条目标【已废】),并在同文件「复盘流水」追加本轮小结——小结必须写「本轮用上了哪几条既有 N」,至少一条真实复用。开工前先读该文件,避免重复犯同样的错;两处均无该文件时,首次修复时按「作业规程 / 注意事项 / 复盘流水」三段骨架创建(铺在仓根目录)。`bugfix-sop.md` 是可演进的作业细则,本纪律段是它的索引与强制入口'),
     P(14, '**修复日志归档**:每次 bug 修复**轮次**收尾时,在本仓 `agent_reports/fix-logs/`(无则创建)落一份当轮修复日志,文件名 `fix-<YYYYMMDD>-<主题>.md`,内容至少五段:①输入文档与条目数 ②已修清单(file:行 + 验证方式) ③留待清单与理由 ④门禁/回归结果 ⑤关联指针(台账 id、缺陷文档回执位置、`bugfix-sop.md` 复盘条目)。复盘流水的当轮条目回链该日志;日志属本地资产(`agent_reports/` 已 ignore),不 commit。跨会话追溯路径:缺陷文档回执(第 12 条)→ 修复日志(本条)→ SOP 复盘(第 13 条)三层互链'),
-    P(15, '**测试脚本组织**:test/ 按被测域分目录——`routing/`(模型路由与成本)/`decision/`(判定与代签)/`hooks/`(钩子与端上守卫);全局基建套件放 test/ 根,实弹评测工具进 `test/scripts/`,历史 work 档案进 `test/archive/`;新增测试脚本必须落在对应域目录,并同步 `test/readme.md` 登记与 code-index/package.json 门禁链——链外测试等于没有守卫'),
+    P(15, '**测试脚本组织**(按仓适用:三域分目录是 TokenSaver 路由栈的现状;测试平铺的仓(如 TSServer)按该仓现状落位,勿迁移目录):test/ 按被测域分目录——`routing/`(模型路由与成本)/`decision/`(判定与代签)/`hooks/`(钩子与端上守卫);全局基建套件放 test/ 根,实弹评测工具进 `test/scripts/`,历史 work 档案进 `test/archive/`;新增测试脚本必须落在对应域目录,并同步 `test/readme.md` 登记与 code-index/package.json 门禁链——链外测试等于没有守卫'),
   ];
   return items;
 }
@@ -1290,7 +1310,18 @@ const effRoots = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8')).roots || []; }
   catch { return []; }
 })();
-const wireRoots = [...new Set([repoRoot, ...effRoots.map(r => path.resolve(r))])];
+// N82 守卫(20261120 用户裁定修)+ packed EPERM 修(20261120 测试机 Program Files 安装实证):
+// 工具仓自身是否自动并入接线名单由 shouldAutoWireRepoRoot(顶层纯函数)判定:
+//   packed ⇒ repoRoot 回退锚=安装目录(非代码仓;只读安装位置写 AGENTS.md/.zcode 会 EPERM abort 整个 init);
+//   alien DATA_DIR+真 git 仓 ⇒ 防临时数据直跑真仓 init 污染真仓 AGENTS.md(N82)。
+// 两种情况都只接显式 roots(用户登记的代码目录);不自动并入时高声 warn。
+const n82DefaultDataDir = resolveLayout({ moduleDir: here, cwd: process.cwd(), env: {} }).dataDir;
+const n82Alien = path.resolve(DATA_DIR) !== path.resolve(n82DefaultDataDir) && !!findGitRoot(here);
+const autoWireRepo = shouldAutoWireRepoRoot({ packed: PACKED_INSTALL, alienDataDir: n82Alien });
+let wireRoots = [...new Set([...(autoWireRepo ? [repoRoot] : []), ...effRoots.map(r => path.resolve(r))])];
+if (!autoWireRepo) {
+  console.error(`[warn] 不自动接线工具仓/安装目录自身(${PACKED_INSTALL ? 'packed 部署:安装目录非代码仓,只读安装位置会 EPERM' : `N82 守卫:DATA_DIR(${DATA_DIR})非默认落点(${n82DefaultDataDir})且模块在 git 仓内`});显式 roots 不受影响`);
+}
 wireRootsList(wireRoots, repoRoot);
 
 // 钩子本体统一装在用户级:所有工作区共享一份,绝对路径直指本模块,不依赖各仓的 workspace 信任审批

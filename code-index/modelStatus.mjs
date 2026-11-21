@@ -584,7 +584,8 @@ function latestQoderProxyServed(at, windowMs, usageFile) {
  * 用于轮内状态句刷新——agent-usage.jsonl 只在 prompt/SessionStart 扫描时更新,轮内取到的是旧尾巴。
  * 找不到(无该文件/无 message.model)→ null,调用方回落 agent-usage。
  */
-export function qoderTranscriptModel(sessionId, { home = os.homedir() } = {}) {
+/** Qoder 转录尾部最新 assistant 条目:{ model, ts }(ts=消息自身时间戳,作代理账本配对锚点;缺失为 null)。 */
+export function qoderTranscriptEntry(sessionId, { home = os.homedir() } = {}) {
   const sid = String(sessionId || '').replace(/[^\w.-]/g, '');
   if (!sid) return null;
   for (const root of [path.join(home, '.qoder-cn', 'projects'), path.join(home, '.qoder', 'projects')]) {
@@ -599,12 +600,19 @@ export function qoderTranscriptModel(sessionId, { home = os.homedir() } = {}) {
         let j;
         try { j = JSON.parse(line); } catch { continue; }
         const m = j && typeof j === 'object' ? j.message : null;
-        if (m && typeof m.model === 'string' && m.model) return m.model;
+        if (m && typeof m.model === 'string' && m.model) {
+          const t = Date.parse(j.timestamp);
+          return { model: m.model, ts: Number.isFinite(t) ? t : null };
+        }
       }
       return null; // 文件存在但尾部没 model → 不跨项目目录乱找
     }
   }
   return null;
+}
+
+export function qoderTranscriptModel(sessionId, opts = {}) {
+  return qoderTranscriptEntry(sessionId, opts)?.model || null;
 }
 
 /**
@@ -616,7 +624,7 @@ export function qoderTranscriptModel(sessionId, { home = os.homedir() } = {}) {
  * Qoder 转录为虚拟档(…/auto,auto 档位制)时,用 proxy-usage 最近一条 qoder 行的真实模型替换显示(2026-11-05)。
  * 查无任何记录 → null(状态句省略【】段,不虚构)。
  */
-export function currentRemoteModel(sessionId, { dbPath = ZCODE_DB_PATH, agentUsagePath = AGENT_USAGE_PATH, proxyUsageFile = path.join(DATA_DIR, 'usage', 'proxy-usage.jsonl'), windowMs = 60000, home = os.homedir() } = {}) {
+export function currentRemoteModel(sessionId, { dbPath = ZCODE_DB_PATH, agentUsagePath = AGENT_USAGE_PATH, proxyUsageFile = path.join(DATA_DIR, 'usage', 'proxy-usage.jsonl'), windowMs = 300000, home = os.homedir() } = {}) {
   if (!sessionId) return null;
   const DatabaseSync = getSqlite();
   let anchor = null; // {at, modelId}
@@ -649,27 +657,31 @@ export function currentRemoteModel(sessionId, { dbPath = ZCODE_DB_PATH, agentUsa
     const served = nearestProxyServed(Number(anchor.at) || 0, windowMs, proxyUsageFile);
     if (served) return served;
   }
-  const fromTranscript = qoderTranscriptModel(sessionId, { home });
-  if (fromTranscript) {
+  const entry = qoderTranscriptEntry(sessionId, { home });
+  if (entry && entry.model) {
     // Qoder 虚拟档(auto 档位制,2026-11-07 起条目名可为 …/auto×0.026 带倍率形态):取最后一段
-    // isAutoModelName 判定,虚拟档即用代理账本最近一次真实服务模型替换显示;查不到保持原样。
+    // isAutoModelName 判定,虚拟档即用代理账本就近真实服务模型替换显示;查不到保持原样。
+    // 锚点=消息自身 ts(2026-11-20 用户实测回归):消息先落盘、代理行晚几秒刷出,且轮间常隔
+    // 数分钟——锚 Date.now() 在长间隔后错过该请求的行 → fail-open 裸条目名(flip-flop 现场复现);
+    // 锚消息 ts + 300s 窗即按 nearest-diff 收敛到该请求的真实模型。
     // 直连条目名(qoder-custom-*/<model>)与 <synthetic> 不替换;ZCode 分支(上方 anchor 路径)不涉。
-    const seg = String(fromTranscript).split('/').pop() || '';
+    const seg = String(entry.model).split('/').pop() || '';
     if (isAutoModelName(seg)) {
-      const served = latestQoderProxyServed(Date.now(), windowMs, proxyUsageFile);
+      const served = latestQoderProxyServed(entry.ts || Date.now(), windowMs, proxyUsageFile);
       if (served) return served;
-      return autoDisplaySafe(String(fromTranscript)); // 账本查不到也别把 auto×0.026 当真实模型名显示
+      return autoDisplaySafe(String(entry.model)); // 账本查不到也别把 auto×0.026 当真实模型名显示
     }
-    return String(fromTranscript);
+    return String(entry.model);
   }
   for (const line of readTailLines(agentUsagePath).reverse()) {
     let j;
     try { j = JSON.parse(line); } catch { continue; }
     if (j && j.conversationId === sessionId && j.model) {
       const m = String(j.model);
-      // agent-usage 记的也可能是虚拟档名(auto×0.026)——归一:虚拟档走代理账本就近替换
+      // agent-usage 记的也可能是虚拟档名(auto×0.026)——归一:虚拟档走代理账本就近替换,
+      // 锚点=该行自身 ts(2026-11-20 同回归:锚 Date.now() 在长间隔后 fail-open 裸名)。
       if (isAutoModelName(m)) {
-        const served = latestQoderProxyServed(Date.now(), windowMs, proxyUsageFile);
+        const served = latestQoderProxyServed(Number(j.ts) || Date.now(), windowMs, proxyUsageFile);
         if (served) return served;
         return autoDisplaySafe(m);
       }
@@ -1141,7 +1153,11 @@ export function renderModelStatus(p) {
   // 节约数字:今日/总计两段(2026-11-04 用户定稿:"本会话累计"段撤下,句首加【当前远程模型】)。
   const today = Math.max(0, Math.round(Number(p.savedTokens) || 0));
   const total = Number.isFinite(p.totalAllDays) ? Math.max(0, Math.round(p.totalAllDays)) : today;
-  const modelTag = p.remoteModel ? `【${p.remoteModel}】` : '';
+  // 【】段相位标注(2026-11-20 用户定案):UserPromptSubmit/会话开始注入=【上轮:…】(本轮请求
+  // 尚未发出,取最近完成轮);轮内工具后注入=【本轮:…】(本轮实际路由到的真实模型);
+  // 无相位(CLI 直跑/旧断言)保持裸名,向后兼容。
+  const phasePre = p.remoteModelPhase === 'prev' ? '上轮:' : p.remoteModelPhase === 'curr' ? '本轮:' : '';
+  const modelTag = p.remoteModel ? `【${phasePre}${p.remoteModel}】` : '';
   // 嵌入进行中 → 两种形态的句尾都带具体进度(2026-11-14 用户定案:不再只说"建立中")
   const progClause = p.embedPid && !p.indexOk
     ? (() => { const g = readEmbedProgress(); return g ? `;向量索引嵌入中 ${g.done}/${g.total}(${g.pct}%)` : ''; })()
@@ -1152,7 +1168,7 @@ export function renderModelStatus(p) {
   return { relay, detail: relay, healthy };
 }
 
-export async function assessModelStatus({ sessionId = null } = {}) {
+export async function assessModelStatus({ sessionId = null, phase = null } = {}) {
   const cfg = loadConfig();
   const models = cfg.models;
   // 自愈补拉节流(2026-11-14 用户定案:用户级可配;2026-11-16 默认回退改 60000 与 config.mjs 同步双点):最小 1000ms 防 0/负值风暴
@@ -1242,7 +1258,7 @@ export async function assessModelStatus({ sessionId = null } = {}) {
     decisionModelLabel: null, // v4:远程链已删,恒 null(状态句决策模型名走本地后端名)
   };
   writeHealthCache(health);
-  return renderStatusWith(health, sessionId);
+  return renderStatusWith(health, sessionId, { phase });
 }
 
 /** 健康缓存(避免每轮探针的 HTTP 开销);只缓存健康字段,节约数字永远现算。 */
@@ -1265,13 +1281,13 @@ function writeHealthCache(health) {
  * 展示层:健康字段 + 现算的节约数字(当日桶+总计)+ 当前远程模型(句首【】段,按会话查)。
  * sessionId 省略时不带【模型】段。
  */
-export function renderStatusWith(health, sessionId = null) {
+export function renderStatusWith(health, sessionId = null, { phase = null } = {}) {
   try { applySessionAccumulation(); } catch { /* 入账失败按入口一次口径 */ }
   const savings = readSavingsState();
   const totalAllDays = Object.values(savings.days || {}).reduce((s, d) => s + (Math.max(0, Math.round(Number(d?.savedTokens) || 0)) || 0), 0);
   let remoteModel = null;
   try { remoteModel = sessionId ? currentRemoteModel(sessionId) : null; } catch { /* 查不到省略【】段 */ }
-  return renderModelStatus({ ...health, ...savings, totalAllDays, remoteModel });
+  return renderModelStatus({ ...health, ...savings, totalAllDays, remoteModel, remoteModelPhase: phase });
 }
 
 /** 每轮实时状态句:健康走缓存(健康快照 TTL 5 分钟;**未健康快照 30s**——2026-11-14 用户定案 B:
@@ -1344,7 +1360,7 @@ export function maybeWarmReranker({ health = null, dataDir = DATA_DIR, now = Dat
   } catch { return { spawned: false, reason: '异常,fail-open' }; }
 }
 
-export async function assessModelStatusCached(sessionId = null, { healthMaxAgeMs = 300000 } = {}) {
+export async function assessModelStatusCached(sessionId = null, { healthMaxAgeMs = 300000, phase = null } = {}) {
   const cached = readHealthCache();
   // 模型后端缺位时不吃缓存:每轮现算(本地=轻量常驻 /health 探测),让自愈补拉与状态句即时反映,不留空窗(2026-11-08 修)
   const backendDown = cached?.health && (cached.health.modelIn === 'local'
@@ -1354,9 +1370,9 @@ export async function assessModelStatusCached(sessionId = null, { healthMaxAgeMs
   // 最多 30s 内翻正;健康快照维持原 5 分钟(省每轮探针)。
   const maxAge = healthIsHealthy(cached?.health) ? healthMaxAgeMs : Math.min(healthMaxAgeMs, 30000);
   if (cached && Date.now() - cached.at < maxAge && !backendDown) {
-    return renderStatusWith(cached.health, sessionId);
+    return renderStatusWith(cached.health, sessionId, { phase });
   }
-  return assessModelStatus({ sessionId });
+  return assessModelStatus({ sessionId, phase });
 }
 
 // ---------- Ollama runner 异常自愈(2026-11-17 用户定案,默认开) ----------

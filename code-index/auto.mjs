@@ -126,20 +126,9 @@ async function main() {
         console.error('[decision-model] 断路器开启,已后台探活(成功自动复位,失败保持跳闸;留痕 data/routing/decision-model-breaker.json)');
       }
     } catch { /* 探活判定/拉起失败不影响会话 */ }
-    // 动态显示名刷新(2026-11-08 用户定案,唯一改名挂载点):会话开启时读全期倍率(globalRate,
-    // 跨会话累计)刷进两端条目——Qoder 只进 displayName(id 恒纯 auto),ZCode 进
-    // personalModelIds/modelOrder。会话中期禁改(名字变更令绑定失效,2026-11-07 实弹事故);
-    // 禁写宿主根级杂字段。fail-open。
-    try {
-      const blend = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage', 'auto-blend.json'), 'utf8'));
-      const rate = blend && Number.isFinite(Number(blend.globalRate)) ? Number(blend.globalRate) : null;
-      if (rate != null && rate > 0) {
-        const { refreshAutoModelName } = await import('./virtualProvider.mjs');
-        const rr = refreshAutoModelName({ rate });
-        const changed = [rr.zcode, rr.qoder].some((x) => x && (x.refreshed || x.seeded));
-        if (changed) console.error(`[auto-name] 条目名已按全期费率刷成 ${rr.zcode?.note || rr.qoder?.note}(会话开启时刷新)`);
-      }
-    } catch { /* 刷名失败不影响会话 */ }
+    // 动态显示名刷新(2026-11-08 定案唯一挂载点;20261120 用户裁定迁移):不再于会话开启时刷名——
+    // 迁到 6h 黄金集代签自动拉起(prompt-guard --check 后台分支的 maybeGrowPool 成功后,经
+    // virtualProvider.refreshAutoNameFromBlend),避免每次新开会话改名令绑定失效/列表重载。
 // 预热前置(2026-11-12 用户定案①):warm 先于保鲜 build——常驻冷加载(15-40s)不再被
 // build(10-20s)顶在后面,首条 prompt 的竞态窗口按同量缩小;build 仍内联(紧随其后),
 // 向量同会话新鲜,detached build→embed 链的编排成本与跨进程陈旧签名不值得。

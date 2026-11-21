@@ -1,8 +1,8 @@
 /**
  * 状态句跨钩子共享层(2026-11-04 用户拍板):一并修两处滞后——
- *   模型名滞后:UserPromptSubmit 注入时本轮请求还没发出,句首【】只能是上一轮;
+ *   模型名滞后:UserPromptSubmit 注入时本轮请求还没发出,句首标注【上轮:…】(最近完成轮);
  *     轮内第一个请求完成后(db 可查)重新渲染最新状态句,由 read-nudge 的 PostToolUse
- *     注入,模型回复末尾照抄的就是本轮真实模型。
+ *     注入,标注【本轮:…】=本轮实际路由的真实模型,模型回复末尾照抄即为本轮值。
  *   入账滞后:回合末由 turn-close(Stop 钩子)结算 applySessionAccumulation,把该轮放大
  *     节约滚进账本,并按回合追加 turns.jsonl(模型/增量/今日/总计)。
  * 状态文件 data/read-guard/<sid>.status.json:{relay, remoteModel, prevTurnId, at}:
@@ -57,7 +57,7 @@ export async function freshStatusLine({ stateDir = path.join(DATA_DIR, 'read-gua
     const qAge = now - (st.at || 0);
     // 负龄(at 在未来 = 时钟回拨)不节流,放行自愈(2026-11-10 夜审 S5-F3)
     if (!turn && st.remoteModel === quick && qAge >= 0 && qAge < minIntervalMs) return null;
-    const relay = await deps.relayFor(sid);
+    const relay = await deps.relayFor(sid, 'curr'); // 相位=curr(2026-11-20):PostToolUse 时本轮首请求已完成
     if (!relay) return null;
     const remote = quick || deps.currentModel(sid) || null;
     deps.writeJson(statusFile(stateDir, sid), {
@@ -114,9 +114,9 @@ function defaultStatusDeps() {
     },
     latestTurn: (sid) => latestCompletedTurn(sid),
     currentModel: (sid) => currentRemoteModel(sid),
-    relayFor: async (sid) => {
+    relayFor: async (sid, phase = null) => {
       const { assessModelStatusCached } = await import('./modelStatus.mjs');
-      return (await assessModelStatusCached(sid))?.relay || null;
+      return (await assessModelStatusCached(sid, { phase }))?.relay || null;
     },
     applySettlement: () => applySessionAccumulation(),
     todaySavings: () => readSessionSavings(),

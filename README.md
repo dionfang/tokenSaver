@@ -12,7 +12,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 适合在本地代码库上用 Agent 开发。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
 
-另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板 + 公共决策包一键更新/本地向量上传(均带同意门禁);能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
+另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板 + 公共决策包一键更新/本地向量上传(均带同意门禁)+ 应用自更新(唯一入口=托盘菜单「检查应用更新」,无自动静默检查;差量下载 + sha512 完整性门 fail-closed,下载完成弹「立即安装(推荐)/稍后」→ 可见安装向导,启动时已下载未装的新版只提示不自动装,仅升不降);能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
 ![微信图片_20261105220119.png](https://raw.gitcode.com/user-images/assets/11189521/7fabff6c-6f9b-44a9-943b-fbc69d24b447/微信图片_20261105220119.png '微信图片_20261105220119.png')
 
 ### 工作方式
@@ -130,11 +130,11 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 
 #### modelRouting(动态模型路由配置)
 
-`data/code-index.config.json` 的 `modelRouting` 段由 init 自动生成骨架(`enabled` 默认 `false`),**已有配置不覆盖**;与上面两层口径不同,这一段只认 `data/code-index.config.json`。常用配置项:
+`data/code-index.config.json` 的 `modelRouting` 段由 init 自动生成骨架(`enabled` 默认 `true`——2026-11-20 裁定A,新装默认开路由记账/样本生长闭环;人工改 false 原样保留),**已有配置不覆盖**;与上面两层口径不同,这一段只认 `data/code-index.config.json`。常用配置项:
 
 | 键 | 说明 |
 |---|---|
-| `enabled` | 总开关;控制三件事:每轮 `[model-routing]` 定档行注入、L1 分类(classifyPrompt)、routing-log 落盘——关闭=三者全停,auto 流量无论开关都照常路由(2026-11-11 S6-F9 口径对齐 model-routing.md §5) |
+| `enabled` | 总开关(默认 `true`,2026-11-20 裁定A);控制三件事:每轮 `[model-routing]` 定档行注入、L1 分类(classifyPrompt)、routing-log 落盘——关闭=三者全停,auto 流量无论开关都照常路由(2026-11-11 S6-F9 口径对齐 model-routing.md §5) |
 | `brandPriority` | 四档链档内品牌调用优先序(默认 glm,deepseek,qwen,minimax,kimi,grok,claude,gpt,gemini),不影响档位归属 |
 | `modelTiers` | 品牌三档默认表(2026-11-06 v4,v4.1 调档):`{normal:[deepseek,glm,qwen,minimax]→R2, mid:[kimi,grok,gemini]→R3, high:[claude,gpt]→R4}`,未识别品牌按 normal 兜底;pro/max 不特殊,档位语义与品牌等级一一对应 |
 | `lightSuffixes` | 轻量版本后缀表(默认 flash,preview,coding,code,coder,turbo,mini,air,nano,event,haiku,luna,lite,base,sol,sonnet):命中即在品牌默认档上降一档(R1 封底,flash 恒 R1) |
@@ -147,6 +147,7 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 | ~~l2Live~~ | 同上:旧键不再读取,实弹 L2 融合票恒开(词法 R1+kNN 投 multi→救回 R2;R2+kNN 投 R3→救回 R3,只救回不压制) |
 | `decisionModel` | 四票合议代签的判定模型(v4 2026-11-09 本地化收口:判定**恒本地**——ollama=`models.decision`(tev1:0.8b)/ local=`models.localDecision`(Strands ONNX q4f16 常驻),跟 `modelIn` 同路径;旧键 `enabled/model/providers/chunkSize/rRef` 已废弃不读)。定档双臂与代签门槛全部走**模型判定档案** `profiles`(键=判定后端名,默认表:tev1→arm1 minConf 0.6/window all-r1、代签 0.4/0.85;strands→0.5/ambiguous、0.4/0.85;arm2 r3MinConf 0.85;未建档模型回退 FALLBACK(0.75/ambiguous/0.6/0.9;2026-11-10 S2-F4 后 arm1 **恒影子 live=false**,只记影子账不改判))。臂1 按档案窗口咨询词法 R1 轮(tev1=全部 R1、strands=置信≤0.5 的 R1),法官投到 R1 以上任何档都只按 R2 救回(一步一档封顶,R3 留给臂2;R4 恒不救);臂2 在词法定档 R2 时现查,法官投 R3 且过 r3MinConf ⇒ 救回 R3;判定失败/投他档维持原档(fail-open),影子留痕 `data/usage/r-ref-shadow.jsonl`。判定模型拉不起=决策票弃权,不拖垮检索/路由 |
 | 双轴标签 | 黄金集每条同时记两个正交轴:`semanticType`(语义形态 multi/routine/light,由 L1/L2/决策三票合议——"这话要求的是不是多点改组")与 `intensityType`(行为强度 heavy/normal/light,由行为票——"这轮实际干了多重的活")。此前两者塞进同一标签比较,multi 一致率被压到 0.2;拆开后各轴各评(`node code-index/modelRoute.mjs --score-golden-dual`)。两轴真值均为机器合议弱真值,无外部人工锚点 |
+| `manualSwitch` | 人工改档真值通道(2026-11-19 裁定)`{enabled 默认 true, live 默认 false, upConf 0.8, downConf 0.5, lateralConf 0.3, agreeMin 0.8}`:只采人工改档动作(同 session 相邻轮的齿轮/模型名变化,不采静态默认选档),升档高权/降档低权;**影子先行**——默认 live=false 只采集+审计三方一致率(人工 vs 难度裸解析 vs 结果),live=true 才把人工档写进黄金证据作档位真值的人工锚点(台账 `data/routing/manual-switch.jsonl`);难度裸解析只作对照绝不作真值(防循环红线) |
 | `tierOptimize` | 自进化闭环 `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`:enabled=true 后每 6h 学习信号权重与门槛,折外过门控自动晋升 live,观察窗成本恶化自动回滚 |
 | `blendNotice` | auto 综合费率行注入开关 `{enabled 默认 true}`:仅路由宿主注入"最近会话实际费 ÷ R3 基准费(R3=1x)"倍率行;关=只停注入,记账照常 |
 | ~~r3Lexical~~ | **已回收**:R3 词法通道与 P2 提前一拍**恒开**(代码常量,enabled/eagerEscalate 不可配);词表本体在 tierClassify.mjs |
@@ -177,7 +178,7 @@ TokenSaver is a local agent productivity tool with two core feature modules.
 
 Built for agent-based development on local repositories. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
-An optional desktop tray client lives in `tray/` (Electron): tray status lamps + dual-channel polling + install wizard/self-check panel + one-click decision-pack update / local vector upload (both consent-gated); all capabilities spawn `code-index` micro-CLIs, with zero import coupling to the host (engineering red line guarded by `test/tray/importBan.test.mjs`).
+An optional desktop tray client lives in `tray/` (Electron): tray status lamps + dual-channel polling + install wizard/self-check panel + one-click decision-pack update / local vector upload (both consent-gated) + app self-update (the tray menu "check for app updates" is the only entry — no automatic silent check; differential download with a fail-closed sha512 integrity gate; after download a dialog offers "install now (recommended) / later", and choosing it launches the visible installer wizard; an already-downloaded update is only announced at startup, never auto-installed; upgrades only); all capabilities spawn `code-index` micro-CLIs, with zero import coupling to the host (engineering red line guarded by `test/tray/importBan.test.mjs`).
 
 ### How it works
 
@@ -272,7 +273,7 @@ Change model deployment only in `code-index/config.mjs`. The same keys in the da
 | `models.localReranker` | `Xenova/bge-reranker-base` |
 | `ollamaBase` | `http://localhost:11434` |
 | `gpu` | `auto` (also `cpu` or `gpu`; note: num_gpu only applies to embedding/reranker — the decision model (ollama path) silently ignores it and is placed automatically by Ollama) |
-| `OLLAMA_KEEP_ALIVE` | `24h`(2026-11-14 起,模型常驻不因空闲消失;显存恒占≈4.5GB) |
+| `OLLAMA_KEEP_ALIVE` | `24h` (since 2026-11-14, models stay resident and no longer vanish when idle; steady VRAM footprint ≈4.5GB) |
 | `OLLAMA_NUM_CTX` | `4096` |
 
 Project settings live in `data/code-index.config.json`, beside `code-index/`. Keys you omit use the defaults in `config.mjs`.
@@ -294,11 +295,11 @@ Project settings live in `data/code-index.config.json`, beside `code-index/`. Ke
 
 #### modelRouting (dynamic model routing config)
 
-The `modelRouting` section of `data/code-index.config.json` is scaffolded by init (`enabled` defaults to `false`), and **an existing config is never overwritten**; unlike the two layers above, this section is read only from `data/code-index.config.json`. Common keys:
+The `modelRouting` section of `data/code-index.config.json` is scaffolded by init (`enabled` defaults to `true` — ruling A, 2026-11-20: fresh installs start with routing accounting / sample growth on; a manual false is preserved), and **an existing config is never overwritten**; unlike the two layers above, this section is read only from `data/code-index.config.json`. Common keys:
 
 | Key | Meaning |
 |---|---|
-| `enabled` | Master switch; gates three things — the per-turn `[model-routing]` tier line, L1 classification (classifyPrompt), and routing-log persistence — all stop when off. Auto traffic is routed the same way regardless (S6-F9, 2026-11-11; aligned with model-routing.md §5) |
+| `enabled` | Master switch (default `true` since ruling A, 2026-11-20); gates three things — the per-turn `[model-routing]` tier line, L1 classification (classifyPrompt), and routing-log persistence — all stop when off. Auto traffic is routed the same way regardless (S6-F9, 2026-11-11; aligned with model-routing.md §5) |
 | `brandPriority` | Within-tier brand call order of the four-tier chains (default glm,deepseek,qwen,minimax,kimi,grok,claude,gpt,gemini); does not affect tier assignment |
 | `modelTiers` | Brand three-grade default table (2026-11-06 v4, adjusted in v4.1): `{normal:[deepseek,glm,qwen,minimax]→R2, mid:[kimi,grok,gemini]→R3, high:[claude,gpt]→R4}`; unrecognized brands fall back to normal. pro/max is not special — tier semantics map one-to-one onto brand grades |
 | `lightSuffixes` | Lightweight-version suffixes (default flash,preview,coding,code,coder,turbo,mini,air,nano,event,haiku,luna,lite,base,sol,sonnet): a hit demotes one tier from the brand default (floor R1; flash is always R1) |
@@ -311,6 +312,7 @@ The `modelRouting` section of `data/code-index.config.json` is scaffolded by ini
 | ~~l2Live~~ | Same as above: legacy key no longer read; live L2 fusion vote always on (lexical R1 + kNN multi → rescue R2; R2 + R3 vote → rescue R3, rescue-only) |
 | `decisionModel` | The judge model for four-vote auto-signing (localized v4, 2026-11-09: judging is **always local** with zero remote calls — ollama = `models.decision` (tev1:0.8b) / local = `models.localDecision` (resident Strands ONNX q4f16), on the same path as `modelIn`; legacy keys `enabled/model/providers/chunkSize/rRef` are no longer read). Both routing arms and signing thresholds follow the **per-model decision profiles** `profiles` (key = judge backend name; default table: tev1 → arm1 minConf 0.6 / window all-r1, signing 0.4/0.85; strands → 0.5/ambiguous, signing 0.4/0.85; arm2 r3MinConf 0.85; unmatched models fall back to FALLBACK (0.75/ambiguous/0.6/0.9; since S2-F4 on 2026-11-10, arm1 is **shadow-only with live=false** — shadow-logged, never rescues live)). Arm 1 consults lexical-R1 turns per the profile window (tev1 = all R1, strands = confidence ≤0.5), and any judge vote above R1 is always capped at an R2 rescue (one step only — R3 belongs to arm 2, R4 never); arm 2 consults on lexical R2 and rescues to R3 when the judge votes R3 above r3MinConf; judge failure / other votes keep the original tier (fail-open), shadow-logged to `data/usage/r-ref-shadow.jsonl`. If the judge cannot start, decision votes abstain — search and routing are unaffected |
 | Dual-axis labels | Every golden-set row carries two orthogonal axes: `semanticType` (multi/routine/light — the L1/L2/decision consensus, "does this ask for a multi-point restructure?") and `intensityType` (heavy/normal/light — the behavior vote, "how heavy was the work actually done?"). Mixing both into one label had pushed multi accuracy to 0.2; split, each axis is scored on its own (`node code-index/modelRoute.mjs --score-golden-dual`). Both axes are machine-consensus weak truth — no external human anchor |
+| `manualSwitch` | Human-switch truth channel (decided 2026-11-19) `{enabled default true, live default false, upConf 0.8, downConf 0.5, lateralConf 0.3, agreeMin 0.8}`: only human switch actions are collected (gear/model-name changes between adjacent turns of the same session — static default selections are not), upgrades weighted high and downgrades low; **shadow-first** — with the default live=false it only collects and audits the three-way agreement (human vs raw difficulty parse vs outcome), and live=true writes the human tier into golden evidence as the human anchor for tier truth (ledger `data/routing/manual-switch.jsonl`); the raw difficulty parse is a contrast only, never truth (anti-feedback red line) |
 | `tierOptimize` | Self-evolution loop `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`: with enabled=true, every 6h it learns signal weights and thresholds from the golden set, auto-promotes a candidate that passes the out-of-fold gate, and auto-rolls back if cost worsens inside the observation window |
 | `blendNotice` | Injection switch for the auto blended-rate line `{enabled default true}`; routing hosts only — injects the "latest session's actual spend ÷ R3-equivalent spend (R3 = 1x base)" multiplier; off = stops the line, accounting continues |
 | ~~r3Lexical~~ | **Recycled**: the lexical R3 channel and P2 one-strike speedup are **always on** (code constants, not configurable); the word list itself lives in tierClassify.mjs |

@@ -44,6 +44,11 @@ export function createWizardController(deps) {
     ollamaBase,
     openPath = async () => {},
     weightRegistry = null, // 模型下载进度登记簿(2026-11-18 交互同步:自检行/下一步门禁/托盘面板共用)
+    // 2026-11-20 修复:托盘自动补权重与向导在线下载并发写同一 .part(互相删件/字节交错→校验永不过→
+    // 「嵌入模型反复下载无法完成」)。防并发门原是单向的(weightsAuto 避让向导 busy,但向导不避让 auto
+    // ——托盘进程刚起 wizardCtl=null→busy=false,auto 在跑时用户开向导即双写方)。向导作为交互侧
+    // 开跑前先取消 auto(cancel 保留 .part,向导按前缀字节续传,进度零浪费)并等其在途清零。
+    cancelAutoWeights = null,
   } = deps;
   // fetchText/clientVersion/manifestUrl/pins 已随拍板 B 移除(清单下载撤,M4 base 包复用时再回);
   // downloader 实例保留(manifest+downloader 模块原样保留供 M4)。
@@ -213,15 +218,17 @@ export function createWizardController(deps) {
     const KEY = 'OLLAMA_MAX_LOADED_MODELS';
     const WANT = '5';
     try {
+      // S14-3(20261119 夜审):reg 三发带 10s 超时;已配判定改解析 REG_SZ 实际值数值比较(旧 includes('5') 把 15/50/25 误判已配)
       const q = await new Promise((resolve) => {
-        execFile('reg', ['query', 'HKCU\\Environment', '/v', KEY], { windowsHide: true, encoding: 'utf8' }, (e, stdout) => resolve({ ok: !e, stdout: String(stdout || '') }));
+        execFile('reg', ['query', 'HKCU\\Environment', '/v', KEY], { windowsHide: true, encoding: 'utf8', timeout: 10_000 }, (e, stdout) => resolve({ ok: !e, stdout: String(stdout || '') }));
       });
-      if (q.ok && q.stdout.includes(KEY) && q.stdout.includes(WANT)) return { ok: true, already: true };
+      const cur = Number((/REG_SZ\s+(\S+)/.exec(q.stdout || '') || [])[1]);
+      if (q.ok && q.stdout.includes(KEY) && cur === Number(WANT)) return { ok: true, already: true };
       const set = await new Promise((resolve) => {
-        execFile('reg', ['add', 'HKCU\\Environment', '/v', KEY, '/t', 'REG_SZ', '/d', WANT, '/f'], { windowsHide: true, encoding: 'utf8' }, (e) => resolve({ ok: !e }));
+        execFile('reg', ['add', 'HKCU\\Environment', '/v', KEY, '/t', 'REG_SZ', '/d', WANT, '/f'], { windowsHide: true, encoding: 'utf8', timeout: 10_000 }, (e) => resolve({ ok: !e }));
       });
       if (!set.ok) return { ok: false, error: 'reg add 失败' };
-      try { execFile('powershell', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","5","User")'], { windowsHide: true, encoding: 'utf8' }, () => {}); } catch { /* 广播尽力 */ }
+      try { execFile('powershell', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","5","User")'], { windowsHide: true, encoding: 'utf8', timeout: 10_000 }, () => {}); } catch { /* 广播尽力 */ }
       return { ok: true, already: false };
     } catch (e) { return { ok: false, error: String(e?.message || e) }; }
   }
@@ -331,6 +338,14 @@ export function createWizardController(deps) {
       await machine.runEnvChecks().catch(() => {});
       sendState({ ...envelope });
       return { ok: false };
+    }
+    // 2026-11-20 修复:开跑前先停托盘自动补权重,保证单写方(cancel 保留 .part→向导按字节前缀续传,进度零浪费;
+    // auto 侧被取消后按「完成时刻」起算 10min 冷却,不会立刻回来抢写)。
+    if (typeof cancelAutoWeights === 'function') {
+      try {
+        const took = await cancelAutoWeights();
+        if (took) { envelope.installLog.push('[auto] 托盘后台补下载已让位:向导接手续传(断点不丢)'); sendState({ ...envelope }); }
+      } catch { /* 让位失败不阻断向导下载(auto 未在途时此调用应为 no-op) */ }
     }
     envelope.installing = 'weights-online';
     envelope.installLog = [];

@@ -13,6 +13,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url'; // S2-4:directRun 解码 %20
 import { DATA_DIR } from './config.mjs';
 import { labelFromCounts } from './tierTruth.mjs';
 import { normalizeType } from './classify.mjs';
@@ -43,7 +44,10 @@ function voteLabel(voters) {
   const [top, n] = entries[0];
   const tied = entries.length > 1 && entries[1][1] === n;
   const topSources = (detail[top] || []).length;
-  return { type: (!tied && n >= 2 && topSources >= 2) ? top : null };
+  const ok = !tied && n >= 2 && topSources >= 2;
+  // 1B(20261119):与正本 autoLabel.voteLabel 同口径——行为票明确相左时否决文本联盟
+  const behaviorOpposes = ok && voters.behavior && voters.behavior.type && normalizeType(String(voters.behavior.type)) !== normalizeType(top);
+  return { type: (ok && !behaviorOpposes) ? top : null };
 }
 
 export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) {
@@ -179,7 +183,7 @@ export function calibrateProfile({ dataDir = DATA_DIR, backend = 'tev1' } = {}) 
   return { out, arm1, signing, arm2Candidates, arm2Rows: arm2Rows.length, over1200: over(1200), over800: over(800), legacyLengthRows, backend: COL };
 }
 
-const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (directRun) {
   const i = process.argv.indexOf('--data');
   const b = process.argv.indexOf('--backend');

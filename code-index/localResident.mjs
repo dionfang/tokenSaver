@@ -58,9 +58,9 @@ function send(res, status, body) {
 }
 
 async function loadEmbedder(modelId) {
-  const { env, pipeline } = await import('@huggingface/transformers');
+  const { env, pipeline } = await (await import('./transformersLoader.mjs')).loadTransformers();
   env.cacheDir = HF_CACHE_DIR;
-  env.allowLocalModels = false;
+  env.allowLocalModels = true; // S4-F2(20261120 夜):与 2026-11-19 embed 修同口径统一——本地 cacheDir 命中优先,离线/受限网络不强制远端解析
   // CPU 线程上限(2026-11-14 用户定案):常驻会话同时承接 embed.mjs 的批量复用路径——批量在此跑时
   // 不允许拉满 CPU;查询单条本就轻,限线程无感。0=全核(旧行为)。
   const cap = Math.max(0, Number(loadConfig().embedCpuThreads) || 0);
@@ -180,7 +180,8 @@ export async function stopLocalResident() {
 }
 
 function startDetached() {
-  return spawnLogged(path.join(here, 'localResident.mjs'), LOG_PATH, here).pid;
+  try { return spawnLogged(path.join(here, 'localResident.mjs'), LOG_PATH, here).pid; }
+  catch (e) { console.error(`[warn] localResident 拉起失败:${e && e.message ? e.message : e}`); throw e; } // S7-9:拉起失败补告警
 }
 
 /** 保证与当前 config 模型一致的常驻进程在跑。返回 /health;超时或失败为 null。
@@ -251,9 +252,14 @@ export async function residentHealth(ms = 3000) {
 }
 
 /** 常驻进程可用时返回向量行,否则 null(调用方改在本进程加载)。 */
-export async function residentEmbed(texts) {
+/** L2 融合票(可选)的常驻嵌入请求预算(20261120 用户裁定修复「auto 经常无响应」):
+ *  常驻 /embed 卡死(死 pid 错配/runner 挂起)时旧预算 120s 每回合白等 ⇒ 收紧到 10s,
+ *  到点 fail-open 弃权(embedIntent 侧既有的 6s/8s 预算同族)。黄金值锚:residentEmbed.test 恒断言。 */
+export const RESIDENT_EMBED_TIMEOUT_MS = 10_000;
+
+export async function residentEmbed(texts, ms = RESIDENT_EMBED_TIMEOUT_MS) {
   if (!Array.isArray(texts) || !texts.length) return null;
-  const json = await postJson('/embed', { texts }, 120000);
+  const json = await postJson('/embed', { texts }, ms);
   if (!Array.isArray(json?.embeddings) || json.embeddings.length !== texts.length) return null;
   return json.embeddings;
 }

@@ -61,24 +61,15 @@ export function modelLamps(health, { localWeights = {} } = {}) {
  *  原 emoji 灯在 Windows 托盘 tooltip 单色渲染成灰圈(用户实测不分红黄绿)→ 改文字状态词,
  *  灯语义同 modelLamps(绿=正常,黄=未驻留/未缓存,红=未安装);Windows tooltip ≤127 字符,
  *  strands id 用向导同款短形 dir(quant)。纯函数,快照缺灯时给获取中兜底。 */
-export function modelTooltip(snapshot) {
-  const m = snapshot?.lamps?.models;
-  if (!m) return '模型状态获取中…';
-  const names = snapshot?.models || {};
-  const local = snapshot?.modelIn === 'local';
-  const pretty = (id) => {
-    const s = String(id ?? '');
-    if (!s.startsWith('strands:')) return s;
-    const p = s.split(':'); // [strands, dir, quant?]
-    return `${p[1] ?? ''}(${p[2] ?? 'quantized'})`;
-  };
-  const LAMPW = { green: '正常', yellow: '未驻留', red: '未安装' };
-  const rows = [
-    ['嵌入模型', local ? names.localEmbedding : names.embedding, m.embedding],
-    ['精排模型', local ? names.localReranker : names.reranker, m.reranker],
-    ['决策模型', local ? names.localDecision : names.decision, m.decision],
-  ];
-  return rows.map(([t, n, l]) => `${LAMPW[l] || '未知'} ${t} ${n ? pretty(n) : '(未知)'}`).join('\n');
+/** 托盘悬浮文案(20261120 用户裁定,火绒式三行):产品名 / 客户端版本 / 公共决策包标识(builtAt)。
+ *  模型启动状态整块移去状态面板(悬浮只答「装的哪版、用的哪个包」);未导入 base 时第三行明示。
+ *  Windows tooltip 127 字符上限,三行约 60 字符安全。 */
+export function appTooltip(snapshot, version) {
+  const base = snapshot?.lamps?.detail?.baseBuiltAt;
+  const baseLine = base
+    ? `公共决策包:${String(base).slice(0, 16).replace('T', ' ')}`
+    : '公共决策包:未导入';
+  return `TokenSaver\n版本:${version || '未知'}\n${baseLine}`;
 }
 
 /** §5.3.2 嵌入状态灯(含 empty)。vectors={embExists,meta} 由采集层读 data/vectors/<modelIn>/。 */
@@ -105,9 +96,10 @@ export function knnLamp({ knn }) {
   const baseEntries = knn?.baseEntries ?? null;
   const localEntries = knn?.localEntries ?? null;
   const baseExists = knn?.baseExists === true;
-  if (!knn || !knn.localExists) return { lamp: 'red', notes: ['本地 local 向量 KNN 不存在(先完成嵌入)'], baseEntries, localEntries, baseExists };
-  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用)'], baseEntries, localEntries, baseExists };
-  return { lamp: 'green', notes: [], baseEntries, localEntries, baseExists };
+  const baseBuiltAt = knn?.baseBuiltAt ?? null;
+  if (!knn || !knn.localExists) return { lamp: 'red', notes: ['本地 local 向量 KNN 不存在(先完成嵌入)'], baseEntries, localEntries, baseExists, baseBuiltAt };
+  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用)'], baseEntries, localEntries, baseExists, baseBuiltAt };
+  return { lamp: 'green', notes: [], baseEntries, localEntries, baseExists, baseBuiltAt };
 }
 
 /** §5.3.4 三端钩子灯:直接映射 hooksStatus.mjs 的 state;拿不到结果(未跑/失败)按 absent 不判红。 */
@@ -141,11 +133,12 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
   const knnDone = Number.isFinite(knnCovered) ? Math.max(fileDone, knnCovered) : fileDone;
   const knnTotal = exemplarCount ?? null;
   const knnPct = knnTotal > 0 ? (knnDone >= knnTotal ? 100 : Math.floor((knnDone / knnTotal) * 100)) : null;
-  // 公共决策包:已下载时分子=包内条数,分母同样是样本库条数;未下载 done=null
+  // 公共决策包(2026-11-19 修:下载完不变绿/无 123/123(100%)):base 是自含权威层,
+  // 分母=包内自身条数(与本地样本数无关)。旧版分母=exemplarCount,全新机本地样本=0→pct=null 永不到100。
+  // 导入为整文件原子落位:存在即完整 → done=total=包内条数 → 100% 绿满条。
   const knnBaseDone = knnR.baseExists ? (knnR.baseEntries ?? 0) : null;
-  const knnBaseTotal = knnTotal;
-  const knnBasePct = knnBaseDone != null && knnBaseTotal > 0
-    ? (knnBaseDone >= knnBaseTotal ? 100 : Math.floor((knnBaseDone / knnBaseTotal) * 100)) : null;
+  const knnBaseTotal = knnBaseDone;
+  const knnBasePct = knnBaseDone != null ? (knnBaseTotal > 0 ? 100 : 0) : null;
   return {
     models,
     embed: embed.lamp,
@@ -163,6 +156,7 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
       knnBasePct,
       baseEntries: knnR.baseEntries,
       baseExists: knnR.baseExists === true,
+      baseBuiltAt: knnR.baseBuiltAt ?? null,
       localEntries: knnR.localEntries,
       missing,
       embedReasons: embed.reasons,

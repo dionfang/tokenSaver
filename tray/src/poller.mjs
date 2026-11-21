@@ -177,12 +177,14 @@ export function createPoller(deps) {
       modelIn: health?.modelIn ?? null,
       models: health?.models ?? null, // 模型名(tooltip 呈现用,2026-11-17)
       consent,
+      localWeights, // 2026-11-18:供托盘自动补权重决策(缺失=false)
     };
     onSnapshot(snapshot);
     if (allowSlow) {
       const due = shouldSlowRefresh({ lastSlowAt: state.lastSlowAt, nowMs: now(), stale, intervalMs: slowIntervalMs });
       const lampDue = needsLampRefresh(lamps, cache?.at ?? null, now()) && now() - state.lastSlowAt >= slowIntervalMs; // 灯黄且缓存旧:受 60s 节流防风暴
-      if (due || lampDue) slowRefresh(lampDue && !due ? 'lamp' : 'tick');
+      // S14-F8(20261118 同族):fire-and-forget async 无 catch → 未处理 rejection 风险
+      if (due || lampDue) slowRefresh(lampDue && !due ? 'lamp' : 'tick').catch(() => {});
     }
     return snapshot;
   }
@@ -192,6 +194,7 @@ export function createPoller(deps) {
     localExists: k.local?.exists === true,
     baseEntries: k.base?.entries ?? null,
     localEntries: k.local?.entries ?? null,
+    baseBuiltAt: k.base?.builtAt ?? null, // 20261120:托盘悬浮第三行=公共决策包标识(builtAt)
   } : null);
 
   /** 慢通道:spawn status.mjs(30s 超时)刷新缓存与 last-status;失败回退读 last-status.txt。

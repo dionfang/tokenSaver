@@ -120,8 +120,18 @@ export function openDb(dbPath = DEFAULT_DB) {
   return { error: `db 打不开(尝试:${cands.join(' , ')})` };
 }
 
-/** 人类消息过滤:role=user 且非 system_reminder/agent_listing_delta 注入。 */
-const isInjectedMsg = (dataStr) => dataStr.includes('"kind":"system_reminder"') || dataStr.includes('agent_listing_delta');
+/** 人类消息过滤:role=user 且非注入。S4-F1(2026-11-20 夜):判别键主要在 message 级 metadata.source
+ *  (todo_reminder 等,实弹 46% 人类消息为 TodoWrite 提醒、108 对齐行混入 10 行注入)——先按 source 剔除
+ *  非人类来源,再按 message data 字面兜底(source 缺席但 data 带 kind/agent_listing 形态)。 */
+const INJECTED_MSG_SOURCES = new Set(['todo_reminder', 'system_reminder', 'agent_listing']);
+const isInjectedMsg = (dataStr, meta) => {
+  const src = meta && meta.metadata ? meta.metadata.source : null;
+  if (typeof src === 'string' && INJECTED_MSG_SOURCES.has(src)) return true;
+  return dataStr.includes('"kind":"system_reminder"') || dataStr.includes('agent_listing_delta');
+};
+
+/** part 级文本兜底:source 与 kind 都缺席、提醒文本本体直接落在 parts 的注入形态(实弹 10 行注入行全为此形态)。 */
+const isInjectedPromptText = (t) => String(t).includes("TodoWrite tool hasn't been used");
 
 function textOfPart(data) {
   try {
@@ -141,12 +151,15 @@ export function loadDbMessages({ db, turnMs = 15 * 60 * 1000 } = {}) {
   const msgs = [];
   const inj = db.prepare("SELECT id, session_id, time_created, data FROM message WHERE json_extract(data, '$.role') = 'user' ORDER BY time_created").all();
   for (const m of inj) {
-    if (isInjectedMsg(String(m.data || ''))) continue;
+    let data = null;
+    try { data = JSON.parse(String(m.data || '')); } catch { /* 损坏行按字面兜底判注入 */ }
+    if (isInjectedMsg(String(m.data || ''), data)) continue;
     const parts = db.prepare("SELECT data FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'text' ORDER BY sequence").all(m.id);
     const text = parts.map((p) => textOfPart(p.data)).filter(Boolean);
     if (!text.length) continue;
+    if (text.some((t) => isInjectedPromptText(t))) continue;
     let model = null;
-    try { model = JSON.parse(m.data).modelSelection?.modelId || null; } catch { /* 无模型字段可空 */ }
+    try { model = data?.modelSelection?.modelId || null; } catch { /* 无模型字段可空 */ }
     msgs.push({ id: m.id, session: m.session_id, ts: num(m.time_created), prompt: text.join('\n'), model });
   }
   // 会话内按序回放:下一条人类消息 ts 决定统计窗右界
@@ -291,7 +304,8 @@ export function buildEvidence({ usageFile = DEFAULT_USAGE, dbPath = DEFAULT_DB, 
       const seg = segOf[axis[k].i];
       if (!seg) continue;
       const isStart = seg.human.__idx === axis[k].i;
-      const pkeyHit = r.promptHead ? promptKey(r.promptHead) === promptKey(d.prompt) : false;
+      // 20261119-2-S4-F2:proxy promptHead 是 200 字口径(400 侧归一后对 >200 字 prompt 恒不等),join 统一按 200 字比对
+      const pkeyHit = r.promptHead ? promptKey(r.promptHead) === promptKey(d.prompt, 200) : false;
       const delta = Math.abs(r.ts - d.ts);
       const cand = { r, seg, isStart, pkeyHit, delta, modelHit: modelAgree(r.served, d.model) };
       if (!best
@@ -304,6 +318,8 @@ export function buildEvidence({ usageFile = DEFAULT_USAGE, dbPath = DEFAULT_DB, 
         best = cand;
       }
     }
+    // 窗内行全部落在任务段外时 best 为空;跳过计 missed,不能解构 null 中断整次回放。
+    if (!best) { missed += 1; continue; }
     const { seg, pkeyHit } = best;
     if (pkeyHit) pkeyJoined += 1;
     const key = `${seg.conv}|${seg.human.ts}`;

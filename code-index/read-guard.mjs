@@ -140,7 +140,7 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
  *  命中两类:①git clean 带 -x/-X(会连带删掉被 gitignore 的 data/ab);②递归删除命中数据目录或其保护祖先。
  *  旧路径 test/ab 仍在正则内(防历史脚本/文档引用期残留)。 */
 const PROTECTED_DATA = /(^|[\\/])(?:test[\\/]ab|agent_reports[\\/]ab-logs)([\\/]|$)/i;
-const RM_CMDS = /^(?:rm|rmdir|del|erase|remove-item)$/i;
+const RM_CMDS = /^(?:rm|rmdir|del|erase|remove-item|rd)$/i; // S3-F2:补 rd(cmd 递归删)
 /** 宿主工具输出截断阈值(ZCode persisted-output >32KB 存盘只给 2KB 预览;Qoder/Cursor 近似同量级):
  *  Bash 拦截记账的节约上限——放行时宿主也会截断,超过它的部分不算"省下的"。 */
 const HOST_OUTPUT_CAP_BYTES = 32 * 1024;
@@ -149,33 +149,80 @@ function expandTarget(t, cwd) {
   let s = String(t || '').trim().replace(/^["']|["']$/g, '');
   s = s.replace(/^(\$\{?PWD\}?|\$\(pwd\)|%CD%)[\\/]/i, '');
   if (!s) return null;
-  try { return path.resolve(cwd, s); } catch { return null; }
+  try {
+    let abs = path.resolve(cwd, s);
+    // 20261120-S3-F2(夜审):Windows 8.3 短名(XXXX~N)绕过——只对**命令里字面带短名段**的目标做
+    // realpathSync.native 归一(rm -rf AGENT_~1 曾全 allow);cwd 前缀自带的短名(如 ADMINI~1)不动,
+    // 避免归一后与 cwd 两侧异形、相对比较全失效。归一出的真实路径照走 PROTECTED_DATA/protectedUnder。
+    if (/[~][0-9]/.test(s) && fs.existsSync(abs)) {
+      try { abs = fs.realpathSync.native(abs); } catch { /* 归一失败走字面 */ }
+    }
+    return abs;
+  } catch { return null; }
 }
 
-/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 agent_reports/ab-logs(或旧 test/ab/result)传入。 */
+/** S3-1(20261119 夜审):目录盘上实存核验——目标目录(-C 仓/递归删除目标)下现有 agent_reports/ab-logs
+ *  (或旧 test/ab/result)即视为含保护数据。cwd 单点 hasProtected 挡不住跨 cwd 形态;按存在性核验,无数据目录不误伤。 */
+function protectedUnder(dir) {
+  if (!dir || typeof dir !== 'string') return false;
+  try {
+    return fs.existsSync(path.join(dir, 'agent_reports', 'ab-logs')) || fs.existsSync(path.join(dir, 'test', 'ab', 'result'));
+  } catch { return false; }
+}
+
+/** 纯函数:判断命令是否会清掉受保护的实验数据。hasProtected 由调用方按 cwd 下是否存在 agent_reports/ab-logs(或旧 test/ab/result)传入。
+ *  S3-1(20261119 夜审):跨 cwd 形态不再只看 cwd 单点——git -C 目标仓与递归/通配删除的绝对目标按盘上实存核验(protectedUnder)。 */
 export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected = false } = {}) {
   const cmd = String(command ?? '');
   if (!cmd.trim()) return { permission: 'allow' };
-  for (const raw of cmd.split(/&&|\|\||;|\n/)) {
+  // 20261120-S3-F2(夜审):cwd 自身含 8.3 短名段(如 ADMINI~1 前缀)先归一长形——expandTarget 对字面
+  // 短名目标做 realpath 归一会得到整条长形路径,两侧异形则 covers/path.relative 全失效误放行。
+  try { if (/[~][0-9]/.test(cwd) && fs.existsSync(cwd)) cwd = fs.realpathSync.native(cwd); } catch { /* 归一失败走原样 */ }
+  // 20261120-S3-F1(夜审):分割正则补单管道 |——旧分割只切 &&/||/;/换行,管道右侧的 rm/git clean 整段逃判
+  // (echo x | rm -rf test/ab 与 cat f | xargs rm -rf agent_reports/ab-logs 曾 allow)。
+  // alternation 左优先:模式串里 \|\| 在裸 \| 之前,双管道整体先匹配,不会被拆成两个单管道。
+  for (const raw of cmd.split(/&&|\|\||\||;|\n/)) {
     const seg = raw.trim();
     if (!seg) continue;
-    const tokens = seg.split(/\s+/).filter(Boolean);
-    if (!tokens.length) continue;
+    const tokens0 = seg.split(/\s+/).filter(Boolean);
+    if (!tokens0.length) continue;
+    // 20261120-S3-F1b(NP1b):管道右侧「xargs rm …」形态——头是 xargs 本身无害,危险命令嵌在其参数里;
+    // 跳到 xargs 后的首个删除/git 命令再走删除判定(与单管道分段同族的第二形态,夜审 cat f | xargs rm -rf 实例)。
+    let tokens = tokens0;
+    if (/^xargs(\.exe)?$/i.test(path.basename(tokens0[0].replace(/^["']|["']$/g, '')).toLowerCase())) {
+      const dangerCmd = (t) => { const b = path.basename(String(t).replace(/^["']|["']$/g, '')).toLowerCase(); return RM_CMDS.test(b) || /^git(\.exe)?$/.test(b); };
+      const k = tokens0.findIndex((t, idx) => idx > 0 && dangerCmd(t));
+      if (k <= 0) continue; // xargs 后无删除命令:无害(如 xargs grep)
+      tokens = tokens0.slice(k);
+    }
     const head = tokens[0].replace(/^["']|["']$/g, '');
+    const headBase = path.basename(head).toLowerCase(); // S3-F2:全路径 git.exe/rm 也认
     // ①git clean -x / -X:连被 gitignore 的文件一起删(旧 data/ab 曾因此被误删)
-    if (/^git(\.exe)?$/i.test(head)) {
+    if (/^git(\.exe)?$/.test(headBase)) {
       const sub = tokens.slice(1).map(t => t.replace(/^["']|["']$/g, ''));
       if (sub.includes('clean') && sub.some(t => /^-[A-Za-z]*[xX][A-Za-z]*$/.test(t) || /^--ignored/i.test(t))) {
-        if (hasProtected) return { permission: 'deny', kind: 'Clean', reason: 'git clean 带 -x/-X' };
+        // S3-1(20261119 夜审):-C 目标仓实存核验——clean 的作用域是 -C 指的仓,不是会话 cwd;
+        // 他仓 cwd 的 `git -C <受保护仓> clean -x` 曾按 cwd 单点判定放行。
+        let repoDir = null;
+        for (let i = 0; i < sub.length; i++) {
+          if (sub[i] === '-C' && sub[i + 1] != null) { repoDir = sub[i + 1]; break; }
+          const glued = /^-C(.+)$/.exec(sub[i]);
+          if (glued) { repoDir = glued[1].replace(/^["']|["']$/g, ''); break; }
+        }
+        let repoHas = false;
+        if (repoDir != null) { try { repoHas = protectedUnder(path.resolve(cwd, repoDir)); } catch { repoHas = false; } }
+        if (hasProtected || repoHas) {
+          return { permission: 'deny', kind: 'Clean', reason: repoDir != null ? `git clean 带 -x/-X(-C 目标仓含保护数据 ${repoDir})` : 'git clean 带 -x/-X' };
+        }
       }
       continue;
     }
     // ②递归删除命中 data/ab 或父目录 data
-    const isRm = RM_CMDS.test(head);
+    const isRm = RM_CMDS.test(headBase) || (headBase === 'find' && tokens.includes('-delete')); // S3-F2:find -delete 视同递归删
     if (!isRm) continue;
     const rest = tokens.slice(1);
     // 递归标志:POSIX 组合式(-rf/-fr/-R)、长写(--recurse/--recursive)、cmd 风格斜杠(/s /r)
-    const recursive = rest.some((t) => {
+    const recursive = (headBase === 'find' && rest.includes('-delete')) || rest.some((t) => { // S3-F2:find -delete 恒递归
       if (/^--/.test(t)) return /^--(recurse|recursive)$/i.test(t);
       if (/^[-/]/.test(t)) return /[rRs]/.test(t.slice(1));
       return false;
@@ -206,6 +253,10 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
       if (PROTECTED_DATA.test(absDir) || /(^|[\\/])data$/i.test(norm)) {
         if (isAbs || hasProtected) return { permission: 'deny', kind: 'Clean', reason: `通配删除命中保护目录 ${bare}(非递归也可清空证据)` };
       }
+      // 2A(20261119 用户裁定):data/ 子目录通配清空同拦(rm data/routing/* 等)
+      { const rel = path.relative(path.resolve(cwd, 'data'), norm); if ((rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) && (isAbs || hasProtected)) return { permission: 'deny', kind: 'Clean', reason: `通配删除命中本地数据目录 ${bare}(data/ 子目录为本地资产)` }; }
+      // S3-1(20261119 夜审):绝对路径通配打他仓根,与递归分支同口径盘上核验(相对路径仍按 hasProtected 不误伤)
+      if (isAbs && protectedUnder(absDir)) return { permission: 'deny', kind: 'Clean', reason: `通配删除目标目录含保护数据 ${bare}` };
       if (hasProtected) {
         if (covers(absDir, path.resolve(cwd, 'agent_reports', 'ab-logs'))
           || covers(absDir, path.resolve(cwd, 'test', 'ab'))
@@ -228,6 +279,12 @@ export function evaluateCleanGuard({ command, cwd = process.cwd(), hasProtected 
       if (PROTECTED_DATA.test(abs)) return { permission: 'deny', kind: 'Clean', reason: `递归删除命中 ${abs}` };
       const norm = abs.replace(/[\\/]+$/, '');
       if (/(^|[\\/])data$/i.test(norm)) return { permission: 'deny', kind: 'Clean', reason: `递归删除命中 ${abs}` };
+      // 2A(20261119 用户裁定):data/ 全子目录(routing/vectors/usage/nightly…)为本地学习资产,
+      // 删了不可再生且无版本控制兜底——定向递归删同样拦截,不止整 data 目录。
+      { const rel = path.relative(path.resolve(cwd, 'data'), norm); if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return { permission: 'deny', kind: 'Clean', reason: `递归删除命中本地数据目录 ${abs}(data/ 子目录为本地资产,禁递归清理)` }; }
+      // S3-1(20261119 夜审):仓根实存核验——`rm -rf <他仓根>` 路径本体不带保护段、hasProtected 又按本 cwd
+      // 判 false ⇒ 曾放行;目标目录实存且其下有保护数据即拦。与 -C 目标仓同一 protectedUnder。
+      if (protectedUnder(abs)) return { permission: 'deny', kind: 'Clean', reason: `递归删除目标含保护数据目录 ${abs}` };
       if (norm === path.resolve(cwd) || /(^|[\\/])\*$/.test(norm)) {
         return { permission: 'deny', kind: 'Clean', reason: `递归删除命中工作区根 ${norm}` };
       }

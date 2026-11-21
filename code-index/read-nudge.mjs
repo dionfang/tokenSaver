@@ -77,8 +77,11 @@ export function evaluateNudge({ hookEventName, toolName, toolInput, toolResponse
     // 按文本 bytes/4 折算曾记出两个数量级的虚账(3MB jpg = 78.6 万 token)。白名单与 read-guard 同一份口径。
     // S3-F1(2026-11-11 夜审):再补 NUL 嗅探——名义文本扩展名实为二进制的结果按 bytes/4 折账同样虚高
     // (read-guard 有同款嗅探;此处只看结果头部 8KB,NUL=二进制不记账)。
+    // 20261120-S3-F3(夜审):嗅探面扩全三路载荷——stdout 之外,Qoder 的 resp.file?.content 与 resp.content
+    // 头部 8KB 同嗅(此前只嗅 stdout,Qoder 二进制载荷仍按 bytes/4 记虚账)。
+    const headNul = (s) => typeof s === 'string' && s.slice(0, 8192).includes('\u0000');
     const extsOk = resolveGuardExts().has(path.extname(key).toLowerCase().replace(/^\./, ''))
-      && !(typeof resp.stdout === 'string' && resp.stdout.slice(0, 8192).includes('\u0000'));
+      && !(headNul(resp.stdout) || headNul(resp.content) || headNul(resp.file?.content));
     const st = h.reads && typeof h.reads[key] === 'object' ? { ...h.reads[key] } : { ranges: 0, bytes: 0, lastAt: 0, nudgedAt: 0 };
     let context;
     if (ranged) {

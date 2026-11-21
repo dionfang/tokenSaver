@@ -12,6 +12,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url'; // S2-4:directRun 解码 %20
 import { DATA_DIR } from './config.mjs';
 
 const readJsonl = (file) => {
@@ -112,7 +113,7 @@ export function auditRRef({ dataDir = DATA_DIR, now = new Date() } = {}) {
   return { report: out, shadowRows: shadow.length, d4Rows: d4.length, arms: byArm, d6Candidates: d6Candidates.length, latencyP95: p95(lat) };
 }
 
-const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (directRun) {
   const i = process.argv.indexOf('--data');
   const dir = i > 0 ? process.argv[i + 1] : DATA_DIR;

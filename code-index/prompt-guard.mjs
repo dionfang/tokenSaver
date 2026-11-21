@@ -265,7 +265,8 @@ async function liveStatusLine(payload) {
       scanQoderUsage({});
     } catch { /* 扫不动就按已有记录计,不拖注入 */ }
     const { assessModelStatusCached } = await import('./modelStatus.mjs');
-    const { relay } = await assessModelStatusCached(sid || null);
+    // 相位=prev(2026-11-20 用户定案):UserPromptSubmit 注入时本轮请求尚未发出,【】段标注【上轮:…】
+    const { relay } = await assessModelStatusCached(sid || null, { phase: 'prev' });
     // 状态句落档(2026-11-04):轮内刷新/回合末结算用 prevTurnId 判定回合边界、拿前轮模型采样
     if (rawSid && relay) {
       try {
@@ -293,7 +294,7 @@ async function main() {
   let payload = {};
   try { payload = JSON.parse(raw || '{}'); } catch { /* 坏载荷只跳过预取 */ }
   const host = hostFromArgv();
-  const cfg = loadConfig();
+  const cfg = loadConfig({ soft: true }); // S3-F5:坏 config 不整退钩子(fail-open)
   // 本地代理保活(ZCode/Qoder 路由宿主):选了虚拟档位 auto 的会话,请求必经 127.0.0.1:8117;
   // 代理没跑就直接 connection refused ⇒ 在请求发出之前把它拉起来(判据见 proxyKeepalive.mjs)。
   // fail-open:失败只留痕,不阻塞用户输入。
@@ -429,6 +430,13 @@ if (process.argv.includes('--check')) {
     if (grown.state === 'grown') {
       // 待签清单已随四票自动代签废除(2026-11-02):此处不再产出 pending-review,只落运行留痕
       fs.appendFileSync(path.join(DATA_DIR, 'usage', 'autoexemplars.log'), JSON.stringify({ ts: Date.now(), ...grown }) + '\n');
+      // auto×费率动态显示名刷新(20261120 用户裁定):与 6h 黄金集代签自动拉起同拍——grow 真跑了才刷,
+      // 不再于会话开启(SessionStart)时刷新。grow 被 6h 节流跳过则同样跳过刷名。
+      try {
+        const { refreshAutoNameFromBlend } = await import('./virtualProvider.mjs');
+        const rn = refreshAutoNameFromBlend();
+        if (rn.changed) fs.appendFileSync(path.join(DATA_DIR, 'usage', 'autoexemplars.log'), JSON.stringify({ ts: Date.now(), event: 'auto-name-refresh', note: rn.note }) + '\n');
+      } catch { /* 刷名失败不影响其余功能 */ }
     }
   } catch { /* 扩样失败不影响任何功能 */ }
   // 难度档迭代优化(2026-11-04):扩样之后跑一轮——学逐信号倍数 + 搜门槛小网格,折外代价过门控才落档案。

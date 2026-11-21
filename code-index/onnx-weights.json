@@ -1,0 +1,5 @@
+{
+  "Xenova/jina-embeddings-v2-base-zh": { "onnx/model_quantized.onnx": 161565239, "tokenizer.json": 2030772 },
+  "Xenova/bge-reranker-base": { "onnx/model_quantized.onnx": 279301077, "tokenizer.json": 17098079 },
+  "strands:strands-decider-2B-hobson-v19": { "model_q4f16.onnx": 527999, "model_q4f16.onnx_data": 1093105664 }
+}

@@ -8,6 +8,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { atomicWriteFileSync } from './proc.mjs'; // S4-5:原子写
 import { fileURLToPath } from 'node:url';
 import { loadKnownAnnotations, DATA_DIR } from './config.mjs';
 
@@ -79,6 +80,6 @@ for (const proj of [...tree.keys()].sort((a, b) => projLines(b) - projLines(a) |
 }
 
 const OUT_PATH = path.join(DATA_DIR, 'CODE_DETAILS.md');
-fs.writeFileSync(OUT_PATH, out.join('\n'), 'utf8');
+atomicWriteFileSync(OUT_PATH, out.join('\n')); // S4-5:原子写(可再生文档也防半文件)
 console.log(`[ok] ${OUT_PATH}`);
 console.log(`     ${byFile.size} 文件、${[...byFile.values()].reduce((s, m) => s + m.size, 0)} 个符号,文档 ${(fs.statSync(OUT_PATH).size / 1024).toFixed(0)}KB / ${out.length} 行`);

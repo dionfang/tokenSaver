@@ -12,7 +12,8 @@ import path from 'node:path';
 export const MIN_NODE_MAJOR = 20;
 
 const sh = (execFile, cmd, args) => new Promise((resolve) => {
-  execFile(cmd, args, { windowsHide: true, encoding: 'utf8' }, (e, stdout, stderr) => resolve({ ok: !e, stdout: String(stdout || ''), stderr: String(stderr || '') }));
+  // S14-3(20261119 夜审):15s 超时——refreshPathForNodeDiscovery 经它连发两次 powershell,AV 扫描/重载挂死时"重新自检"不得无上限同步等待
+  execFile(cmd, args, { windowsHide: true, encoding: 'utf8', timeout: 15_000 }, (e, stdout, stderr) => resolve({ ok: !e, stdout: String(stdout || ''), stderr: String(stderr || '') }));
 });
 
 /** node -v 输出解析(纯):'v22.11.0\n' → '22.11.0'。 */

@@ -194,9 +194,9 @@ if (canVector) {
       if (hosted) {
         q = hosted[0];
       } else {
-        const { env, pipeline } = await import('@huggingface/transformers');
+        const { env, pipeline } = await (await import('./transformersLoader.mjs')).loadTransformers();
         env.cacheDir = HF_CACHE_DIR;
-        env.allowLocalModels = false;
+        env.allowLocalModels = true; // S4-F2(20261120 夜):与 2026-11-19 embed 修同口径统一——本地 cacheDir 命中优先,离线/受限网络不强制远端解析
         let pipe;
         try {
           pipe = await pipeline('feature-extraction', vmeta.model, { dtype: 'q8' });

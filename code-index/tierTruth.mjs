@@ -22,15 +22,26 @@ const TIERS = ['R1', 'R2', 'R3', 'R4'];
 export function evidenceOf(row = {}) {
   const ev = row.evidence || {};
   const n = (v) => (typeof v === 'string' && !v.trim() ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+  // '—'(影子账本里的"无记录")与空串一律当缺字段,别让脏值冒充合法档位
+  const t = (v) => (typeof v === 'string' && v.trim() && v.trim() !== '—' ? v.trim() : null);
   return {
     calls: n(ev.toolCalls ?? ev.calls),
     writes: n(ev.writeEdits ?? ev.writes),
     reads: n(ev.reads),
     errors: n(ev.errors),
     escalated: ev.escalated === true,
-    // '—'(影子账本里的"无记录")与空串一律当缺字段,别让脏值冒充合法档位
-    servedTier: typeof ev.servedTier === 'string' && ev.servedTier.trim() && ev.servedTier.trim() !== '—' ? ev.servedTier.trim() : null,
+    servedTier: t(ev.servedTier),
+    // S2-1(20261119 夜审):转发上梯事件行的 escalationFrom/To——上梯目标档是影子行里唯一编码
+    // "真值=上梯后档"的字段(loadShadowEvidence 曾丢字段,deriveTierTruth 只能错按 servedTier 推)。
+    escalationFrom: t(ev.escalationFrom),
+    escalationTo: t(ev.escalationTo),
     flagship: ev.flagship === true,
+    // 人工改档锚点(20261119 用户裁定):用户主动改档动作=深思熟虑的档位判断(独立于分类器,非循环)。
+    // 只采「改档动作」不采静态默认选档;升档高权/降档低权。影子先行:manualSwitchLive=true 才采纳。
+    manualSwitch: ev.manualSwitch === true,
+    manualSwitchTo: t(ev.manualSwitchTo),
+    manualSwitchDir: t(ev.manualSwitchDir),
+    manualSwitchLive: ev.manualSwitchLive === true,
   };
 }
 
@@ -61,9 +72,26 @@ export function deriveTierTruth(ev = {}) {
   if (ev.escalated === true) {
     // 上梯那一轮 = 低档真干不动的直接证据 ⇒ 真值取上梯后的目标档;R3 封顶(代理 P2 不上 R4),
     // 已在上限仍标 escalated 时**保持原档**,不能倒挂成低一档(那会把"最强档还失败"误读成"活儿轻")。
-    const from = TIERS.includes(ev.servedTier) ? ev.servedTier : 'R1';
-    const next = ESC_NEXT[from] || from;
-    return { tier: next, confidence: 0.8, rule: `p2-escalated(from ${from})` };
+    // S2-1(20261119 夜审):上梯事件行的 servedTier 记**上梯后**实际服务档(modelRouteProxy 两路写方
+    // 均记上梯目标档;生产 routing-shadow 4 条 escalated 行实测 servedTier=escalationTo)——旧口径
+    // from=servedTier 再 ESC_NEXT 会把 R1→R2 上梯推成 R3。真值单源=escalationTo(与 extractTierEvidence
+    // p2-exact 同口径);缺 escalationTo 按 escalationFrom 推目标,再缺按 servedTier 本身(上梯后档
+    // 即真值,自然满足"R3 封顶保持原档"),全缺才按 R1 起步的旧兜底。
+    const to = TIERS.includes(ev.escalationTo) ? ev.escalationTo : null;
+    const from = TIERS.includes(ev.escalationFrom) ? ev.escalationFrom : null;
+    const served = TIERS.includes(ev.servedTier) ? ev.servedTier : null;
+    const tier = to || (from ? (ESC_NEXT[from] || from) : null) || served || (ESC_NEXT.R1 || 'R2');
+    const via = to ? `to ${to}` : from ? `from ${from}` : served ? `served ${served}` : 'from R1';
+    return { tier, confidence: 0.8, rule: `p2-escalated(${via})` };
+  }
+  // 人工改档锚点(20261119 用户裁定):用户主动改档=经过思考的档位判断,是独立于分类器的用户侧事实
+  // (与 flagship 同类,非预测回灌⇒不触 #14 循环红线)。升档=「当前档干不动」的人工判断(人肉版 P2,高权);
+  // 降档动机混杂(可能省钱/求快而非任务轻)⇒低权;同档换模型难度信号最弱。结果侧上梯证据优先于人工判断,
+  // 故本分支置于 escalated 之后。影子先行:仅 manualSwitchLive=true 采纳,默认只采集+审计不改真值。
+  if (ev.manualSwitch === true && ev.manualSwitchLive === true && TIERS.includes(ev.manualSwitchTo)) {
+    const dir = ev.manualSwitchDir;
+    const conf = dir === 'up' ? 0.8 : dir === 'down' ? 0.5 : 0.3;
+    return { tier: ev.manualSwitchTo, confidence: conf, rule: `human-switch-${dir || 'lateral'}(人工改档锚点${dir === 'down' ? ',动机混杂降权' : dir === 'up' ? ',深思熟虑升档' : ''})` };
   }
   if (writes === null && calls === null) return { tier: null, confidence: 0, rule: 'no-evidence' };
   if (errors !== null && errors >= 2 && (writes === 0 || writes <= 2)) {
@@ -103,7 +131,7 @@ export function tierTruthFromAxes(row = {}) {
 /**
  * 双通道并排:返回 {behavior, map, agree, tier}(tier 取"用哪条做优化目标"的那条,默认行为侧)。
  * 两条都缺 ⇒ tier=null,该行不进量尺。
- * 2026-11-06 双轴:map 通道改走**强度轴优先**(tierTruthFromAxes)——语义轴被当强度用会把 R2 门禁压到 0.362。
+ * 2026-11-06 双轴:map 通道走 tierTruthFromAxes——语义轴优先、强度轴仅回落(口径依据见其头注,不在此重复)。
  */
 export function reconcile(row = {}, { prefer = 'behavior' } = {}) {
   const behavior = deriveTierTruth(evidenceOf(row));

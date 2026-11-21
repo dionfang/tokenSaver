@@ -127,9 +127,9 @@ export async function embedIntentResilient(text, wantModel = null) {
   if (wantModel && localModel && wantModel !== localModel) return null; // 模型守卫:目标不是本地 jina → 拒绝兜底
   try {
     if (!_directPipe) {
-      const { env, pipeline } = await import('@huggingface/transformers');
+      const { env, pipeline } = await (await import('./transformersLoader.mjs')).loadTransformers();
       env.cacheDir = HF_CACHE_DIR;
-      env.allowLocalModels = false;
+      env.allowLocalModels = true; // S4-F2(20261120 夜):与 2026-11-19 embed 修同口径统一——本地 cacheDir 命中优先,离线/受限网络不强制远端解析
       const modelId = cfgL ? cfgL.models.localEmbedding : 'Xenova/jina-embeddings-v2-base-zh';
       try { _directPipe = await pipeline('feature-extraction', modelId, { dtype: 'q8' }); }
       catch {
@@ -207,7 +207,15 @@ export async function pickRangeForFile(absFile, sessionId, { maxLines = 625, cos
   const vmeta = readVectorMeta(backend);
   const embPath = vectorPaths(backend).emb;
   if (!vmeta?.dim || !fs.existsSync(embPath)) return null;
-  if (Number(vmeta.chunks) !== chunks.length) return null; // 块清单与向量不配对,宁可不算
+  if (Number(vmeta.chunks) !== chunks.length) {
+    // S4-2(20261119):重嵌窗口块清单与向量不配对→回退嵌入时快照(与 search 同口径),不再恒 null 静默失效
+    try {
+      const paired = fs.readFileSync(vectorPaths(backend).paired, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const raw0 = fs.readFileSync(embPath);
+      if (paired.length && raw0.byteLength === paired.length * vmeta.dim * 4) chunks = paired;
+      else return null;
+    } catch { return null; }
+  }
   const raw = fs.readFileSync(embPath);
   // 必须带 byteOffset:小文件读出的 Buffer 常落在共享内存池里,漏掉偏移会读到其他对象的数据
   if (raw.byteLength % 4 !== 0) return null;

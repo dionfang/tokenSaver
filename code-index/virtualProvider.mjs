@@ -368,3 +368,16 @@ export function refreshAutoModelName({ home = os.homedir(), rate = null } = {}) 
   }
   return out;
 }
+
+/** auto×费率动态显示名刷新(20261120 用户裁定:唯一挂载点从 SessionStart(auto.mjs)迁到 6h 黄金集代签
+ *  自动拉起)——读 data/usage/auto-blend.json 的全期倍率刷两端条目名。fail-open;返回 {changed,note}。 */
+export function refreshAutoNameFromBlend({ dataDir = DATA_DIR } = {}) {
+  try {
+    const blend = JSON.parse(fs.readFileSync(path.join(dataDir, 'usage', 'auto-blend.json'), 'utf8'));
+    const rate = blend && Number.isFinite(Number(blend.globalRate)) ? Number(blend.globalRate) : null;
+    if (rate == null || rate <= 0) return { changed: false, note: null };
+    const rr = refreshAutoModelName({ rate });
+    const changed = [rr.zcode, rr.qoder].some((x) => x && (x.refreshed || x.seeded));
+    return { changed, note: rr.zcode?.note || rr.qoder?.note || null };
+  } catch { return { changed: false, note: null }; }
+}

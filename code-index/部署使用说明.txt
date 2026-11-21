@@ -84,14 +84,16 @@ TokenSaver 部署使用说明
   启用三步:
     ① init 已自动在 ZCode/Qoder 客户端播种 auto 虚拟模型;
     ② 会话里把模型切换到 auto,即对该会话启用;
-    ③ 建议把 modelRouting.enabled 设为 true(只影响定档建议行,不影响路由本身)。
+    ③ modelRouting.enabled 新装默认已开(2026-11-20 裁定A;控制定档建议行/L1 分类/
+       routing-log 三件事,不影响 auto 路由本身;人工改 false 原样保留)。
 
   接入要求:自定义模型必须以 Anthropic Messages 协议接入——
     ZCode:供应商类型选 anthropic-messages,baseUrl 指向供应商的 anthropic 网关;
     Qoder:条目 protocol 填 anthropic,baseUrl 指向 anthropic 兼容网关。
 
   modelRouting 可配置字段(data/code-index.config.json):
-    enabled                    总开关(默认 false;只影响定档建议行,不影响路由)
+    enabled                    总开关(默认 true,2026-11-20 裁定A;控制定档建议行/L1
+                               分类/routing-log 三件事,不影响 auto 路由本身)
     brandPriority              同档品牌的调用优先序
     modelTiers                 品牌三档默认表(2026-11-06 v4,v4.1 调档):normal=[deepseek,
                                glm,qwen,minimax]→R2 / mid=[kimi,grok,gemini]→R3 /
@@ -263,7 +265,9 @@ existing config is never overwritten):
   Three steps to enable:
     (1) init already seeded the auto virtual model in ZCode/Qoder;
     (2) switch the session model to auto — routing is on for that session;
-    (3) recommended: set modelRouting.enabled to true (only affects the tier line).
+    (3) modelRouting.enabled is already on by default for fresh installs (ruling A,
+        2026-11-20; it gates the tier line, L1 classification and routing-log — auto
+        routing itself is unaffected; a manual false is preserved).
 
   Wiring requirement: custom models must use the Anthropic Messages protocol —
     ZCode: provider type anthropic-messages, baseUrl pointing at the provider's
@@ -272,7 +276,9 @@ existing config is never overwritten):
     gateway.
 
   modelRouting fields (data/code-index.config.json):
-    enabled                    master switch (default false; only affects the tier line)
+    enabled                    master switch (default true since ruling A 2026-11-20;
+                               gates the tier line / L1 classification / routing-log,
+                               not auto routing itself)
     brandPriority              brand call order within a tier
     modelTiers                 brand three-grade default table (2026-11-06 v4,
                                adjusted in v4.1): normal=[deepseek,glm,qwen,minimax]→R2 /

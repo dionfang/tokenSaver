@@ -19,7 +19,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR, loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
+import { DATA_DIR, CONFIG_PATH, loadConfig, OLLAMA_KEEP_ALIVE } from './config.mjs';
+import { L2_LAYER_WEIGHTS as THRESHOLD_L2_LAYER_WEIGHTS } from './thresholds.mjs'; // S14-F4(20261118):层权重单源
 import { atomicWriteFileSync, takeJsonLock as procTakeJsonLock, releaseJsonLock as procReleaseJsonLock } from './proc.mjs';
 import { normalizeType, L1_TYPES, classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration, TIER_FROM_TYPE } from './tierClassify.mjs';
@@ -48,7 +49,10 @@ function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8'))
 // ---------- L2 向量分类 ----------
 
 export function cosine(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || !a.length) return 0;
+  // 2026-11-17 修(PU-001 验证中发现):decodeLayer 解出的向量是 Float32Array,旧 Array.isArray 守卫
+  // 使其恒返 0 ⇒ 生产合并库上 knnClassify 恒 null(L2 票自 v_b64 编码落地起死票)。改为接受数组+TypedArray。
+  const vec = (x) => !!x && typeof x.length === 'number' && x.length > 0 && (Array.isArray(x) || ArrayBuffer.isView(x));
+  if (!vec(a) || !vec(b) || a.length !== b.length) return 0;
   let dot = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i += 1) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
   const d = Math.sqrt(na) * Math.sqrt(nb);
@@ -116,9 +120,18 @@ function readLayerPath(file) {
 export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = false, authority = null, model = null } = {}) {
   const exPath = path.join(dataDir, 'routing', 'exemplars.json');
   const ex = readJson(exPath);
-  if (!ex || !Array.isArray(ex.exemplars) || !ex.exemplars.length) throw new Error(`样本库缺失或为空: ${exPath}`);
   const want = model || currentEmbedModel(); // 可显式指定(测试/服务器离线构建);缺省跟运行配置
-  const cfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
+  if (!ex || !Array.isArray(ex.exemplars) || !ex.exemplars.length) {
+    // 2026-11-19 修(测试机 0.2.1「立即同步」报错[err]样本库缺失或为空):空样本库=无事可做,不再硬失败——
+    // 全新装机尚无代签样本属正常态;存量 local 层保留不动(空样本绝不覆盖现有向量库)。
+    const p0 = vectorsLayerPaths(dataDir, want);
+    const old0 = readFirstExisting([p0.local.slugFile, p0.local.fixedFile]);
+    const oldOk0 = old0 && old0.model === want ? old0 : null;
+    const keep = oldOk0?.vectors ? Object.keys(oldOk0.vectors).length : 0;
+    console.log(`[info] 样本库为空(${exPath}),无需构建决策向量;现有 local 层 ${keep} 条保留不动`);
+    return { ok: keep, embedded: 0, reusedBase: 0, reusedLocal: keep, fail: 0, out: null, dim: oldOk0?.dim || 0, model: want, authority: null, slug: p0.slug, empty: true };
+  }
+  const cfg = (() => { const c = loadConfig({ soft: true }); return c && !c._configError ? (c.exemplars || {}) : {}; })(); // S1-F1(20261120 夜):坏 config 时 loadConfig 的 process.exit 不可捕获,catch 兜底形同虚设——后台路径一律 soft
   const auth = authority || cfg.authority || 'local';
   const paths = vectorsLayerPaths(dataDir, want);
   const base = readFirstExisting([paths.base.slugFile, paths.base.fixedFile]);
@@ -153,7 +166,7 @@ export async function buildVectors({ dataDir = DATA_DIR, embedFn, failFast = fal
   // 嵌入函数与**目标模型**绑定(2026-11-10 修污染):不再经 embedIntent(它跟 config 后端走)——
   // 目标是 ollama/* 就直打 /api/embed,目标是 local/jina 才走常驻+进程内兜底。
   // 否则"config=local、构建目标=ollama"时会把 jina 768 向量冒充 ollama 库(实测污染事件)。
-  const cfgAll = (() => { try { return loadConfig(); } catch { return {}; } })();
+  const cfgAll = (() => { const c = loadConfig({ soft: true }); return c && !c._configError ? c : {}; })(); // S1-F1(20261120 夜):同上 soft 化,坏 JSON 回落默认 ollamaBase
   const ollamaBase = cfgAll.ollamaBase || 'http://localhost:11434';
   const ollamaName = want.startsWith('ollama/') ? want.slice('ollama/'.length) : null;
   const embedForWant = ollamaName
@@ -242,7 +255,10 @@ export function loadVectors(dataDir = DATA_DIR, { model = null } = {}) {
   const paths = vectorsLayerPaths(dataDir, model);
   // 加载缓存(2026-11-10):按文件 mtime+size 判失效,避免每轮判定重复 parse+base64 解码。
   const statKey = (f) => { try { const st = fs.statSync(f); return `${st.mtimeMs}:${st.size}`; } catch { return '0:0'; } };
-  const cacheKey = `${dataDir}|${paths.slug}|${[paths.base.slugFile, paths.base.fixedFile, paths.local.slugFile, paths.local.fixedFile, paths.local.legacyFile].map(statKey).join(',')}`;
+  // S14-F5(20261118):cacheKey 并入 config 文件 stat——doc 携带 knnLocalWeight 后,配置改动必须
+  // 让缓存失效(否则新权重不生效)。stat 极廉(1 次 stat,不读不解析),配置读仍只在重建时发生。
+  const cfgStatKey = (() => { try { const st = fs.statSync(CONFIG_PATH); return `${st.mtimeMs}:${st.size}`; } catch { return '0:0'; } })();
+  const cacheKey = `${dataDir}|${paths.slug}|${[paths.base.slugFile, paths.base.fixedFile, paths.local.slugFile, paths.local.fixedFile, paths.local.legacyFile].map(statKey).join(',')}|cfg:${cfgStatKey}`;
   if (_vectorsCache.key === cacheKey) return _vectorsCache.data;
   const base = decodeLayer(readFirstExisting([paths.base.slugFile, paths.base.fixedFile]));
   const local = decodeLayer(readFirstExisting([paths.local.slugFile, paths.local.fixedFile]));
@@ -256,9 +272,14 @@ export function loadVectors(dataDir = DATA_DIR, { model = null } = {}) {
     _vectorsCache = { key: cacheKey, data: raw };
     return raw; // 交给 vectorsMatchModel 统一拒绝
   }
-  const cfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
+  const cfg = (() => { const c = loadConfig({ soft: true }); return c && !c._configError ? (c.exemplars || {}) : {}; })(); // S1-F1(20261120 夜):loadVectors 路径同 soft 化(后台/钩子一律 soft 家族)
   const authority = localOk && localOk.authority ? localOk.authority : (cfg.authority || 'local');
-  const vectors = { ...(baseOk ? baseOk.vectors : {}), ...(localOk ? localOk.vectors : {}) };
+  // PU-001 A(2026-11-17 用户批准):合并条目打**层标记 src**——base=服务器清洗权威层,local=本机自签辅助层;
+  // knnClassify 据此做层权重(base 1.0 / local 0.6)。浅拷贝打标,不污染源层文档(缓存/重建共用)。
+  // 同 key local 覆盖 base(向量优先语义不变);authority='local' 的 overrides 只改标签,src 保持。
+  const vectors = {};
+  if (baseOk) for (const [k, e] of Object.entries(baseOk.vectors || {})) vectors[k] = { ...e, src: 'base' };
+  if (localOk) for (const [k, e] of Object.entries(localOk.vectors || {})) vectors[k] = { ...e, src: 'local' };
   if (authority === 'local' && localOk && localOk.overrides) {
     for (const [k, meta] of Object.entries(localOk.overrides)) {
       if (vectors[k]) vectors[k] = { ...vectors[k], ...meta };
@@ -272,29 +293,60 @@ export function loadVectors(dataDir = DATA_DIR, { model = null } = {}) {
     ok: Object.keys(vectors).length, fail: (localOk && localOk.fail) || 0,
     vectors,
     layers: { base: !!baseOk, local: !!localOk, legacy: !local && !!legacy },
+    // S14-F5(20261118):组 doc 时把 local 层权重挂到 doc——knnClassify 是热路径(每请求一次),
+    // 原实现每次调用 loadConfig() 读盘(=每请求多一次 IO)。此处读一次挂 doc,判定侧零读盘。
+    knnLocalWeight: Number(cfg.knnLocalWeight) > 0 ? Number(cfg.knnLocalWeight) : L2_LAYER_WEIGHTS.local,
   };
   _vectorsCache = { key: cacheKey, data };
   return data;
 }
 
+/** PU-001 A 层权重(2026-11-17 用户批准):base=服务器清洗权威层全权,local=本机自签辅助层降权。
+ *  仅在**混合库**(base 层有数据)时生效;纯 local 库(服务器包未下发)local 权重=1,行为与改前完全一致。
+ *  标定域:默认走代码常量,config exemplars.knnLocalWeight 可覆盖(系统域,不播种到用户配置面);
+ *  knnClassify 的 localWeight 参数可单次覆盖(测试/评测用)。taint 降权与本权重相乘(各自独立)。 */
+export const L2_LAYER_WEIGHTS = THRESHOLD_L2_LAYER_WEIGHTS; // S14-F4(20261118):并入 thresholds 单源(原 0.6 字面量双写)
+
 /** cosine kNN 加权投票:sim≥minSim 的 top-k 邻居按相似度加权,输出 type+confidence。
  *  自证降权(2026-11-04 用户定档):rule 含 l2 的近邻=其标签曾有 L2 票参与签出,相似度按
  *  taintFactor(默认 0.5)折算后再进标签权重/置信/top-k 排序——阻断"L2 签出的标教 L2"循环;
  *  旧向量文件无 rule 字段按未污染算,下次重建向量后自动生效。
+ *  层权重(PU-001 A,2026-11-17):混合库中 local 邻居按 L2_LAYER_WEIGHTS.local 降权,base 全权;
+ *  纯 local 库不降权(验收门禁:无 base 包时投票结果与改前一致)。
  *  excludePkey / excludePkeys(2026-11-10):按 promptKey 排除指定条目,用于 LOO 评估
  *  (参照集与黄金集同源,不排除自身会让指标虚高);向量条目自 2026-11-10 起带 pkey 字段。 */
-export function knnClassify(vector, vectorsDoc, { k = 5, minSim = L2_MIN_SIM, taintFactor = 0.5, excludePkey = null, excludePkeys = null } = {}) {
+export function knnClassify(vector, vectorsDoc, { k = 5, minSim = L2_MIN_SIM, taintFactor = 0.5, excludePkey = null, excludePkeys = null, localWeight = null } = {}) {
   if (!vector || !vectorsDoc?.vectors) return null;
   // LOO(2026-11-10):按 pkey 排除"查询自身"的参照条目。签入行会回流样本库,
   // 同一 prompt 的自邻居 cosine≈1,不排除会让 KNN 评测虚高(taintFactor 只降权不剔除)。
   // 旧向量文件无 pkey 字段 ⇒ 无法排除(重建向量后自动生效),向后兼容。
   const exSet = excludePkeys instanceof Set ? excludePkeys : (excludePkey ? new Set([String(excludePkey)]) : null);
+  // 混合库判定:loadVectors 产出的 doc 带 layers;直传旧形态 doc 时按条目 src 兜底扫描。
+  const hasBase = vectorsDoc.layers ? !!vectorsDoc.layers.base : Object.values(vectorsDoc.vectors).some((e) => e && e.src === 'base');
+  let lw = 1;
+  if (hasBase) {
+    // S14-F5(20261118):优先用显式参数 → doc 携带的权重(组 doc 时读一次)→ 兜底才读 config。
+    // 热路径(每请求一次)不再触发 loadConfig() 读盘。S1-F1(20261120 夜):兜底 soft 化——坏 config 的
+    // process.exit 不可被 try/catch 捕获,原 catch 形同虚设;soft 带回 _configError 按缺省权重回落。
+    const n = Number(localWeight);
+    const docW = Number(vectorsDoc.knnLocalWeight);
+    lw = Number.isFinite(n) && n > 0 ? n
+      : (Number.isFinite(docW) && docW > 0 ? docW
+        : (() => {
+          { // S1-F1(20261120 夜):坏 config 的 process.exit 不可捕获,catch 兜底形同虚设——soft 化判 _configError 走缺省权重
+            const c = loadConfig({ soft: true });
+            const w = c && !c._configError ? Number(c.exemplars?.knnLocalWeight) : NaN;
+            return Number.isFinite(w) && w > 0 ? w : L2_LAYER_WEIGHTS.local;
+          }
+        })());
+  }
   const sims = Object.entries(vectorsDoc.vectors)
     .filter(([, e]) => { if (!exSet) return true; const pk = e && e.pkey; return !(pk && exSet.has(String(pk))); })
     .map(([id, e]) => {
       const sim = cosine(vector, e.v);
       const tainted = !!(e.rule && /l2/i.test(String(e.rule)));
-      return { id, label: normalizeType(e.label), sim, tainted, eff: sim * (tainted ? taintFactor : 1) };
+      const layerW = e && e.src === 'base' ? L2_LAYER_WEIGHTS.base : lw;
+      return { id, label: normalizeType(e.label), sim, tainted, src: (e && e.src) || 'local', eff: sim * (tainted ? taintFactor : 1) * layerW };
     })
     .filter((x) => x.sim >= minSim)
     .sort((a, b) => b.eff - a.eff)

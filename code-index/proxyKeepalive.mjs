@@ -210,3 +210,14 @@ export function recordPayloadKeys(payload, { dataDir = DATA_DIR, file = null, mi
     return true;
   } catch { return false; }
 }
+
+// ---------- CLI:node proxyKeepalive.mjs --ensure(20261120 托盘死亡重拉看护配套) ----------
+// 托盘 60s 周期兜底调本入口(空载荷=无条件保活③),钩子链断(如 hook-relay 缺件)时保活不再依赖钩子。
+// fail-open:任何异常都输出 JSON 且 exit 0,绝不阻塞托盘周期。
+const __directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (__directRun && process.argv.includes('--ensure')) {
+  ensureProxyRunning({})
+    .then((r) => process.stdout.write(JSON.stringify(r) + '\n'))
+    .catch((e) => process.stdout.write(JSON.stringify({ state: 'failed', reason: String(e?.message || e) }) + '\n'))
+    .finally(() => process.exit(0));
+}

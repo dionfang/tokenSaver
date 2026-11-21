@@ -18,3 +18,16 @@ export const MAX_PHASE_TURNS = 4;
 
 /** 切换税门控的上下文上限(tokens,≈640KB 请求体)。消费方:config 默认值、init 播种骨架。 */
 export const SWITCH_GUARD_MAX_CONTEXT_TOKENS = 200000;
+
+/** 缓存「热→冷」时效(ms):超过该空闲时长即视为缓存冷(代理 cacheCold 门与显式缓存计价 TTL 同一事实)。
+ *  消费方:modelRouteProxy(cacheCold 判定)、costProfile(显式缓存 ttlMs 默认)。S1-F4 20261118 双写收口。 */
+export const CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** L2 混合向量库的层权重(PU-001 A):base=服务器清洗权威层全权,local=本机自签辅助层降权。
+ *  仅混合库(base 有数据)生效;纯 local 库 local 权重=1,行为与改前一致。
+ *  消费方:config(系统域默认 knnLocalWeight)、modelRoute(knnClassify 层权重)。S14-F4 20261118 双写收口。 */
+export const L2_LAYER_WEIGHTS = { base: 1, local: 0.6 };
+
+/** R-ref 决策咨询单次超时兜底上限(ms):与档案 maxLatencyMs 取 min(S2-F1 单源,20261118)。
+ *  消费方:modelRouteProxy(arm1/arm2 judgeTier 超时、装配默认)。方案文档语义=「超时上限」,降窗未实现。 */
+export const RREF_CONSULT_TIMEOUT_MS = 5000;

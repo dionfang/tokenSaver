@@ -6,14 +6,16 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; background: #161b22; color: #c9d1d9; padding: 14px 16px; }
-  h2 { font-size: 12px; color: #8b949e; font-weight: 600; margin: 0 0 6px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
-  .hint { color: #8b949e; font-size: 12px; margin-bottom: 10px; }
-  .list { display: flex; flex-direction: column; gap: 6px; min-height: 220px; max-height: 280px; overflow: auto; }
-  .item { display: flex; align-items: center; gap: 8px; background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 6px 8px; }
+  body { font: 13px/1.6 "Microsoft YaHei", system-ui, sans-serif; background: #161b22; color: #c9d1d9; padding: 14px 16px;
+    /* 20261120 用户裁定:窗口固定不可变尺寸——整页 flex 纵列,列表自缩滚动,添加按钮/错误行恒钉底不被挤占 */
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  h2 { font-size: 12px; color: #8b949e; font-weight: 600; margin: 0 0 6px; border-bottom: 1px solid #21262d; padding-bottom: 4px; flex: none; }
+  .hint { color: #8b949e; font-size: 12px; margin-bottom: 10px; flex: none; }
+  .list { display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .item { display: flex; align-items: center; gap: 8px; background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 6px 8px; flex: none; }
   .path { flex: 1; word-break: break-all; }
   .empty { color: #8b949e; padding: 12px 0; }
-  .err { color: #d29922; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  .err { color: #d29922; font-size: 12px; margin-top: 8px; white-space: pre-wrap; flex: none; max-height: 72px; overflow-y: auto; }
   button {
     appearance: none; font: 12px/20px "Microsoft YaHei", system-ui, sans-serif;
     color: #c9d1d9; background: #21262d; border: 1px solid #30363d; border-radius: 4px;
@@ -21,7 +23,7 @@
   }
   button:hover:not(:disabled) { border-color: #58a6ff; color: #58a6ff; }
   button:disabled { opacity: 0.55; cursor: default; }
-  .foot { margin-top: 12px; }
+  .foot { margin-top: 12px; flex: none; }
 </style>
 </head>
 <body>

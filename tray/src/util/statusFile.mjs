@@ -83,14 +83,14 @@ export function embeddingsExists(dataDir, backend) {
 
 /** KNN 双层文件实况:存在性+条数(条数取 ok 字段,兜底 vectors 键数)。 */
 export function readKnnLayer(file) {
-  if (!existsSyncSafe(file)) return { exists: false, entries: null };
+  if (!existsSyncSafe(file)) return { exists: false, entries: null, builtAt: null };
   const txt = readTextOnce(file);
-  if (txt == null) return { exists: true, entries: null };
+  if (txt == null) return { exists: true, entries: null, builtAt: null };
   try {
     const j = JSON.parse(txt);
     const n = Number.isFinite(j?.ok) ? j.ok : j?.vectors && typeof j.vectors === 'object' ? Object.keys(j.vectors).length : null;
-    return { exists: true, entries: n };
-  } catch { return { exists: true, entries: null }; }
+    return { exists: true, entries: n, builtAt: typeof j?.builtAt === 'string' ? j.builtAt : null };
+  } catch { return { exists: true, entries: null, builtAt: null }; }
 }
 
 /** 与 code-index/proc.mjs LOCK_TTL_MS 一致:超 6 小时或进程已死的 .embed.pid 不算在嵌。 */

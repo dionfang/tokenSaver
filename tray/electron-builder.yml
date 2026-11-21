@@ -22,10 +22,12 @@ extraResources:
     filter:
       - "**/*"
       - "!hf-cache/**"
-      - "!bin/**"
       - "!data/**"
       - "!*.log"
       - "!node_modules/.cache/**"
+# 20261120 修复:bin/hook-relay.exe(闪窗 GUI 中继)必须随包——init 的 8 条钩子入口都绝对路径指向它,
+# 旧 filter "!bin/**" 把它排掉后,测试机 hooks 全失效(缺系统 .NET csc 现编时无回退可执行文件)。
+# bin/ 当前仅此一个文件,整体入包(约 7KB)。
 # 2026-11-17:asar=false——本机有长驻进程持久锁新生成的 app.asar(持有者不明,Defender 历史无关),
 # 且产品源码本就「轻度混淆」口径(§3-13),asar 封装非必需;解包目录形态规避锁并便于现场排查。
 asar: false

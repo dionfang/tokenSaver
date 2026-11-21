@@ -128,8 +128,17 @@ export function atomicWriteFileSync(file, data) {
     throw e;
   }
   try { fs.closeSync(fd); } catch { /* 已关 */ }
-  try { fs.renameSync(tmp, file); }
-  catch (e) { try { fs.unlinkSync(tmp); } catch { /* tmp 已不在 */ } throw e; }
+  // Windows 覆盖式 rename 偶发 EPERM/EBUSY(防病毒/索引器/并发读短暂占用目标文件)→ 有限次同步退避重试
+  // (仅错误路径,热路径零开销)。实证:modelRouteProxy.test B3 flake——注入一次 EPERM 即复现「限流模型未冷却」
+  // (markHealth 静默吞错,下一轮又打刚 429 的坏模型)。20261119 修复。
+  for (let t = 0; ; t++) {
+    try { fs.renameSync(tmp, file); break; }
+    catch (e) {
+      const transient = !!(e && (e.code === 'EPERM' || e.code === 'EBUSY' || e.code === 'EACCES'));
+      if (!transient || t >= 3) { try { fs.unlinkSync(tmp); } catch { /* tmp 已不在 */ } throw e; }
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (t + 1)); } catch { /* 无 SAB 支持时直接下一轮 */ }
+    }
+  }
 }
 
 /** JSON 原子写(2 空格缩进,与既有 writeFileSync(JSON.stringify(x, null, 2)) 口径一致)。 */

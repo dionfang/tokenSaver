@@ -15,13 +15,12 @@ import { createPoller } from './poller.mjs';
 import { resolvePaths, hfWeightCached, localWeightCached } from './util/paths.mjs';
 import { createWeightsAuto } from './wizard/weightsAuto.mjs';
 import { downloadWeights } from './wizard/weightsOnline.mjs';
-import { modelTooltip } from './util/lamps.mjs';
+import { appTooltip } from './util/lamps.mjs';
 import { createWizardController } from './wizard/controller.mjs';
 import { createUpdateBase } from './updateBase.mjs';
 import { createUploadKnn } from './uploadKnn.mjs';
-import { checkAppUpdate, scheduleBackgroundCheck, installOnQuit } from './appUpdater.mjs';
+import { checkAppUpdate } from './appUpdater.mjs';
 import { createDownloader, httpRequest } from './downloader.mjs';
-import { readConsent, t4Allowed } from './consent.mjs';
 import { createDownloadRegistry } from './util/downloadRegistry.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -120,6 +119,16 @@ function wizardController() {
     },
     execFile,
     openPath: (p) => shell.openPath(p),
+    // 2026-11-20 修复「嵌入模型反复下载无法完成」:向导在线下载开跑前停掉托盘自动补权重
+    // (两条下载链并发写同一 .part → 互相删件/字节交错 → 校验永不过)。取消保留 .part,向导续传;
+    // 返回是否真停了在途任务(供向导日志提示)。等 inFlight 清零再放行,避免 Windows 文件占用 EBUSY。
+    cancelAutoWeights: async () => {
+      if (!autoDownloader || !weightsAuto?._state?.inFlight) return false;
+      autoDownloader.cancel();
+      const t0 = Date.now();
+      while (weightsAuto._state.inFlight && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 200));
+      return true;
+    },
   });
   ipcMain.handle('wizard:action', async (_e, name, payload) => {
     try {
@@ -187,7 +196,21 @@ function activateTray() {
     tray.setToolTip('TokenSaver');
     tray.setContextMenu(buildMenu());
     tray.on('double-click', () => openPanel());
-    scheduleBackgroundCheck(pushBase); // C6=b 应用自更新:托盘就绪后 30s 静默检查+后台下载(退出时装)
+    // 20261120 用户裁定(撤销 C6=b 自动检查):不启动静默自更新——更新唯一入口=托盘右键「检查应用更新」(菜单 :358)。
+    // 20261120 用户裁定(再改口径):下载完成弹「立即安装(推荐)/稍后」→ 立即=退出并拉起**可见安装向导**;
+    // 退出装机/开机静默装机全线取消(不同客户端环境静默行为异常);installOnQuit 已废为 no-op。
+    // 代理死亡重拉看护(20261120 用户裁定立项):prompt-guard 钩子链断(如 hook-relay 缺件)时
+    // ensureProxyRunning 无人触发,8117 断了没人拉(实测代理死后静默停摆)——托盘 60s 周期兜底调
+    // code-index 微 CLI --ensure(pid+端口双判据+30s 冷却,fail-open),钩子链健康与否都不依赖。
+    const proxyWatchdog = () => {
+      const { nodeBin, codeIndexRoot } = ctx.paths || {};
+      if (!nodeBin || !codeIndexRoot) return;
+      runner.run('proxy-watchdog', nodeBin, [path.join(codeIndexRoot, 'proxyKeepalive.mjs'), '--ensure'], { cwd: codeIndexRoot, timeoutMs: 20000 })
+        .then((r) => { if (r.code !== 0) console.error('[proxy-watchdog] 非零退出', r.code, (r.stderr || '').slice(-160)); })
+        .catch(() => {});
+    };
+    proxyWatchdog(); // 启动即保活一轮(钩子断的窗口期也能把 8117 拉起来)
+    setInterval(proxyWatchdog, 60_000).unref?.();
   })();
 }
 
@@ -321,11 +344,13 @@ async function runUpdateBase(fromMenu) {
   try { up = await getUploadKnn().run(); }
   catch (e) { up = { outcome: 'handler-throw', message: String(e?.message || e).slice(0, 200) }; }
   if (up.outcome === 'updated') await poller?.slowRefresh('upload-knn').catch(() => {});
+  // 20261120 用户裁定:绿色提示只报下载结果;上传跳过类(no-local-layer/nothing-new/consent 等)静默不显示,
+  // 仅「上传成功」与「上传失败」才追加——失败必须可见,跳过不制造噪音。
   const skipUpload = ['no-local-layer', 'nothing-new', 'consent-required', 'no-paths', 'busy'].includes(up.outcome);
   const upMsg = up.outcome === 'updated'
-    ? `已上传 ${up.accepted ?? 0} 条`
-    : skipUpload ? '跳过(本地向量尚未生成或无新增)' : `失败:${up.message || up.outcome}`;
-  const summary = `${r.outcome === 'updated' ? `公共决策包已更新(${r.accepted ?? '?'} 条)` : '公共决策包已是最新'};上传本地向量:${upMsg}`;
+    ? `;已上传 ${up.accepted ?? 0} 条`
+    : skipUpload ? '' : `;上传本地向量失败:${up.message || up.outcome}`;
+  const summary = `${r.outcome === 'updated' ? `公共决策包已更新(${r.accepted ?? '?'} 条)` : '公共决策包已是最新'}${upMsg}`;
   pushBase({ phase: 'result', outcome: up.outcome === 'updated' ? 'updated' : r.outcome, message: summary });
   if (fromMenu) dialog.showMessageBox({ message: summary, buttons: ['知道了'] });
   return { ...r, upload: up, message: summary };
@@ -352,11 +377,9 @@ function buildMenu() {
   return Menu.buildFromTemplate([
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
-    { label: '更新公共决策包', visible: t4Allowed(ctx.consent), click: () => { openPanel(); runUpdateBase(true); } },
     { label: '检查应用更新', click: () => { openPanel(); checkAppUpdate({ onEvent: pushBase, fromMenu: true }); } },
-    { label: '修复钩子', click: () => { repairHooks('all'); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
-    { label: `开机自启    ${ctx.autorunOn ? '━●' : '○━'}`, click: async () => {
+    { label: `开机自启    ${ctx.autorunOn ? '✓' : '✗'}`, click: async () => {
       const next = !ctx.autorunOn;
       const ok = await setAutorun(next);
       if (ok) { ctx.autorunOn = next; writeTrayState({ autoLaunch: next ? 'on' : 'off' }); }
@@ -385,8 +408,9 @@ function applySnapshot(snapshot) {
   if (panel && !panel.isDestroyed()) panel.webContents.send('tray:snapshot', { ...snapshot, weightDownload: weightRegistry.snapshot() });
   if (tray) {
     tray.setContextMenu(buildMenu());
-    // 2026-11-17 用户裁决:悬浮提示改模型拉起状态(灯+类型+名,一行一模型),不再显示 ⚙ 状态句
-    tray.setToolTip(modelTooltip(snapshot));
+    // 2026-11-17 旧裁决(模型状态悬浮)已被 20261120 裁定取代:模型状态整块移去面板,悬浮只留身份三行
+    // 20261120 用户裁定(火绒式三行):悬浮=TokenSaver/版本/公共决策包 builtAt;模型状态看面板。
+    tray.setToolTip(appTooltip(snapshot, app.getVersion()));
   }
 }
 
@@ -401,6 +425,26 @@ if (!gotLock) {
     else openWizard();
   });
   app.whenReady().then(async () => {
+    // 待装新版提示(20261120 用户裁定改口径):启动自检发现已下载+已校验的 pending 新版 ⇒ **只弹提示**,
+    // 由用户选择「立即安装(可见向导)/稍后」;静默装机(启动自装/退出装)已全线取消,不再自动拉安装器。
+    try {
+      const { consumePendingAtStartup, __internal } = await import('./appUpdater.mjs');
+      const p = await consumePendingAtStartup();
+      if (p && p.prompt) {
+        const { response } = await dialog.showMessageBox({
+          type: 'info', title: '应用更新',
+          message: `检测到已下载的新版本 ${p.version} 尚未安装`,
+          detail: '选择「立即安装」将退出 TokenSaver 并打开新版安装向导,按向导完成即可升级。',
+          buttons: ['立即安装(推荐)', '稍后'], defaultId: 0, cancelId: 1,
+        });
+        if (response === 0) {
+          if (!__internal.spawnInstaller(p.file)) {
+            dialog.showErrorBox('应用更新', '安装程序启动失败;下次启动会再次提示,或到安装包目录手动运行。');
+          }
+          app.quit(); return;
+        }
+      }
+    } catch { /* 自检失败不阻断正常启动 */ }
     Menu.setApplicationMenu(null); // 不显示 Electron 默认窗口菜单栏
     ipcMain.handle('tray:refresh', async () => {
       if (!poller) return { ok: false, error: 'not-ready' };
@@ -422,7 +466,10 @@ if (!gotLock) {
         return { ok: false, timedOut: true };
       }
       if (res.code !== 0) {
-        const tail = (res.stderr || res.stdout || `exit ${res.code}`).slice(-400);
+        // 20261120(测试机静默死亡修复):退出码恒显——旧 `stderr||stdout` 把 code 遮住,
+        // 而原生崩溃的退出码(0xC000001D 缺 AVX / 0xC0000005 原生崩 / 被杀)正是定罪钥匙。
+        const body = (res.stderr || res.stdout || '').slice(-400);
+        const tail = `${body}\n[exit] code=${res.code}`;
         dialog.showErrorBox('立即同步失败', tail);
         return { ok: false, code: res.code };
       }
@@ -544,5 +591,6 @@ if (!gotLock) {
   });
   app.on('window-all-closed', (e) => { /* 托盘常驻:面板关了不退 */ });
   // 2026-11-15 退出握手:菜单「退出」→ app.quit() 触发 before-quit 置真,close 拦截放行(hide 兜底不拦真退)
-  app.on('before-quit', () => { quitting = true; installOnQuit(); }); // 就绪态静默装新版(C6=b 退出时装)
+  // 20261120 用户裁定:退出不再触装(静默装机全线取消,installOnQuit 已废 no-op;仅保留退出握手置位)
+  app.on('before-quit', () => { quitting = true; });
 }

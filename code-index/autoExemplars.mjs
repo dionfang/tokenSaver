@@ -157,6 +157,10 @@ export function loadShadowEvidence({ dataDir = DATA_DIR, tailCap = 50000, host =
       servedTier: (typeof r.servedTier === 'string' && r.servedTier.trim()) ? r.servedTier.trim() : ((prevRow && prevRow.servedTier) || null),
       servedModel: r.servedModel || ((prevRow && prevRow.servedModel) || null),
       decisionTier: r.decisionTier || ((prevRow && prevRow.decisionTier) || null),
+      // S2-1(20261119 夜审):转发 escalationFrom/To——上梯目标档是派生真值的单源字段,丢了它
+      // deriveTierTruth 只能按 servedTier(上梯后实际服务档)回落。与 servedTier 同口径:本行有值取本行,缺则留前值。
+      escalationFrom: (typeof r.escalationFrom === 'string' && r.escalationFrom.trim()) ? r.escalationFrom.trim() : ((prevRow && prevRow.escalationFrom) || null),
+      escalationTo: (typeof r.escalationTo === 'string' && r.escalationTo.trim()) ? r.escalationTo.trim() : ((prevRow && prevRow.escalationTo) || null),
     });
   }
   return out;
@@ -166,7 +170,7 @@ export function loadShadowEvidence({ dataDir = DATA_DIR, tailCap = 50000, host =
  * 自动增长一次:对齐 → 并池 → **四票自动代签黄金集** → 写 exemplars.json → 需要时后台重建向量。
  * 返回 {state:'skipped'|'grown'|'failed', ...}。
  */
-export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAULT_INTERVAL_MS, now = Date.now(), spawnVectors = true, label = true, exportFn = null, labelTtlMs = LABEL_TTL_MS } = {}) {
+export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAULT_INTERVAL_MS, now = Date.now(), spawnVectors = true, label = true, exportFn = null, labelTtlMs = LABEL_TTL_MS, buildFn = null } = {}) {
   // 并发锁(2026-11-10 根治):prompt-guard --check 可能多进程同轮并发(09:41 实测两次 grow 叠跑),
   // 重复导出/签入会写坏状态,双双重试向量重建还会叠加常驻重启窗口的资源压力。锁按 pid 存活判定,进程崩溃自动过期。
   const lockPath = path.join(dataDir, 'routing', '.autoexemplars.lock');
@@ -188,7 +192,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       const er = exp({ out: path.join(dataDir, 'routing', 'raw-labels.jsonl') });
       if (er && er.error) console.error(`[warn] 弱标签导出失败(${er.error}),沿用旧 raw-labels`);
     } catch (e) { console.error(`[warn] 弱标签导出异常:${e && e.message ? e.message : e}`); }
-    const { buildCandidates } = await import('./importRoutingLog.mjs');
+    const buildCandidates = buildFn || (await import('./importRoutingLog.mjs')).buildCandidates; // S5-F1 测试缝:可注入对齐器做密闭故障注入
     // logFile 显式按 dataDir 推导(2026-11-03 R1 审查修):buildCandidates 不认 dataDir,缺省会静默落到
     // 全局 routing-log——注入临时 dataDir 的部署/测试隔离契约失效。dbPath 保持全局默认(ZCode 会话库
     // 是机器级资源,与 dataDir 无关;R3 待办:maybeGrowPool 开 dbPath 注入口,测试再密闭)。
@@ -269,7 +273,10 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       source: 'auto-signed',
     }));
     const merged = mergePools([...signedPool, ...primary], extra);
-    const exCfg = (() => { try { return loadConfig().exemplars || {}; } catch { return {}; } })();
+    const exCfg = (() => {
+      const c = loadConfig({ soft: true }); // S14-F1(20261120 夜审):后台路径禁 process.exit,坏 JSON 走默认空
+      return c._configError ? {} : (c.exemplars || {});
+    })();
     const builtLib = buildExemplars(merged, resolveExemplarCaps(exCfg)); // 0=不限;正数才截断
     const exemplars = builtLib.exemplars;
     const outFile = path.join(dataDir, 'routing', 'exemplars.json');
@@ -303,6 +310,13 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     }
     return { state: 'grown', pool: merged.length, exemplars: exemplars.length, before: beforeN, changed, contestedPooled: contestedEntries.length, sign: signStats, review: reviewStats };
   } catch (e) {
+    // S5-F1(20261118):失败也回写 state.at——原 catch 直接 return,节流看旧 at 连续放行,
+    // 黄金集空/报告写失败窗口每轮空转烧 CPU。回写 at 让节流在失败后同样生效。
+    try {
+      const sp = path.join(dataDir, 'routing', STATE_FILE);
+      fs.mkdirSync(path.dirname(sp), { recursive: true });
+      fs.writeFileSync(sp, JSON.stringify({ at: now, error: String(e && e.message ? e.message : e) }) + '\n');
+    } catch { /* 状态写失败不掩盖原错误 */ }
     return { state: 'failed', reason: String(e && e.message ? e.message : e) };
   }
   } finally {
@@ -348,7 +362,9 @@ async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, twoVote
       const batch = classifyBatchFn || dm.classifyBatch;
       const cand = rows.map((r, i) => ({ id: i + 1, text: String(r.prompt || ''), row: r })).filter((x) => signable(x.row.prompt));
       if (cand.length) {
-        const dr = await batch(cand.map((x) => x.text), { config: cfgRaw });
+        const prof = dm.resolveDecisionProfile ? dm.resolveDecisionProfile(cfgRaw, { dataDir }) : null;
+        const maxLat = Number(prof?.arm1?.maxLatencyMs) > 0 ? Number(prof.arm1.maxLatencyMs) : 30000;
+        const dr = await batch(cand.map((x) => x.text), { config: cfgRaw, timeoutMs: maxLat }); // S2-2: honoring 档案 maxLatencyMs
         if (dr.skipped) {
           // 批量嵌入让行(2026-11-10):忙跳过 ≠ 故障——不跳闸,决策票本轮弃权,三票照常签
           decisionNote = dr.error || '批量嵌入进行中,决策票本轮弃权';
@@ -357,8 +373,9 @@ async function gatherVoters({ rows, dataDir, l2MinConf, decisionMinConf, twoVote
           decisionNote = `决策模型失败已跳闸:${dr.error}`;
         } else {
           dmModel = dr.backend || null;
+          const byId = new Map(cand.map((x) => [x.id, x]));
           for (const a of dr.answers) {
-            const src = cand[a.id - 1];
+            const src = byId.get(a.id);
             if (src) decisionByRow.set(src.row, a);
           }
           if (dr.failedChunks) {
@@ -432,12 +449,34 @@ export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVot
   // 让 R2/R3 不再是"恒 0";"活多"证不了能力,这份证据才证"低档干不动")。只补不删。
   // signedAt(2026-11-10 阶段①):签入时间戳,TTL 复核的起点;每条都盖,不留"无时间"的标签。
   const signedAt = Date.now();
+  // 人工改档锚点回流(20261119 用户裁定,影子先行):仅 live=true 才把人工改档档写进 evidence 供 deriveTierTruth;
+  // 默认 live=false 只采集+审计(auditSwitchAgreement),不改真值/代签行为。would* 永不作真值(防循环红线)。
+  let msAnchors = null, msLive = false;
+  try {
+    const ms = await import('./manualSwitch.mjs');
+    const lc = loadConfig({ soft: true }); // S14-F1(20261120 夜审):坏 config JSON 时 process.exit 不可捕获,catch 兜不住——soft 化后 msLive=false 即零影响
+    const msCfg = lc._configError ? ms.SWITCH_DEFAULTS
+      : { ...ms.SWITCH_DEFAULTS, ...(lc.modelRouting?.manualSwitch || {}) };
+    msLive = msCfg.enabled === true && msCfg.live === true;
+    if (msLive) msAnchors = ms.loadManualSwitchAnchors({ dataDir });
+  } catch { /* 通道不可用 = 零影响 */ }
   const signedWithEvidence = signed.map((s) => {
-    const ex = shadowEvidence && shadowEvidence.get(promptKey(String(s.prompt || '')));
-    if (!ex || !s.evidence) return { ...s, signedAt };
+    if (!s.evidence) return { ...s, signedAt };
+    const pk = promptKey(String(s.prompt || ''));
+    const ex = shadowEvidence && shadowEvidence.get(pk);
     const extra = {};
-    if (ex.escalated === true) extra.escalated = true;
-    if (ex.servedTier) extra.servedTier = ex.servedTier;
+    if (ex) {
+      if (ex.escalated === true) extra.escalated = true;
+      if (ex.servedTier) extra.servedTier = ex.servedTier;
+      // S2-1(20261119 夜审):上梯事件行的 from/to 一并回流——黄金证据缺 escalationTo 时
+      // deriveTierTruth 只能按 servedTier 回落,真值单源字段不能断流。
+      if (ex.escalationFrom) extra.escalationFrom = ex.escalationFrom;
+      if (ex.escalationTo) extra.escalationTo = ex.escalationTo;
+    }
+    if (msLive && msAnchors) {
+      const a = msAnchors.get(pk);
+      if (a) { extra.manualSwitch = true; extra.manualSwitchTo = a.toTier; extra.manualSwitchDir = a.dir; extra.manualSwitchLive = true; }
+    }
     if (!Object.keys(extra).length) return { ...s, signedAt };
     return { ...s, signedAt, evidence: { ...s.evidence, ...extra } };
   });

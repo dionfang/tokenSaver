@@ -91,11 +91,12 @@
     $('embed-pct').textContent = total != null ? `${done}/${total}(${pct ?? 0}%)` : '未选目录';
     setLamp('knn', L.knn, KNN_TEXT);
     $('knn-name').textContent = KNN_NAME[L.knn] || '模型决策状态';
-    // 本地决策包:当前模式已写向量条数 / exemplars.json 样本条数。满=绿、不足=黄。
+    // 本地决策包(20261120 显示逻辑与公共决策包对齐):无样本库=灰条+「无本地样本」(旧版显示「—」
+    // =查不到状态,用户投诉);有样本=同语法 done/total(pct%),100% 绿满条,不足=黄条。
     const kd = p.knnDone ?? 0, kt = p.knnTotal, kpct = p.knnPct;
     $('knn-bar').style.width = `${kt != null ? (kpct ?? 0) : 0}%`;
-    $('knn-bar').className = kpct != null && kpct >= 100 ? 'full' : '';
-    $('knn-pct').textContent = kt != null ? `${kd}/${kt}(${kpct ?? 0}%)` : '—';
+    $('knn-bar').className = kt == null ? 'grey' : (kpct != null && kpct >= 100 ? 'full' : '');
+    $('knn-pct').textContent = kt != null ? `${kd}/${kt}(${kpct ?? 0}%)` : '无本地样本';
     // 公共决策包(原名 base 向量包):未下载=灰条且无文案;已下载=同本地格式「done/total(pct%)」
     // 下载/导入进行中(baseDownloading)由 onBaseEvent 实时驱动进度条,周期快照不覆盖,避免条来回跳。
     const bd = p.knnBaseDone, bt = p.knnBaseTotal, bpct = p.knnBasePct;
@@ -151,7 +152,7 @@
     if (ev.phase === 'result' || ev.phase === 'done') {
       baseDownloading = false;
       baseHold = false; paintBaseBtn();
-      const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest';
+      const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest' || ev.outcome === 'installing';
       baseMsg(ev.message || '', ok ? 'ok' : 'err');
       // 成功即拉新快照,进度条从下载态转入真实 base 层条数比例(不再等周期 tick/被 slowInFlight 跳过)
       if (ok) window.trayPanel?.refresh?.().catch(() => {});

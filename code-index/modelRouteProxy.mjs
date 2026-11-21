@@ -52,7 +52,7 @@ import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
 import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, RREF_CONSULT_TIMEOUT_MS, CACHE_TTL_MS as THRESHOLD_CACHE_TTL_MS } from './thresholds.mjs'; // S1-F4 单源;S1-F2 门控两值并入;S2-F1(20261118) 咨询超时并入
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
-import { resolveDecisionProfile } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
+import { resolveDecisionProfile, DECISION_PROFILE_FALLBACK } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
 import { blendedRate, loadModelPrices } from './costProfile.mjs';
 import { isAutoModelName, normalizeAutoModel, resolveZcodeV2Dir } from './virtualProvider.mjs';
 
@@ -96,7 +96,8 @@ function rRefCacheGet(pkey, decisionModel = '', ctxHash = '') {
   const k = pkey ? `${pkey}|${decisionModel}|${ctxHash}` : null;
   const e = k ? rRefCache.get(k) : null;
   if (!e) return null;
-  if (Date.now() - Number(e.at || 0) > RREF_CACHE_TTL_MS) { rRefCache.delete(k); return null; }
+  const ttl = e.negative ? 60_000 : RREF_CACHE_TTL_MS; // S2-F4:负缓存 60s(咨询失败短窗不重复打)
+  if (Date.now() - Number(e.at || 0) > ttl) { rRefCache.delete(k); return null; }
   return e;
 }
 function rRefCacheSet(pkey, v, decisionModel = '', ctxHash = '') {
@@ -1292,15 +1293,23 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
   const server = http.createServer((req, res) => {
     const chunks = [];
     let size = 0;
-    req.on('data', (c) => { chunks.push(c); size += c.length; if (size > 32 * 1024 * 1024) req.destroy(); });
+    let over = false; // S12-3:>32MB 回 413(原直接 destroy=connection reset 无 4xx 语义)
+    // 20261121 白昼重落地:夜草案「destroy 挂 res 'finish'」实测仍 ECONNRESET——finish 在响应字节 flush 即刻触发,
+    // 客户端还在上传就 RST,已发的 413 被丢。改为 over 后持续排水(data 恒消费不攒),等 req 'end' 自然收尾;
+    // 2s 兜底 destroy 只打永不完成上传的慢/恶意连接。
+    let overKill = null;
+    req.on('data', (c) => { if (over) return; chunks.push(c); size += c.length; if (size > 32 * 1024 * 1024 && !over) { over = true; try { res.writeHead(413, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'request body too large (>32MB)' } })); } catch { /* 已断开 */ } overKill = setTimeout(() => { try { req.destroy(); } catch { /* 已断开 */ } }, 2000); } });
     req.on('end', async () => {
+      if (over) { if (overKill) { clearTimeout(overKill); overKill = null; } return; }
       const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw.trim()) { try { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'empty request body' } })); } catch { /* 已断开 */ } return; } // S12-3:空体 400
       // 双端隔离(2026-11-04):/apps/qoder 前缀=Qoder 宿主,其余(/apps/anthropic 等)=ZCode;
       // 各宿主只在自己的路由清单里决策,互不混池;旧快照无 host 标签退回合并池(兼容未刷新部署)。
       const reqHost = req.url.startsWith('/apps/qoder') ? 'qoder' : 'zcode';
       const upstreams = upstreamsForHost(readJson(upstreamsFile) || { providers: {} }, reqHost);
       let bodyObj = null;
-      try { bodyObj = JSON.parse(raw); } catch { /* 非 JSON 原样转发 */ }
+      try { bodyObj = JSON.parse(raw); } catch { /* 非 JSON */ }
+      if (!bodyObj && /messages/.test(req.url)) { try { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'invalid JSON body' } })); } catch { /* 已断开 */ } return; } // S12-3:messages 端点非 JSON 400(其余路径仍透传)
 
       const adapter = bodyObj ? pickProtocolAdapter(req.url) : null;
       const convKey = convKeyOf(bodyObj, req.url, adapter || anthropicAdapter);
@@ -1411,9 +1420,10 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               const cKey = promptHeadLog ? promptKey(promptHeadLog) : null;
               const cHash = contextHash(prevHuman);
               const cached = rRefCacheGet(cKey, ro.decisionModel, cHash);
-              let vote = cached ? { tier: cached.tier, confidence: cached.confidence, cached: true } : null;
+              const negCached = !!cached && cached.negative === true; // S2-F4:负缓存命中=短窗跳过咨询
+              let vote = cached && !negCached ? { tier: cached.tier, confidence: cached.confidence, cached: true } : null;
               let voteLatency = null;
-              if (!vote) {
+              if (!vote && !negCached) {
                 try {
                   const dm = await import('./decisionModel.mjs');
                   // 断路器按该实例配置目录隔离(生产=DATA_DIR,隔离测试=注入临时目录,互不绑架)
@@ -1425,7 +1435,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                       if (cKey) rRefCacheSet(cKey, vote, ro.decisionModel, cHash);
                     }
                   }
-                } catch { /* 判定失败/超时/异常 = fail-open,维持词法定档 */ }
+                } catch { if (cKey) rRefCacheSet(cKey, { tier: null, confidence: 0, negative: true }, ro.decisionModel, cHash); /* S2-F4:失败负缓存 60s,fail-open 维持词法 */ }
               }
               if (vote) {
                 const conf = Number(vote.confidence);
@@ -1437,7 +1447,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 logRRefShadow(path.dirname(usageFile || PROXY_USAGE_LOG), {
                   ts: Date.now(), pkey: cKey, contextHash: cHash, promptHead: promptHeadLog,
                   arm: rRefArm2 ? 'r3-rescue' : 'r1-amb',
-                  l1Tier: rRefArm2 ? 'R2' : 'R1', l1Conf: lexSnapshot ? lexSnapshot.confidence : Number(diffDecision.confidence), // S2-F2:影子 l1Conf 用词法原始
+                  l1Tier: lexSnapshot ? lexSnapshot.tier : (rRefArm2 ? 'R2' : 'R1'), l1Conf: lexSnapshot ? lexSnapshot.confidence : Number(diffDecision.confidence), // S2-F2:影子 l1Conf 用词法原始
                   rTier: vote.tier, rConf: conf, cached: vote.cached === true, rescueTier,
                   live: rRefArm2 ? true : !!ro.rRef.live, applied: !!rescueTier, host: reqHost,
                   latencyMs: voteLatency, window: rRefArm2 ? null : ro.rRef.window, // v3:D3 参与度入账(延迟/触发窗)
@@ -1773,11 +1783,11 @@ export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.co
     modelTiers: mr.modelTiers && typeof mr.modelTiers === 'object' && !Array.isArray(mr.modelTiers) ? mr.modelTiers : DEFAULT_MODEL_TIERS,
     lightSuffixes: Array.isArray(mr.lightSuffixes) ? mr.lightSuffixes.map((s) => String(s).toLowerCase()) : DEFAULT_LIGHT_SUFFIXES,
     // L2 融合票(2026-11-07 嵌套收口):统一走 resolveL2Config 的 liveEnabled/liveMinConf
-    // (新 l2.live 优先,旧顶层 l2Live 回落);minConf 缺省 0.8 保守档。
+    // (新 l2.live 优先,旧顶层 l2Live 回落);minConf 缺省 0.3(resolveL2Config 实际缺省,S1-2 20261119 更正旧注 0.8)。
     l2Live: { enabled: l2c.liveEnabled, minConf: l2c.liveMinConf },
     // 决策模型身份(2026-11-09):R-ref 缓存 key 的一部分——切换 tev1↔strands 后旧票不串味。
     // 模型名只认 config.mjs(models 段),与 judgeLocal 的后端分派同源。
-    decisionModel: (() => { try { const c = loadConfig(); return c.modelIn === 'local' ? String(c.models?.localDecision || 'local') : String(c.models?.decision || 'ollama'); } catch { return ''; } })(),
+    decisionModel: (() => { try { const c = loadConfig({ soft: true }); if (c._configError) return ''; return c.modelIn === 'local' ? String(c.models?.localDecision || 'local') : String(c.models?.decision || 'ollama'); } catch { return ''; } })(),
     // R3 词法通道总闸(v2 重建 2026-11-08):enabled 缺省开(直接实弹,用户裁定)、eagerEscalate=P2 提前一拍缺省开。
     // R3 词法通道(2026-11-14 用户裁定:**恒开**,配置键 r3Lexical 不再读取)——enabled=词法 R3 同击总闸,
     // eagerEscalate=P2 提前一拍;词表本体在 tierClassify.mjs,不进优化器网格。
@@ -1789,14 +1799,15 @@ export function mrRoutingOptions(configPath = path.join(DATA_DIR, 'code-index.co
     decisionOn: true,
     rRef: (() => {
       const prof = resolveDecisionProfile(readJson(configPath), { dataDir: path.dirname(configPath) }) // 档案层文件随 dataDir(测试隔离契约,同断路器);
+      const fb = DECISION_PROFILE_FALLBACK; // 20261119-2-S1-F2:回落字面量与 FALLBACK 同值双写收敛单源——调档只改 decisionModel 一处
       return {
         live: prof.arm1.live !== false,
-        minConf: Number.isFinite(Number(prof.arm1.minConf)) ? Number(prof.arm1.minConf) : 0.75,
-        maxChars: Number.isFinite(Number(prof.arm1.maxChars)) ? Math.max(200, Math.floor(Number(prof.arm1.maxChars))) : 1200,
+        minConf: Number.isFinite(Number(prof.arm1.minConf)) ? Number(prof.arm1.minConf) : fb.arm1.minConf,
+        maxChars: Number.isFinite(Number(prof.arm1.maxChars)) ? Math.max(200, Math.floor(Number(prof.arm1.maxChars))) : fb.arm1.maxChars,
         maxLatencyMs: Number.isFinite(Number(prof.arm1.maxLatencyMs)) ? Math.max(1000, Math.floor(Number(prof.arm1.maxLatencyMs))) : RREF_CONSULT_TIMEOUT_MS, // S9-F1: 档案可配的判定延迟预算,judgeTier 超时上限;S2-F1 默认值单源(thresholds)
         r3Rescue: prof.arm2.rescue !== false,
-        r3MinConf: Number.isFinite(Number(prof.arm2.r3MinConf)) ? Number(prof.arm2.r3MinConf) : 0.85,
-        window: prof.arm1.window === 'all-r1' ? 'all-r1' : 'ambiguous',
+        r3MinConf: Number.isFinite(Number(prof.arm2.r3MinConf)) ? Number(prof.arm2.r3MinConf) : fb.arm2.r3MinConf,
+        window: prof.arm1.window === 'all-r1' ? 'all-r1' : fb.arm1.window,
       };
     })(),
   };

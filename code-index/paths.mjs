@@ -3,7 +3,8 @@
  * 路径真源微 CLI(tray 方案 §16.12-3/§17.1-6,2026-11-15):托盘侧唯一路径获取通道,
  * 与钩子/CLI 永远同源(config.mjs resolveLayout 单一实现),禁止托盘自行复述布局规则。
  *   node paths.mjs          # stdout JSON: { dataDir, hfCacheDir, codeIndexRoot, packed, version }
- * 纯只读;无参数。npm 镜像形态下 here=npm/、version=npm 包版本,resolveLayout 自动走 packed 分支。
+ * 纯只读;无参数。packed 分支由 resolveLayout 自动判定(npm 发布镜像已随渠道弃用删除,
+ *   2026-11-17;packed 判定逻辑保留,复制部署/内嵌形态仍走该分支)。
  */
 import fs from 'node:fs';
 import path from 'node:path';

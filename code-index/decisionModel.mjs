@@ -158,7 +158,9 @@ export function readServerProfiles(dataDir = DATA_DIR) {
 
 /** 当前判定后端 → 生效档案(默认表 → 服务器层;客户端 config profiles 通道已移除,参数权威在档案)。 */
 export function resolveDecisionProfile(config = null, { dataDir = DATA_DIR } = {}) {
-  const cfg = { ...loadConfig(), ...(config || {}) };
+  // 热路径禁止 process.exit:坏 JSON 时 soft 回落,显式 config 仍优先,两者皆不可用才走 FALLBACK 档案。
+  const loaded = loadConfig({ soft: true });
+  const cfg = { ...(loaded._configError ? {} : loaded), ...(config || {}) };
   const isOllama = String(cfg.modelIn) === 'ollama';
   const name = String((isOllama ? (cfg.models && cfg.models.decision) : (cfg.models && cfg.models.localDecision)) || '').trim();
   const backend = name ? `${isOllama ? 'ollama' : 'local'}:${name}` : null;
@@ -240,7 +242,7 @@ export function parseAnswers(json, items = [], { valid = null } = {}) {
  * 远程路径的行为不变:分片并发(默认 2),每请求一个 AbortController 超时;单分片失败只跳过该片,
  * **全部**分片失败才算 error;429/503/网络抖动指数退避(最多 2 次、最长 400ms)。
  * 本地路径:ollama/常驻都串行。两端判定批大小恒 1 题一判(v2.7:chunkSize 不支持配置)。
- * 返回 {answers, usage, latencyMs, endpoint, chunks, failedChunks, retriedChunks, backend, error?}。
+ * 返回 {answers, usage, latencyMs(只覆盖已判分片;零判出=null,消费方记 fail/na), endpoint, chunks, failedChunks, retriedChunks, backend, error?}。
  */
 export async function judgeBatch(args = {}) {
   const { items, criteria = TYPE_CRITERIA, valueRe = null, fetchFn = null, config = null } = args;
@@ -256,7 +258,6 @@ export async function judgeBatch(args = {}) {
     const effChunk = Number(args.chunkSize) > 0 ? Math.min(Math.floor(Number(args.chunkSize)), MAX_QUESTIONS) : 1;
     const chunks = [];
     for (let off = 0; off < items.length; off += effChunk) chunks.push(items.slice(off, off + effChunk));
-    const started = Date.now();
     let endpoint = null;
     let backend = null;
     let failedChunks = 0;
@@ -264,7 +265,9 @@ export async function judgeBatch(args = {}) {
     let skipped = false; // 批量嵌入让行:忙跳过不算故障(调用方不得据此跳闸)
     let usage = null;
     const parsedAll = [];
+    let judgeMs = 0; // S16-F1(20261120 夜):延迟只覆盖已判分片——失败分片的快败耗时(冷启动 2-4ms)不得进延迟样本(dm-bench 曾记伪延迟)
     for (const chunk of chunks) {
+      const cStart = Date.now();
       const lr = await judgeLocal({
         items: [chunk], criteria, valid, config, dataDir: args.dataDir || DATA_DIR,
         fetchFn: fetchFn || fetch, timeoutMs: args.timeoutMs || 30000, retries: args.retries ?? 1,
@@ -283,13 +286,18 @@ export async function judgeBatch(args = {}) {
       if (!raw) { failedChunks += 1; continue; }
       // ONNX 打分路径直接给归一答案图(shaped);ollama systemone 路径直接给归一答案图;文本路径走 extractJson+shapeAnswers
       const shaped = raw.shaped || shapeAnswers(extractJson(raw.text || ''), valid);
-      const parsed = parseAnswers(shaped || {}, chunk, { valid: valid || undefined });      if (!shaped) { failedChunks += 1; continue; }
+      // S2-5(20261119 夜):拆行——原「parseAnswers 赋值与 !shaped 早退」挤同一行,早退条件被误读为赋值失败
+      const parsed = parseAnswers(shaped || {}, chunk, { valid: valid || undefined });
+      if (!shaped) { failedChunks += 1; continue; }
       // S2-F5(20261118):原有一行二次重映射(把 a.id 当「位置+1」再查 chunk)——parseAnswers 已按
       // items 位置解析出真实 id,再重写会在 id≠position+1 时把答案安到别的条目头上(生产 chunkSize=1 零暴露)。
       parsedAll.push(...parsed);
+      judgeMs += Date.now() - cStart;
     }
     parsedAll.sort((a, b) => a.id - b.id);
-    const base = { answers: parsedAll, usage, latencyMs: Date.now() - started, endpoint, chunks: chunks.length, failedChunks, retriedChunks: 0, backend, skipped };
+    if (failedChunks > 0) console.error(`[warn] judgeBatch 部分分片失败(${failedChunks}/${chunks.length}),已判答案照常计票`); // S7-9:静默失败补告警
+    // latencyMs 语义(20261121):已判分片耗时合计;零判出=null(消费方记 fail/na,不再出伪延迟样本)
+    const base = { answers: parsedAll, usage, latencyMs: parsedAll.length ? judgeMs : null, endpoint, chunks: chunks.length, failedChunks, retriedChunks: 0, backend, skipped };
     // 与远程口径一致:只有**全部分片**失败才是 error(触发跳闸/弃权);部分失败只记 failedChunks,
     // 已判出的答案照常计票——否则一次超时就把整轮判定作废 + 误跳断路器
     if (!parsedAll.length) return { ...base, error: `本地决策模型判定失败:${lastErr || '无可解析答案'}` };
@@ -318,7 +326,8 @@ export function appendDecisionLedger({ model, criteria, items, answers, latencyM
     // (实测 200 条共享 25627ms);记录单题均值 = 整批 / 答案数,batchSize 保留批量上下文。
     const nAns = (answers || []).length || 1;
     const rows = (answers || []).map((a) => {
-      const item = byId.get(a.id) || (items || [])[(a.id || 1) - 1] || {};
+      const item = byId.get(a.id) || {}; // S2-F1(20261120 夜):id↔position 兜底回落删——items 传错批次时静默错位比空串更糟,告警显式留痕
+      if (!byId.has(a.id)) console.error(`[warn] appendDecisionLedger 答案 id=${a.id} 无对应 item(调用方 items 批次错位?)`);
       const prompt = String(item.text || '');
       return {
         ts: Date.now(),

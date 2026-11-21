@@ -4,6 +4,7 @@
  * 全部量纲常数随基准同步换算(相对比较与百分比门槛不受影响;档间相对比 1:10:20:72.5 取代旧口径 1:8:15:100)。
  */
 import fs from 'node:fs';
+import { CACHE_TTL_MS } from './thresholds.mjs'; // S1-F4(20261118):缓存 TTL 事实单源
 import path from 'node:path';
 /**
  *
@@ -33,7 +34,7 @@ export const DEFAULT_COST_PROFILE = {
   /** 隐式缓存:自动、命中 20%。 */
   implicit: { hitDiscount: 0.2, hotM: 0.0115, coldM: 0.05 },
   /** 显式缓存:创建 125% / 命中 10% / TTL 5min。 */
-  explicit: { hitDiscount: 0.1, createDiscount: 1.25, hotM: 0.0065, coldM: 0.062, ttlMs: 5 * 60 * 1000 },
+  explicit: { hitDiscount: 0.1, createDiscount: 1.25, hotM: 0.0065, coldM: 0.062, ttlMs: CACHE_TTL_MS }, // S1-F4(20261118):TTL 事实并入 thresholds 单源
   /** 当前计费面(隐式=默认;显式需主动开启,本机以隐式为主)。 */
   cacheMode: 'implicit',
   /** 漏升(该升没升)的返工模型:P2 要连续 2 轮失败才上梯,故空转轮数 = 2。 */
