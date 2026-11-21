@@ -369,14 +369,41 @@ export function refreshAutoModelName({ home = os.homedir(), rate = null } = {}) 
   return out;
 }
 
+/** 当前条目里已写的倍率(ZCode personalModelIds 名 / Qoder displayName,`auto×0.151` 形态)。
+ *  两端都读不到带倍率名(未播种/纯 auto/损坏)→ null(调用方 fail-open 放行刷新)。 */
+function currentAutoRate({ home = os.homedir(), zcodeV2Dir = null } = {}) {
+  try {
+    const raw = fs.readFileSync(zcodeConfigFile({ home, zcodeV2Dir }), 'utf8');
+    const rules = JSON.parse(raw)?.config?.providerConfigRules?.providerRules;
+    const entry = Array.isArray(rules) ? rules.find((r) => r?.providerId === 'tokenSaverModel') : null;
+    const name = (entry?.config?.personalModelIds || []).find(isAutoModelName) || '';
+    const m = /×([\d.]+)/.exec(name);
+    if (m && Number.isFinite(Number(m[1]))) return Number(m[1]);
+  } catch { /* 无 ZCode 条目,试 Qoder */ }
+  try {
+    const dir = fs.existsSync(path.join(home, '.qoder-cn')) ? '.qoder-cn' : '.qoder';
+    const pc = JSON.parse(fs.readFileSync(path.join(home, dir, 'settings.json'), 'utf8'));
+    const m = /×([\d.]+)/.exec(String(pc?.providers?.['tokensaver-auto']?.models?.[0]?.displayName || ''));
+    if (m && Number.isFinite(Number(m[1]))) return Number(m[1]);
+  } catch { /* 无 Qoder 条目 */ }
+  return null;
+}
+
 /** auto×费率动态显示名刷新(20261120 用户裁定:唯一挂载点从 SessionStart(auto.mjs)迁到 6h 黄金集代签
- *  自动拉起)——读 data/usage/auto-blend.json 的全期倍率刷两端条目名。fail-open;返回 {changed,note}。 */
-export function refreshAutoNameFromBlend({ dataDir = DATA_DIR } = {}) {
+ *  自动拉起)——读 data/usage/auto-blend.json 的全期倍率刷两端条目名。fail-open;返回 {changed,note}。
+ *  20261121 用户裁定加偏差死区:与当前条目倍率偏差 <0.05 不刷(每次刷名重写 provider_config 令 ZCode
+ *  列表重载,6h 节流下一天最多 4 次太碎);攒到差异够大才动。无当前值(未播种/纯 auto)不设防照常刷。 */
+const RATE_REFRESH_DEADBAND = 0.05;
+export function refreshAutoNameFromBlend({ dataDir = DATA_DIR, home = os.homedir() } = {}) {
   try {
     const blend = JSON.parse(fs.readFileSync(path.join(dataDir, 'usage', 'auto-blend.json'), 'utf8'));
     const rate = blend && Number.isFinite(Number(blend.globalRate)) ? Number(blend.globalRate) : null;
     if (rate == null || rate <= 0) return { changed: false, note: null };
-    const rr = refreshAutoModelName({ rate });
+    const cur = currentAutoRate({ home });
+    if (cur != null && Math.abs(rate - cur) < RATE_REFRESH_DEADBAND) {
+      return { changed: false, note: `倍率偏差 ${Math.abs(rate - cur).toFixed(3)} <${RATE_REFRESH_DEADBAND},不刷新(当前 auto×${cur.toFixed(3)})` };
+    }
+    const rr = refreshAutoModelName({ rate, home });
     const changed = [rr.zcode, rr.qoder].some((x) => x && (x.refreshed || x.seeded));
     return { changed, note: rr.zcode?.note || rr.qoder?.note || null };
   } catch { return { changed: false, note: null }; }
