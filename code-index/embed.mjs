@@ -339,6 +339,20 @@ chunks.forEach((c, i) => {
 });
 console.log(`[info] 增量:复用 ${hit} / 待嵌入 ${misses.length}(共 ${chunks.length})`);
 
+// 面板实时进度文件(2026-11-21,仿决策向量 build-vectors.progress.json 其七模式):托盘快通道 5s 读一次,
+// done=复用+已嵌(总体口径,增量场景不会假满);开头写一次 hit,面板取 max(meta.chunks, done) 不闪回。
+// 完成后删除(meta 落盘即终值);中断删除(残留文件有 pid 门,死 pid 不被面板采纳,删只为不留脏)。
+const PROGRESS_FILE = path.join(DATA_DIR, 'embed-progress.json');
+const PROGRESS_WRITE_MS = 5_000;
+let progressWrittenAt = 0;
+const noteProgress = (done, force = false) => {
+  const t = Date.now();
+  if (!force && progressWrittenAt && t - progressWrittenAt < PROGRESS_WRITE_MS) return;
+  progressWrittenAt = t;
+  try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify({ done, total: chunks.length, pid: process.pid })); } catch { /* 进度失败不影响嵌入 */ }
+};
+const clearProgress = () => { try { fs.unlinkSync(PROGRESS_FILE); } catch { /* 无文件忽略 */ } };
+
 if (misses.length) {
   // 分批 + 部分落盘(2026-11-10):每 16 批把已嵌入行写到正式路径(paired 只含已完成块)。
   // 崩溃后 rerun 的复用表(md5(块文本)→向量)会跳过已完成块,只补剩余——不再从 0 重来。
@@ -346,6 +360,7 @@ if (misses.length) {
   // 20261120-S4-F4:间隔 8→16——每 8 批全量重写已完成行,4000 块全量重嵌累计 IO≈15×全量(写放大);
   // 崩溃可续语义不变(EMB/PAIRED 对组非原子窗由 buildReuse 字节数校验+代际守卫兜底)。
   const doneRows = []; const doneIdx = [];
+  noteProgress(hit, true); // 开头先落一次:条停在「复用已覆盖」水位,不先掉回旧 meta 值
   const flushPartial = () => {
     fs.mkdirSync(store.dir, { recursive: true });
     const parts = doneRows.map((row) => Buffer.from(Float32Array.from(row).buffer, Float32Array.from(row).byteOffset, Float32Array.from(row).byteLength));
@@ -360,14 +375,16 @@ if (misses.length) {
     for (let b = 0; b * BATCH < misses.length; b++) {
       const idxs = misses.slice(b * BATCH, (b + 1) * BATCH);
       const rowsPart = await emb.embed(idxs.map(i => chunks[i].t));
-      if (rowsPart.length !== idxs.length) { console.error(`[err] 嵌入返回 ${rowsPart.length} 行,期望 ${idxs.length}`); process.exit(1); }
+      if (rowsPart.length !== idxs.length) { console.error(`[err] 嵌入返回 ${rowsPart.length} 行,期望 ${idxs.length}`); clearProgress(); process.exit(1); }
       rowsPart.forEach((row, k) => { vec.set(row, idxs[k] * emb.dim); doneRows.push(row); });
       doneIdx.push(...idxs);
       console.log(`[progress] 嵌入 ${doneRows.length}/${misses.length}`);
+      noteProgress(hit + doneRows.length);
       if ((b + 1) % 16 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
       if (PACE_MS && (b + 1) * BATCH < misses.length) await new Promise(r => setTimeout(r, PACE_MS)); // 批间喘息(WHEA 缓解)
     }
   } catch (e) {
+    clearProgress(); // 中断不留半截进度(残留也有死 pid 门,删除只为不积脏)
     console.error(`[err] 嵌入中断(${String(e?.message || e).slice(0, 200)}),释放锁;冷却结束后自动续嵌`);
     process.exit(1);
   }
@@ -382,6 +399,7 @@ fs.renameSync(EMB_PATH + '.' + process.pid + '.tmp', EMB_PATH);
 fs.writeFileSync(PAIRED_PATH + '.' + process.pid + '.tmp', chunks.map((c) => JSON.stringify(c)).join('\n') + '\n');
 fs.renameSync(PAIRED_PATH + '.' + process.pid + '.tmp', PAIRED_PATH); // 配对快照原子替换(2026-11-10 二次审计 P1-3+M2 漏列):copyFileSync 中途断电=向量与快照错位,下次重嵌被固化
 writeVectorMeta(backend, { model: emb.model, dim: emb.dim, backend, chunks: chunks.length, signature: curSig, builtAt: new Date().toISOString() });
+clearProgress(); // meta 落盘=终值生效,删进度文件,面板条由 meta.chunks 收口(100%)
 console.log(`[ok] 完成:复用 ${hit} + 新嵌入 ${misses.length} = ${chunks.length} × ${emb.dim} 维,耗时 ${((Date.now() - t0) / 1000).toFixed(0)}s(模型仅处理 ${misses.length} 块)`);
 if (backend === 'local') {
   const health = await ensureLocalResident(console.log);

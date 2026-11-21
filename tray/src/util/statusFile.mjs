@@ -126,6 +126,20 @@ export function readBuildVectorsProgress(dataDir) {
   } catch { return null; }
 }
 
+/** data/embed-progress.json(代码索引嵌入实时进度,embed.mjs 每批落盘,2026-11-21)。
+ *  只在 pid 与当前嵌入锁一致时由轮询采用;损坏/缺失=null。done=复用+已嵌(总体口径,不假满)。 */
+export function readEmbedProgressFile(dataDir) {
+  const txt = readTextOnce(path.join(dataDir, 'embed-progress.json'));
+  if (!txt) return null;
+  try {
+    const j = JSON.parse(txt);
+    const done = Number(j?.done);
+    const pid = Number(j?.pid);
+    if (!Number.isFinite(done) || done < 0 || !Number.isInteger(pid)) return null;
+    return { done, total: Number.isFinite(Number(j?.total)) ? Number(j.total) : null, pid };
+  } catch { return null; }
+}
+
 /** data/tray-consent.json(§6 getConsent 契约);缺失/损坏=null(未配置≠已拒绝)。
  * 2026-11-15 用户裁决:缺文件不得伪 false——否则未跑向导的机器面板误显「未同意上传」互惠文案。 */
 export function readConsentFile(dataDir) {

@@ -109,7 +109,7 @@ export function hooksLamps(hooksResult) {
 }
 
 /** §6 getLamps 契约总装。progress 仅展示,不参与绿黄判定。 */
-export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights, exemplarCount = null, knnCovered = null } = {}) {
+export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights, exemplarCount = null, knnCovered = null, embedCovered = null } = {}) {
   const models = modelLamps(health, { localWeights });
   const embed = embedLamp({ health, vectors, chunksLines });
   const knnR = knnLamp({ knn });
@@ -120,9 +120,13 @@ export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksIn
         : knnR.lamp === 'red' ? 'localKnn'
           : knnR.lamp === 'yellow' ? 'baseKnn' : null;
   // 2026-11-15 用户裁决:面板进度=总体状态——done=向量 meta 已嵌块数,total=chunks.jsonl 总索引块
-  // (progress 实时批次仅供内部展示用途,不再进入 detail;embedPct 由总体口径计算)
+  // (progress 实时批次仅供内部展示用途,不再进入 detail;embedPct 由总体口径计算)。
+  // 2026-11-21 延伸(用户问「进度条为何不动」):嵌入中 meta 只在收尾落盘,分子冻结在旧值——
+  // embed.mjs 每批落 embed-progress.json(done=复用+已嵌,同总体口径),分子取 max(meta.chunks, done),
+  // 进度未追上旧 meta 时不回退(同 knnCovered 其七模式);文件被 poller 以活 pid 门控后才传入。
   const embedTotal = chunksLines ?? null;
-  const embedDone = vectors?.meta?.chunks ?? 0;
+  const embedFileDone = vectors?.meta?.chunks ?? 0;
+  const embedDone = Number.isFinite(embedCovered) ? Math.max(embedFileDone, embedCovered) : embedFileDone;
   // 向下取整(2026-11-15 修复):四舍五入会把 99.96% 抬成 100%——绿满条与「部分嵌入」黄灯自相矛盾
   // (5214/5216 实测曾显示 100% 绿条)。仅 done≥total 才 100%,不足一律 <100 → 黄条。
   const embedPct = embedTotal > 0 ? (embedDone >= embedTotal ? 100 : Math.floor((embedDone / embedTotal) * 100)) : null;

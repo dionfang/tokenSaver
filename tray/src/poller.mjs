@@ -134,6 +134,11 @@ export function createPoller(deps) {
     const vectorProgress = embedPid != null && paths.dataDir != null && typeof io.readBuildVectorsProgress === 'function'
       ? io.readBuildVectorsProgress(paths.dataDir) : null;
     const decisionEmbed = !!(vectorProgress && vectorProgress.pid === embedPid);
+    // 代码索引嵌入实时进度(2026-11-21):embed.mjs 每批落 embed-progress.json,分分子取 max(meta.chunks, done)。
+    // 仅活 pid 且 pid 一致才采纳(决策嵌入/残留死 pid 文件不进分子);决策嵌入期间代码条仍走旧口径。
+    const embedProg = !decisionEmbed && embedPid != null && paths.dataDir != null && typeof io.readEmbedProgressFile === 'function'
+      ? io.readEmbedProgressFile(paths.dataDir) : null;
+    const embedCovered = embedProg && embedProg.pid === embedPid ? embedProg.done : null;
     // 决策向量嵌入不把代码索引灯打成「部分嵌入」;代码索引嵌入没有这份进度文件,仍用活 pid。
     const healthForLamps = health
       ? { ...health, embedPid: decisionEmbed ? (health.embedPid ?? null) : embedPid }
@@ -162,6 +167,7 @@ export function createPoller(deps) {
       health: healthForLamps, vectors, chunksLines, knn: knnLayerInput(knnL), hooks: state.hooks, consent, progress, localWeights,
       exemplarCount: readExemplars(),
       knnCovered: decisionEmbed ? vectorProgress.covered : null,
+      embedCovered,
     });
     if (state.statusLine == null && paths.dataDir != null) state.statusLine = io.readLastStatus(paths.dataDir);
     const stale = isCacheStale(cache?.at ?? null, now());
