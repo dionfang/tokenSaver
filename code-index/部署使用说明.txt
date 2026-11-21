@@ -35,11 +35,16 @@ TokenSaver 部署使用说明
   --roots "其他路径"。数据落在旁边 data/。
 
 安装参数:
-  node init.mjs [--roots "路径1[,路径2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
+  node init.mjs [--roots "路径1[,路径2]"] [--set-roots "路径1[,路径2]"] [--model-in ollama|local]
+                [--hooks all|cursor|zcode|qoder] [--routing-on]
 
-  --roots     要索引的目录,逗号分隔;再次运行会合并新增目录;要删除目录,改 JSON 后重跑。
+  --roots     要索引的目录,逗号分隔;再次运行会合并新增目录。
+  --set-roots 逗号分隔目录**整表替换**(与 --roots 的合并语义相反;可重复传,传空=清空)。
+              要删目录用它,或改 JSON 后重跑。
   --model-in  嵌入/决策判定模型来源:ollama 或 local(默认)。
   --hooks     只装指定客户端的钩子。省耗记账功能三端都装;动态模型路由只装 ZCode 与 Qoder。
+  --routing-on 显式开路由记账闭环(写 modelRouting.enabled=true;向导完成步携带;
+              已有配置人工改的 false 原样保留)。
 
 验证安装:node status.mjs
 日常检索:node search.mjs 关键词 --k 5
@@ -111,8 +116,9 @@ TokenSaver 部署使用说明
     switchGuard                上下文过厚时不升档(默认开,阈值 20 万 tokens;
                                同会话连拦 3 次自动放行,拦截时客户端会收到压缩建议)
     l2                        **已回收(2026-11-14 用户裁定)**:L2 影子/实弹融合票恒开(代码常量,
-                               配置键不再读取);阈值(minSim 0.55/minConf 0.6/live 0.3)属标定
-                               域走代码默认,不暴露给用户配置面
+                               shadow/live.enabled 配置键不再读取);阈值(minSim 0.55/minConf
+                               0.6/live 0.3)属标定域走代码默认,旧阈值键(l2.minSim/minConf、
+                               l2Live.minConf)标定域内一个版本窗口仍可读,不属用户配置面
     r3Lexical                 **已回收**:R3 词法通道与 P2 提前一拍恒开(代码常量,enabled/
                                eagerEscalate 不可配);词表本体在 tierClassify.mjs
     decisionModel              四票合议代签的判定模型(2026-11-09 v4 本地化收口:判定
@@ -135,7 +141,7 @@ TokenSaver 部署使用说明
                                注入行,记账照常;仅路由宿主生效)
 
   综合费率(自动;modelRouting.blendNotice.enabled 默认 true):会话选 auto 后,每轮注入
-  一行"auto 综合费率 ×N.NNN"——最近会话的实际花费 ÷ 同样 tokens 全走 R3 的花费(R3=1x 基准)
+  一行"[model-routing] auto 综合费率 ×N.NNN"——最近会话的实际花费 ÷ 同样 tokens 全走 R3 的花费(R3=1x 基准)
   (×1.0=纯 R1;每用一个高档轮倍率抬升;关开关只停注入,记账照常)。
   价格按四个难度档位计价(不按真实模型),来自 data/routing/model-prices.json 的
   tiers 段(每档 input/cacheRead/output 单价,元/M tokens;cacheWrite 可选,缺省按
@@ -156,7 +162,7 @@ transformers.js 常驻进程)。清理有两条触发线:
 
 2) 宿主关闭后 → 全部及时清理
    ZCode 的钩子只有七个事件、没有 SessionEnd,拿不到"宿主要走"的信号,因此会话开始
-   时会拉一个脱离父进程的看护(cleanup-watch.mjs):祖先链上的进程全死、且本会话所属的
+   时会拉一个脱离父进程的看护(cleanupWatch.mjs):祖先链上的进程全死、且本会话所属的
    宿主应用(ZCode/Cursor/Qoder)一个都不在了,就卸掉全部驻留模型并停常驻进程。
    多开窗口时模型是共享的:还有别的会话在用就不卸,等最后一个会话结束才统一清。
 
@@ -178,12 +184,12 @@ TokenSaver deployment guide
 2. Embedding/reranker/decision models, pick one (decision judges on the same path;
    local by default):
    - local (recommended, no external service): weights cached in code-index/hf-cache
-     (embedding + reranker + decision ≈1.5GB with q4f16; q8 weights removed — re-fetch if switching back, metrics archived in data/routing/profile-calibration-strands-q8.md — copy the whole directory when
+     (decision ONNX ≈1.0GB with q4f16 + embedding + reranker ≈1.5GB total; q8 weights removed — re-fetch if switching back, metrics archived in data/routing/profile-calibration-strands-q8.md — copy the whole directory when
      copy-deploying). Missing models
      download automatically on first use.
    - ollama: install and start Ollama yourself, then pull by hand (this tool never
-     Version pin: **Ollama 0.40.15** (measured bulk embedding ~0.83s/chunk; 0.40.16 regressed to 1.17-1.42s/chunk, ~1.5x slower; 0.40.7 in between with high variance; /v1/systemone decision endpoint compatible on all three). Re-benchmark with the same protocol before upgrading.
-     starts Ollama or pulls for you):
+     starts Ollama or pulls for you).
+     Version pin: **Ollama 0.40.15** (measured bulk embedding ~0.83s/chunk; 0.40.16 regressed to 1.17-1.42s/chunk, ~1.5x slower; 0.40.7 in between with high variance; /v1/systemone decision endpoint compatible on all three). Re-benchmark with the same protocol (batch 32, free VRAM, 90s double-sampling) before upgrading.
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16
        ollama pull tev1:0.8b (decision judge)
@@ -209,13 +215,19 @@ Option B: copy deployment
   directory beside it.
 
 init options:
-  node init.mjs [--roots "path1[,path2]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
+  node init.mjs [--roots "path1[,path2]"] [--set-roots "path1[,path2]"] [--model-in ollama|local]
+                [--hooks all|cursor|zcode|qoder] [--routing-on]
 
-  --roots     Directories to index, comma-separated; re-running merges new ones; to
-              remove a directory, edit the JSON and re-run.
+  --roots     Directories to index, comma-separated; re-running merges new ones.
+  --set-roots Comma-separated directories that **replace the whole list** (opposite of
+              --roots, which merges; repeatable; an empty value clears it). Use it to
+              remove a directory, or edit the JSON and re-run.
   --model-in  Embedding / decision-judge model source: ollama or local (default).
   --hooks     Install hooks for the selected client only. The Token Ledger installs on
               all three clients; dynamic model routing on ZCode and Qoder only.
+  --routing-on Explicitly enable the routing-accounting loop (writes
+              modelRouting.enabled=true; carried by the wizard's finish step; a manual
+              false in an existing config is preserved).
 
 Verify: node status.mjs
 Daily search: node search.mjs keywords --k 5
@@ -338,7 +350,7 @@ existing config is never overwritten):
                                hosts only)
 
   Blended rate (automatic; modelRouting.blendNotice.enabled defaults to true): once a
-  session selects auto, every turn carries a line "auto 综合费率 ×N.NNN" — the latest
+  session selects auto, every turn carries a line "[model-routing] auto 综合费率 ×N.NNN" — the latest
   session's actual spend ÷ what the same tokens would cost entirely on R3 (R3 = 1x base,
   the 2026-11-06 rebase; each high-tier turn bumps it up; the switch only stops the
   line, accounting continues). Prices are per difficulty tier (not per real model),
@@ -364,7 +376,7 @@ resident process). Cleanup has two triggers:
 
 2) After the host closes — everything is released promptly
    ZCode's hooks expose seven events and no SessionEnd, so no callback can announce "the
-   host is going away". Instead, a detached watcher (cleanup-watch.mjs) is started with
+   host is going away". Instead, a detached watcher (cleanupWatch.mjs) is started with
    the session: once every process on the ancestor chain is gone and the session's own
    host application (ZCode/Cursor/Qoder) is no longer running, it unloads every resident
    model and stops the resident process. With several windows open the models are

@@ -83,18 +83,22 @@ node status.mjs
 ### 初始化参数
 
 ```bash
-node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
+node init.mjs [--roots "<路径1>[,<路径2>...]"] [--set-roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder] [--routing-on]
 ```
 
 `--roots`:逗号分隔的扫描目录,写入 `data/code-index.config.json`。正斜杠、反斜杠都可以。
 
 - 不传且还没有配置:用工具仓 git 根。
 - 不传且已有配置:按文件里的 `roots` 自愈(仍存在的保留,失踪的按兄弟目录猜一次),不把工具仓自己塞进名单;然后给这些 git 仓挂钩子并后台建索引。
-- 传入:与已有 `roots` 合并(纳入,不去掉旧的)。不存在的路径跳过。要删目录,改 JSON 后重跑不带参数的 `init`。
+- 传入:与已有 `roots` 合并(纳入,不去掉旧的)。不存在的路径跳过。要删目录,用 `--set-roots` 整表替换(传空=清空),或改 JSON 后重跑不带参数的 `init`。
+
+`--set-roots`:逗号分隔目录**整表替换**(与 `--roots` 的合并语义相反;可重复传,传空=清空)。
 
 `--hooks`:`all` | `cursor` | `zcode` | `qoder`。只写选中工具的会话 hook,不改其他工具已有文件。不传时的识别规则见「项目简介」的两模块兼容范围:省耗记账三端都装,动态模型路由只装 ZCode 与 Qoder。
 
 `--model-in`:`ollama` 或 `local`,写入 `modelIn`,不改模型名。新建配置时不传则为 `local`。已有配置时不传则保持原路径。
+
+`--routing-on`:显式开启路由记账闭环(写入 `modelRouting.enabled=true`;向导完成步携带)。已有配置人工改的 false 原样保留。
 
 ### 配置
 
@@ -117,7 +121,7 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--model-in ollama|local] [--
 |---|---|
 | `roots` | 扫描目录。优先级:`--roots` > 环境变量 `CODE_INDEX_ROOTS` > 本文件 |
 | `modelIn` | `ollama` 或 `local`。优先级:`--model-in` > 本文件 > `local` |
-| `skipDirs` | 跳过的目录名。写了就整表替换,不是追加。默认已跳过依赖、构建产物和编辑器目录。新生成的配置还会加上 `code-index`、`.cursor`、`.zcode` |
+| `skipDirs` | 跳过的目录名。写了就整表替换,不是追加。默认已跳过依赖、构建产物和编辑器目录。新生成的配置还会加上 `code-index`、`.cursor`、`.zcode`、`.qoder` |
 | `exts` | 收录的扩展名,不带点 |
 | `jsonWhitelist` | 允许收录的 json 文件名。默认 `package.json`、`pages.json`、`manifest.json`、`tsconfig.json` |
 | `maxFileBytes` | 单文件上限。默认 `819200` |
@@ -248,18 +252,22 @@ If you copied only `code-index/`, [`部署使用说明.txt`](code-index/部署�
 ### init options
 
 ```bash
-node init.mjs [--roots "<path1>[,<path2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder]
+node init.mjs [--roots "<path1>[,<path2>...]"] [--set-roots "<path1>[,<path2>...]"] [--model-in ollama|local] [--hooks all|cursor|zcode|qoder] [--routing-on]
 ```
 
 `--roots`: comma-separated directories to scan, written to `data/code-index.config.json`. Forward slashes and backslashes both work.
 
 - Omitted, and no config yet: use the git root of the tool repo.
 - Omitted, and config already exists: heal `roots` from the file (keep paths that still exist; guess a missing one once from a sibling directory). Do not add the tool repo itself. Then attach hooks to those git repositories and build the index in the background.
-- Passed: merge into the existing `roots` (add, do not drop old entries). Skip paths that do not exist. To remove a directory, edit the JSON and run `init` with no arguments.
+- Passed: merge into the existing `roots` (add, do not drop old entries). Skip paths that do not exist. To remove a directory, replace the whole list with `--set-roots` (empty value clears it), or edit the JSON and run `init` with no arguments.
+
+`--set-roots`: comma-separated directories that **replace the whole list** (opposite of `--roots`, which merges; repeatable; an empty value clears it).
 
 `--hooks`: `all` | `cursor` | `zcode` | `qoder`. Only the selected tool's session hooks are written. Files for the other tools are left as they are. When the flag is omitted, detection follows the two-module compatibility scope under "Overview": the Token Ledger installs on all three clients, dynamic model routing on ZCode and Qoder only.
 
 `--model-in`: `ollama` or `local`. It writes `modelIn` and does not change model names. Omitted on a new config, the path is `local`. Omitted when a config already exists, the current path is kept.
+
+`--routing-on`: explicitly enable the routing-accounting loop (writes `modelRouting.enabled=true`; carried by the wizard's finish step). A manual `false` in an existing config is preserved.
 
 ### Configuration
 
@@ -282,7 +290,7 @@ Project settings live in `data/code-index.config.json`, beside `code-index/`. Ke
 |---|---|
 | `roots` | Directories to scan. Precedence: `--roots` > `CODE_INDEX_ROOTS` > this file |
 | `modelIn` | `ollama` or `local`. Precedence: `--model-in` > this file > `local` |
-| `skipDirs` | Directory names to skip. A value replaces the whole list; it does not append. The default already skips dependency, build, and editor directories. A newly generated config also adds `code-index`, `.cursor`, and `.zcode` |
+| `skipDirs` | Directory names to skip. A value replaces the whole list; it does not append. The default already skips dependency, build, and editor directories. A newly generated config also adds `code-index`, `.cursor`, `.zcode`, and `.qoder` |
 | `exts` | Extensions to index, without the leading dot |
 | `jsonWhitelist` | JSON filenames allowed into the index. Default: `package.json`, `pages.json`, `manifest.json`, `tsconfig.json` |
 | `maxFileBytes` | Per-file size cap. Default `819200` |

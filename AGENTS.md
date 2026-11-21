@@ -31,7 +31,7 @@
 
 14. **修复日志归档**:每次 bug 修复**轮次**收尾时,在本仓 `agent_reports/fix-logs/`(无则创建)落一份当轮修复日志,文件名 `fix-<YYYYMMDD>-<主题>.md`,内容至少五段:①输入文档与条目数 ②已修清单(file:行 + 验证方式) ③留待清单与理由 ④门禁/回归结果 ⑤关联指针(台账 id、缺陷文档回执位置、`bugfix-sop.md` 复盘条目)。复盘流水的当轮条目回链该日志;日志属本地资产(`agent_reports/` 已 ignore),不 commit。跨会话追溯路径:缺陷文档回执(第 12 条)→ 修复日志(本条)→ SOP 复盘(第 13 条)三层互链
 
-15. **测试脚本组织**(按仓适用:三域分目录是 TokenSaver 路由栈的现状;测试平铺的仓(如 TSServer)按该仓现状落位,勿迁移目录):test/ 按被测域分目录——`routing/`(模型路由与成本)/`decision/`(判定与代签)/`hooks/`(钩子与端上守卫);全局基建套件放 test/ 根,实弹评测工具进 `test/scripts/`,历史 work 档案进 `test/archive/`;新增测试脚本必须落在对应域目录,并同步 `test/readme.md` 登记与 code-index/package.json 门禁链——链外测试等于没有守卫
+15. **测试脚本组织**(按仓适用:按被测域分目录是 TokenSaver 路由栈的现状;测试平铺的仓(如 TSServer)按该仓现状落位,勿迁移目录):test/ 按被测域分目录——`routing/`(模型路由与成本)/`decision/`(判定与代签)/`hooks/`(钩子与端上守卫)/`tray/`(托盘客户端接入面);全局基建套件放 test/ 根,实弹评测工具进 `test/scripts/`,历史 work 档案进 `test/archive/`;新增测试脚本必须落在对应域目录,并同步 `test/readme.md` 登记与 code-index/package.json 门禁链——链外测试等于没有守卫
 
 <!-- output-diet-v10 -->
 ## 输出纪律(省话不省工) / Output discipline: less talk, same work

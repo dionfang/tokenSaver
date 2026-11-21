@@ -156,7 +156,8 @@ export const DEFAULT_CONFIG = {
   embedCpuThreads: Math.max(2, Math.min(4, Math.floor(os.cpus().length / 4))),
   // 自愈补拉节流(2026-11-14 用户定案:可配置;2026-11-16 默认改 60000):模型被驱逐/缺位后,两次补拉之间的最小间隔。
   //   默认 60000=1 分钟(精排掉线滞后窗口实测 10min 太宽,用户裁决收紧);调大=更省电但滞后久。
-  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。⚠ 消费侧兜底 modelStatus.mjs:1080 的 ||60000 须同改(默认双点)。
+  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。⚠ 消费侧兜底 modelStatus.mjs 的 warmMinInterval
+  //   兜底行(搜「|| 60000」,行号随编辑漂移以符号为准)须同改(默认双点)。
   warmMinIntervalMs: 60000,
   // Ollama runner 异常自愈(2026-11-17 用户定案,默认开):检测 server.log 近 5 分钟
   //   ≥2 条 "llm server error" 且期望模型未驻留(连载 2 轮健康评估计数)⇒ spawn 重启
@@ -183,12 +184,12 @@ export const DEFAULT_CONFIG = {
   // 多模型路由门控(model-routing.md #11):默认全关。enabled=true 后 prompt-guard 才跑 L1 分类+路由日志;
   // 二次人工配置:改 data/code-index.config.json 的 modelRouting 段(2026-11-03 起 role 两档制已废:routeMode/roles/chains
   // 均不再被读取,四档链恒由快照派生;providerPriority/brandPriority 仍生效)。
-  // l2(2026-11-07 收口为嵌套键;旧顶层 l2Shadow/l2Live/旧 l2.minSim 兼容读一个版本期,读法统一在 modelRoute.mjs mrL2Options):
-  //   {shadow=false 嵌入器总闸——L2 kNN/影子级联要 true 才加载嵌入模型(影子起子进程会与主会话争资源,默认关);
-  //    vote:{minSim 0.55, minConf 0.6} 代签投票阈值;
-  //    live:{enabled=false, minConf=0.3} 代理实弹 L2 融合票(词法判 R1 但 kNN 投 multi 且置信≥minConf ⇒ 救回 R2,
-  //    只救回不压制),依赖嵌入模型与向量库;shadow 关则两条支路都拿不到嵌入器。
-  //   minConf 2026-11-06 实测定档 0.3(=旧口径 0.75 的同分位操作点;置信口径换边际差值后旧 0.6-0.8 几乎不触发)。
+  // l2(2026-11-21 死键模板回收,doc-drift B-1):DEFAULT 不再携带 l2/decisionModel 模板——L2 融合票恒开
+  //   (2026-11-14 用户裁定,代码常量),读法统一在 modelRoute.mjs resolveL2Config:shadow/liveEnabled 恒 true
+  //   不读配置;标定域阈值 vote.minSim/vote.minConf/live.minConf 仍回落读旧键(l2.vote.*、旧 l2.minSim/minConf、
+  //   l2Live.minConf),缺省走 L2_MIN_SIM/L2_MIN_CONF/0.3 常量,行为与模板存在时完全一致。decisionModel 段
+  //   (enabled/model/providers)零读者(2026-11-14 收口,判定参数走 decisionModel.mjs 档案表),一并回收;
+  //   init scaffold 本就不播种这两段,存量 data JSON 里的同名键按上述回落语义继续被读/忽略,无需清理。
   // brandPriority(2026-11-03 用户需求):自定义品牌调用顺序,只决定"同一档位内谁先被调"(四档链档内排序主键),
   //   **不影响档位归属**(tierOfModel/classifyDifficulty/resolveTier 级联照旧)——即"不影响动态模型路由的调用档位"。
   //   未在列表里的品牌排到所有已列品牌之后;可改 data/code-index.config.json 的 modelRouting.brandPriority 覆盖。
@@ -221,7 +222,7 @@ export const DEFAULT_CONFIG = {
   //   grow=false 只评不扩样;fitCost=true 从 proxy-usage.jsonl 反标定冷热轮实测值(默认用人工画像);
   //   dry=true 只出报告不落档案;allowBoost=false 学到的高纯度信号也只降不升(升档代价 8 倍,升权是加杠杆)。
   modelRouting: { enabled: true, // 20261120 裁定A:路由记账/样本生长闭环全新安装默认开(注入行仅多一行提示);人工改 false 原样保留
- retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, l2: { shadow: false, vote: { minSim: 0.55, minConf: 0.6 }, live: { enabled: false, minConf: 0.3 } }, decisionModel: { enabled: false, model: '', providers: [{ baseUrl: '', apiKey: '', path: '' }] }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: MAX_PHASE_TURNS, switchGuard: { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
+ retryOnRateLimit: true, maxRetries: 2, providerPriority: [], blendNotice: { enabled: true }, brandPriority: ['glm', 'deepseek', 'qwen', 'minimax', 'kimi', 'grok', 'claude', 'gpt', 'gemini'], modelTiers: { normal: ['deepseek', 'glm', 'qwen', 'minimax'], mid: ['kimi', 'grok', 'gemini'], high: ['claude', 'gpt'] }, lightSuffixes: ['flash', 'preview', 'coding', 'code', 'coder', 'turbo', 'mini', 'air', 'nano', 'event', 'haiku', 'luna', 'lite', 'base', 'sol', 'sonnet'], maxPhaseTurns: MAX_PHASE_TURNS, switchGuard: { enabled: true, maxContextTokens: SWITCH_GUARD_MAX_CONTEXT_TOKENS }, tierOptimize: { enabled: false, minIntervalMs: 6 * 60 * 60 * 1000, folds: 5, minN: 6, priorN: 8, grow: true, fitCost: false, dry: false, allowBoost: false } },
 };
 
 export function loadConfig({ soft = false } = {}) {

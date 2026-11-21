@@ -38,6 +38,11 @@
 
 **测试与门禁**
 - 门禁链修复 && 缺失、npm 链补齐;新增密闭性自检门禁(gate-enclosure,支持子目录)
+
+**夜审 20261120 批量修复轮(75 发现→33 fixed)**
+- 注入过滤三形态+tier-evidence 再生自检;decisionProfiles 守卫+突变红;judgeMs 只计已判分片
+- soft config 全家(坏 JSON 隔离子进程 exit 0)/read-guard 管道+短名归化/onnx-weights.json 字节表单源/NUL 三路嗅探/allowLocalModels 统一 true
+- 批次1 文档(CRON 四方对齐每日 22:05/CHANGELOG 0.2.x/init 第 15 条按仓适用注记全盘重部署)
 - 判定类测试进程级隔离(后台嵌入不再打红密闭测试)
 - 四支顶层评测脚本统一 NO_LEDGER + backup-then-write 写盘纪律
 - 节流负龄放行 ×6(时钟回拨不再永久卡死);keep_alive 阈值双写归一
@@ -58,6 +63,10 @@
 - **proxy 看护兜底**:托盘 60s proxyWatchdog(--ensure 空载荷保活),代理进程死亡不再无人拉起
 - **routing-on 裁定 A(2026-11-20)**:新装默认 `modelRouting.enabled=true`(init `--routing-on` 旗标+向导 DONE 携带),人工改 false 原样保留
 - **0.2.10/0.2.11 安装链加固**:权重就绪改字节级门(半截文件不再过存在性门)、重装「无法关闭」根治(三层查杀宏 ts-kill-children.ps1)、hook-relay.exe 随包、开机自激活 pending.json(已下载未装的新版启动自检)
+- **面板嵌入进度条实时跟进(0.2.11 已含)**:embed.mjs 每批落 `embed-progress.json`(done=复用+已嵌,总体口径),面板代码索引条嵌入中实时爬升,不再冻结到收尾才跳终值
+- **「检查应用更新」两修(0.2.11 已含)**:已是最新版不再弹窗(面板绿文案即够);点「立即安装」向导拉起失败根治(旧 setTimeout 随主进程退出被吞,改同步拉起再退出)
+- **embed 族超时 1h→6h(下一批包)**:客户端 CPU 限线程嵌入全量 >1.2h,旧值准点树杀成「每次满 1 小时结束嵌入」;6h 与 `.embed.pid` 锁 TTL 同口径
+- **auto 刷名偏差死区 0.05(下一批包)**:6h grow 同拍刷名一天最多 4 次重写 provider_config 令 ZCode 列表重载;现与当前条目倍率偏差 <0.05 不刷,攒到差异够大再动(未播种/纯 auto 不设防照常刷)
 
 ### 文档
 
