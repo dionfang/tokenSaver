@@ -5,7 +5,10 @@
  */
 import { spawn } from 'node:child_process';
 
-export const TIMEOUTS = { status: 30_000, hooksStatus: 15_000, warm: 120_000, auto: 300_000, init: 300_000, import: 60_000, pull: 600_000, embed: 3_600_000 };
+// embed:1h→6h(2026-11-21 测试机实锤):客户端 CPU 限线程嵌入全量 ≈1s/块,4419 块首建 >1.2h,
+// 旧 1h 超时准点树杀→「每次满 1 小时结束嵌入」来回点好几轮才攒完。6h 与 .embed.pid 锁 TTL/面板
+// 读锁 TTL 同口径(proc.mjs LOCK_TTL_MS),慢机一次点完;真僵死也在 6h 内被收尸,锁 TTL 保证面板可见性恢复。
+export const TIMEOUTS = { status: 30_000, hooksStatus: 15_000, warm: 120_000, auto: 300_000, init: 300_000, import: 60_000, pull: 600_000, embed: 6 * 3_600_000 };
 const MUTEX_FAMILIES = new Set(['warm', 'auto', 'init', 'import', 'pull']); // pull 互斥(2026-11-17 M3:拉模型与 warm/init 抢资源);embed 自持 .embed.pid 锁不入互斥族
 
 /** 树杀命令构造(纯函数,供单测):Windows=taskkill /PID x /T /F,其余平台退化为 kill -9。 */
