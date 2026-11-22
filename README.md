@@ -11,10 +11,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 **模块二:动态模型路由(AutoTier)**——init 后本地代理(127.0.0.1:8117)即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(以 R3=1x 为基准:R1 日常 0.05x / R2 增强 0.5x / R4 奢侈 3.625x)调度真实模型,贵模型只在必要时使用;配合健康滑链、门控疲劳放行与自进化闭环持续降本。**仅 ZCode 与 Qoder 两个客户端支持,且只对自定义模型中以 Anthropic Messages 协议接入的模型生效**(会话不选 auto 或模型不是该接入方式时,零行为)。
 
 适合在本地代码库上用 Agent 开发。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
-
-另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板 + 公共决策包一键更新/本地向量上传(均带同意门禁)+ 应用自更新(唯一入口=托盘菜单「检查应用更新」,无自动静默检查;差量下载 + sha512 完整性门 fail-closed,下载完成弹「立即安装(推荐)/稍后」→ 可见安装向导,启动时已下载未装的新版只提示不自动装,仅升不降);能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
 ![微信图片_20261105220119.png](https://raw.gitcode.com/user-images/assets/11189521/7fabff6c-6f9b-44a9-943b-fbc69d24b447/微信图片_20261105220119.png '微信图片_20261105220119.png')
-![default.jpg](https://raw.gitcode.com/user-images/assets/11189521/99072fb5-0580-4656-a221-c58602df62ec/default.jpg 'default.jpg')
 ### 工作方式
 
 #### 省耗记账(要点)
@@ -52,9 +49,23 @@ ollama pull tev1:0.8b
 
 `init` 会安装依赖、写配置、接线 hook,并在后台建索引、预热。用 `node status.mjs` 确认就绪。参数名写错、缺少取值,或 `--model-in` / `--hooks` 取值非法时,报错退出且不改配置。`--roots=路径` 与 `--model-in=local` 这种写法也可以。
 
-#### 独立工具(推荐)
+#### 客户端安装(托盘守护程序,推荐)
+
+安装包随 Release 发布:在线包 ≈225MB(三 CPU 权重装后向导自动在线下载,带镜像回退)与完整离线包 ≈1.48GB(权重随包,离线环境用)。双击安装即可;未完成首次配置时双击只开安装向导,完成后双击直接进托盘。
+
+首次配置走安装向导五步:运行模式选择(cpu/gpu)→ 环境自检(缺项自动安装:权重在线下载/ollama pull,带真百分比进度)→ 数据上传(可选;参与公共决策包互惠的唯一同意入口)→ 接线(自动完成 `init`:目录登记、三端钩子、路由开关)→ 完成(同会话无缝转入托盘)。
+
+之后由托盘守护程序负责日常运行:四组状态灯 + 面板自检反映索引与三个本地模型状态;「更新公共决策包」一键先上传本地已签向量再下载公共决策包;应用升级走托盘菜单「检查应用更新」(差量下载 + sha512 完整性门)。全程无需命令行。
+
+两类数据落点:①向量索引数据(分块/向量/配置/记账账本)在 `%LOCALAPPDATA%\TokenSaver\data`;②模型文件在 `%USERPROFILE%\.tokensaver\hf-cache`(cpu 模式的三权重,由安装器/向导下载),gpu 模式的模型由 Ollama 自管(默认 `%USERPROFILE%\.ollama\models`)。
+
+![default.jpg](https://raw.gitcode.com/user-images/assets/11189521/99072fb5-0580-4656-a221-c58602df62ec/default.jpg 'default.jpg')
+
+#### 纯命令行工具(不安装托管守护程序)
 
 数据写在本仓库 `data/`,不写进被索引的项目。
+
+两类数据落点:①向量索引数据(分块/向量/配置/记账账本)在仓库根的 `data/`;②模型文件——`--model-in local`(默认)在 `code-index/hf-cache`(三模型约 1.5GB,不入库,缺失时首次使用自动下载),`--model-in ollama` 由 Ollama 自管(默认 `%USERPROFILE%\.ollama\models`,不随目录复制)。
 
 ```bash
 git clone https://gitcode.com/dionfang/TokenSaver.git
@@ -182,8 +193,6 @@ TokenSaver is a local agent productivity tool with two core feature modules.
 
 Built for agent-based development on local repositories. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
-An optional desktop tray client lives in `tray/` (Electron): tray status lamps + dual-channel polling + install wizard/self-check panel + one-click decision-pack update / local vector upload (both consent-gated) + app self-update (the tray menu "check for app updates" is the only entry — no automatic silent check; differential download with a fail-closed sha512 integrity gate; after download a dialog offers "install now (recommended) / later", and choosing it launches the visible installer wizard; an already-downloaded update is only announced at startup, never auto-installed; upgrades only); all capabilities spawn `code-index` micro-CLIs, with zero import coupling to the host (engineering red line guarded by `test/tray/importBan.test.mjs`).
-
 ### How it works
 
 #### Token Ledger (key points)
@@ -221,9 +230,23 @@ If the model names were changed in `code-index/config.mjs`, pull those names ins
 
 `init` installs dependencies, writes config, attaches hooks, and builds and warms the index in the background. Confirm it is ready with `node status.mjs`. A bad flag name, a missing value, or an illegal `--model-in` / `--hooks` value exits with an error and does not change config. `--roots=path` and `--model-in=local` are also accepted.
 
-#### Standalone tool (recommended)
+#### Client install (tray guardian, recommended)
+
+The installer ships with the Release: the online package ≈225MB (three CPU weights are downloaded by the wizard right after install, with mirror fallback) and the full offline package ≈1.48GB (weights bundled, for offline machines). Double-click to install; before first-time setup is finished, double-clicking opens the installer wizard only, and afterwards it opens straight into the tray.
+
+First-time setup runs the five-step wizard: run mode (cpu/gpu) → environment self-check (missing items auto-install: online weight download / ollama pull, with real progress) → data upload (optional; the only consent entry for the decision-pack reciprocity) → wiring (runs `init` automatically: root registration, hooks for all three clients, routing switch) → finish (seamlessly hands over to the tray in the same session).
+
+Afterwards the tray guardian handles day-to-day operation: four status lamps + panel self-check reflect the index and the three local models; "update decision pack" uploads locally signed vectors first, then downloads the public pack; app upgrades go through the tray menu "check for app updates" (differential download + sha512 integrity gate). No command line needed.
+
+Two kinds of data live in fixed locations: (1) vector-index data (chunks / vectors / config / ledgers) in `%LOCALAPPDATA%\TokenSaver\data`; (2) model files in `%USERPROFILE%\.tokensaver\hf-cache` (the three CPU-mode weights, downloaded by the installer/wizard), while gpu-mode models are managed by Ollama itself (default `%USERPROFILE%\.ollama\models`).
+
+![default.jpg](https://raw.gitcode.com/user-images/assets/11189521/99072fb5-0580-4656-a221-c58602df62ec/default.jpg 'default.jpg')
+
+#### Pure CLI (no guardian install)
 
 Data is written to this repo's `data/`, not into the projects being indexed.
+
+Two kinds of data live in fixed locations: (1) vector-index data (chunks / vectors / config / ledgers) in the repo-root `data/`; (2) model files — with `--model-in local` (default) in `code-index/hf-cache` (three models, ~1.5GB, not in git, downloaded on first use), with `--model-in ollama` managed by Ollama itself (default `%USERPROFILE%\.ollama\models`, not copied with the directory).
 
 ```bash
 git clone https://gitcode.com/dionfang/TokenSaver.git
