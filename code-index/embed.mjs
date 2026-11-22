@@ -331,10 +331,11 @@ if (reuse) {
 
 const vec = new Float32Array(chunks.length * emb.dim);
 const misses = [];
+const reusedRows = []; const reusedIdx = []; // 20261122 修复:复用行并入持久对组(见 flushPartial),重跑中断不再缩水持久水位
 let hit = 0;
 chunks.forEach((c, i) => {
   const v = reuseMap?.get(md5(c.t));
-  if (v) { vec.set(v, i * emb.dim); hit++; }
+  if (v) { vec.set(v, i * emb.dim); hit++; reusedRows.push(v); reusedIdx.push(i); }
   else misses.push(i);
 });
 console.log(`[info] 增量:复用 ${hit} / 待嵌入 ${misses.length}(共 ${chunks.length})`);
@@ -354,19 +355,24 @@ const noteProgress = (done, force = false) => {
 const clearProgress = () => { try { fs.unlinkSync(PROGRESS_FILE); } catch { /* 无文件忽略 */ } };
 
 if (misses.length) {
-  // 分批 + 部分落盘(2026-11-10):每 16 批把已嵌入行写到正式路径(paired 只含已完成块)。
-  // 崩溃后 rerun 的复用表(md5(块文本)→向量)会跳过已完成块,只补剩余——不再从 0 重来。
-  // 完成后的全量写仍在下方(全量 vec + 全量 chunks 配对),部分文件只存在于中途。
-  // 20261120-S4-F4:间隔 8→16——每 8 批全量重写已完成行,4000 块全量重嵌累计 IO≈15×全量(写放大);
-  // 崩溃可续语义不变(EMB/PAIRED 对组非原子窗由 buildReuse 字节数校验+代际守卫兜底)。
+  // 分批 + 部分落盘(2026-11-10):定期把已完成行原子写到正式路径——崩溃后 rerun 的复用表按
+  // md5(块文本) 跳过已完成块只补剩余,不再从 0 重来;完成后的全量写仍在下方,部分文件只存在于中途。
+  // 20261120-S4-F4 间隔 8→16(写放大);20261122 回调 16→4——托盘死线树杀实测每轮丢最多 255 块新算力,
+  // 4 批(local=64/ollama=128 块)把单次中断损失压回一个数量级,写放大换持久水位只涨不缩,规模内可接受。
+  // 20261122 修复:flush 覆盖写必须并入复用行(reusedRows/reusedIdx)——旧行为只写本 run 新嵌行,
+  // 重跑中断会把已复用的持久水位挤掉(掉回幅度从「丢尾巴」放大成「丢整个此前持久层」)。
+  // EMB/PAIRED 两 rename 非原子窗仍由 buildReuse 字节数校验+代际守卫兜底(杀进窗口=判 null 全量重嵌,fail-safe)。
   const doneRows = []; const doneIdx = [];
   noteProgress(hit, true); // 开头先落一次:条停在「复用已覆盖」水位,不先掉回旧 meta 值
   const flushPartial = () => {
     fs.mkdirSync(store.dir, { recursive: true });
-    const parts = doneRows.map((row) => Buffer.from(Float32Array.from(row).buffer, Float32Array.from(row).byteOffset, Float32Array.from(row).byteLength));
+    // 行序无关:buildReuse 按 md5(块文本) 配对,只要求 EMB 行 i ↔ PAIRED 行 i 平行
+    const allRows = reusedRows.concat(doneRows);
+    const allIdx = reusedIdx.concat(doneIdx);
+    const parts = allRows.map((row) => Buffer.from(Float32Array.from(row).buffer, Float32Array.from(row).byteOffset, Float32Array.from(row).byteLength));
     fs.writeFileSync(EMB_PATH + '.' + process.pid + '.tmp', Buffer.concat(parts));
     fs.renameSync(EMB_PATH + '.' + process.pid + '.tmp', EMB_PATH);
-    const pairedTxt = doneIdx.map((i) => JSON.stringify(chunks[i])).join('\n') + '\n';
+    const pairedTxt = allIdx.map((i) => JSON.stringify(chunks[i])).join('\n') + '\n';
     fs.writeFileSync(PAIRED_PATH + '.' + process.pid + '.tmp', pairedTxt);
     fs.renameSync(PAIRED_PATH + '.' + process.pid + '.tmp', PAIRED_PATH);
     console.log(`[info] 部分进度已落盘(${doneRows.length}/${misses.length},崩溃可续)`);
@@ -380,7 +386,7 @@ if (misses.length) {
       doneIdx.push(...idxs);
       console.log(`[progress] 嵌入 ${doneRows.length}/${misses.length}`);
       noteProgress(hit + doneRows.length);
-      if ((b + 1) % 16 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
+      if ((b + 1) % 4 === 0 && b * BATCH + BATCH < misses.length) flushPartial();
       if (PACE_MS && (b + 1) * BATCH < misses.length) await new Promise(r => setTimeout(r, PACE_MS)); // 批间喘息(WHEA 缓解)
     }
   } catch (e) {

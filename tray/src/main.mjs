@@ -485,9 +485,9 @@ if (!gotLock) {
       }
       syncBusy = true;
       try {
-        const res = await runner.run('embed', nodeBin, args, {
-          cwd: codeIndexRoot, label, timeoutMs: 60 * 60 * 1000,
-        });
+        // 20261122 修复:不传 timeoutMs,回落 TIMEOUTS.embed=6h(表已按测试机 CPU 全量 >1.2h 定 6h;
+        // 旧 1h 覆盖点把表修复打回 1h → CPU 机全量嵌准点树杀,显示层进度掉回持久层水位)
+        const res = await runner.run('embed', nodeBin, args, { cwd: codeIndexRoot, label });
         await poller?.slowRefresh('sync-embed');
         return explainSyncResult(res);
       } catch (e) {
@@ -511,9 +511,8 @@ if (!gotLock) {
         return { ok: false, error: 'no-paths' };
       }
       syncBusy = true;
-      const run = (args, label) => runner.run('embed', nodeBin, args, {
-        cwd: codeIndexRoot, label, timeoutMs: 60 * 60 * 1000,
-      });
+      // 同上(20261122):回落 embed 族 6h 默认;grow-now/--build-vectors 同族,正常分钟级,死线只兜挂死
+      const run = (args, label) => runner.run('embed', nodeBin, args, { cwd: codeIndexRoot, label });
       try {
         const grown = await run([`${codeIndexRoot}/autoExemplars.mjs`, '--grow-now'], '立即同步 更新样本库');
         const growOut = explainSyncResult(grown);
