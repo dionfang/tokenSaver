@@ -14,6 +14,7 @@ if (stage.status !== 0) process.exit(stage.status ?? 1);
 const build = spawnSync(process.execPath, [path.join(tray, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'), '--win', 'nsis', '-c', 'electron-builder.offline.yml'], { cwd: tray, stdio: 'inherit', windowsHide: true, env: { ...process.env } });
 if (build.status !== 0) process.exit(build.status ?? 1);
 const { stripExeDescription, exeCandidates } = await import('./strip-exe-description.mjs');
+// 20261122 事故同修:只清写壳 exe——rcedit 会毁 NSIS 安装器尾部载荷(225MB→47KB stub)
 const targets = exeCandidates(path.join(tray, 'release-offline'));
 if (targets.length === 0) { console.error('[strip] release-offline 下未找到待清写 exe'); process.exit(1); }
 try { stripExeDescription(targets); process.exit(0); }
