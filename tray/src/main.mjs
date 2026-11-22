@@ -498,10 +498,26 @@ if (!gotLock) {
         syncBusy = false;
       }
     }
-    ipcMain.handle('tray:sync-embed', () => runSyncJob(
-      [`${ctx.paths?.codeIndexRoot || ''}/embed.mjs`],
-      '立即同步 embed.mjs',
-    ));
+    // 20261123 修复(用户问「进度条空,点立即同步才有」的第二层):按钮链只跑 embed.mjs,
+    // chunks.jsonl 不存在时 embed 直退 1(「请先运行 node build.mjs」)——纯托盘机(无编辑器
+    // 钩子链的 auto.mjs 触发面)一个按钮无法从零建全索引。补 build 前置(与 auto.mjs 同链):
+    // chunks 缺失时先跑 build.mjs 再 embed;build 失败即停并弹错(不给半截索引)。
+    ipcMain.handle('tray:sync-embed', async () => {
+      const dataDir = ctx.paths?.dataDir;
+      let needBuild = true;
+      try { needBuild = !fs.existsSync(path.join(dataDir || '', 'chunks.jsonl')); } catch { needBuild = true; }
+      if (needBuild) {
+        const pre = await runSyncJob(
+          [`${ctx.paths?.codeIndexRoot || ''}/build.mjs`],
+          '立即同步 build.mjs(索引缺失,先建块)',
+        );
+        if (!pre.ok) return pre; // build 失败即停(半截索引无意义,错误已在 runSyncJob 弹出)
+      }
+      return runSyncJob(
+        [`${ctx.paths?.codeIndexRoot || ''}/embed.mjs`],
+        '立即同步 embed.mjs',
+      );
+    });
     // 先重写样本库并立刻刷新进度条(旧向量/新样本数),再后台嵌入;嵌入中靠进度文件推进分子。
     ipcMain.handle('tray:sync-vectors', async () => {
       if (syncBusy || ctx.snapshot?.embedPid != null) return { ok: true, busy: true };

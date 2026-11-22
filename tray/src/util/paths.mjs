@@ -15,7 +15,12 @@ const DEV_CODE_INDEX = path.resolve(here, '..', '..', '..', 'code-index'); // �
 // 2026-11-17 发行链:packed 布局=resources/node_modules/code-index(electron-builder extraResources);
 // config.mjs isInsideNodeModules=true → hf-cache 归 ~/.tokensaver/hf-cache;data 由安装器 env 指 %LOCALAPPDATA%。
 const PACKED_CODE_INDEX = process.resourcesPath ? path.join(process.resourcesPath, 'node_modules', 'code-index') : null;
-const CODE_INDEX_ROOT = (PACKED_CODE_INDEX && fs.existsSync(path.join(PACKED_CODE_INDEX, 'paths.mjs'))) ? PACKED_CODE_INDEX : DEV_CODE_INDEX;
+// 20261123 修复(0.2.13 测试机首启弹窗「paths.mjs 无响应」):覆盖安装收尾窗内 resources 可能瞬时未落齐,
+// existsSync(paths.mjs)=false 会令 CODE_INDEX_ROOT 落回 DEV 布局 → 兜底分支条件永假 → 弹窗死胡同复现。
+// 判定改为「resourcesPath 在即 packed 形态」(装机形态恒有 resourcesPath;dev 无);瞬时缺失时 root 仍指
+// packed 位置,resolvePaths 的 j=null 分支据 CODE_INDEX_ROOT===PACKED_CODE_INDEX 走 packedFallbackLayout。
+const IS_PACKED = !!PACKED_CODE_INDEX;
+const CODE_INDEX_ROOT = IS_PACKED ? PACKED_CODE_INDEX : DEV_CODE_INDEX;
 
 let cached = null;
 
@@ -45,9 +50,11 @@ export function packedFallbackLayout({ localAppData, home = os.homedir(), platfo
   return { packed: true, dataDir, hfCacheDir: path.join(home, '.tokensaver', 'hf-cache') };
 }
 
-/** spawn paths.mjs(30s 超时,失败时开发布局兜底并标 degraded)。幂等缓存。 */
+/** spawn paths.mjs(30s 超时,失败时 packed 布局静态兜底;开发布局 degraded)。
+ *  20261123:幂等缓存补瞬时窗自愈——首启撞安装收尾窗(资源未落齐)曾把 degraded 结果缓存死,
+ *  后续启动永弹窗;cached 命中带 degraded/dataDir=null 时放弃缓存重解析一次。 */
 export async function resolvePaths({ force = false } = {}) {
-  if (cached && !force) return cached;
+  if (cached && !force && !(cached.degraded || cached.dataDir == null)) return cached;
   const nodeBin = await detectNodeBin();
   const out = await new Promise((resolve) => {
     let child;
@@ -64,10 +71,10 @@ export async function resolvePaths({ force = false } = {}) {
   let j = null;
   try { j = out ? JSON.parse(out) : null; } catch { j = null; }
   if (!j) {
-    // paths.mjs 不可达(典型=机器未装 Node):packed 布局规范路径静态可知(与双保险同源),
-    // 直接兜底+建目录+回填 env——向导可开、自检展示「请安装 Node」硬项,不再是死胡同;
-    // 开发布局无规范兜底,维持 degraded 供 UI 提示(开发机必有 node,degraded=真异常)。
-    if (PACKED_CODE_INDEX && CODE_INDEX_ROOT === PACKED_CODE_INDEX) {
+    // paths.mjs 不可达(典型=机器未装 Node;20261123 新增=覆盖安装收尾窗资源瞬时未落齐):
+    // packed 布局规范路径静态可知(与双保险同源),直接兜底+建目录+回填 env——向导可开、
+    // 自检展示「请安装 Node」硬项,不再是死胡同;开发布局无规范兜底,维持 degraded(degraded=真异常)。
+    if (IS_PACKED) {
       const fb = packedFallbackLayout({
         localAppData: process.env.LOCALAPPDATA, home: os.homedir(), platform: process.platform,
         mkdir: (d) => fs.mkdirSync(d, { recursive: true }),
