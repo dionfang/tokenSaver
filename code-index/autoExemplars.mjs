@@ -462,8 +462,11 @@ export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVot
   } catch { /* 通道不可用 = 零影响 */ }
   const signedWithEvidence = signed.map((s) => {
     if (!s.evidence) return { ...s, signedAt };
-    const pk = promptKey(String(s.prompt || ''));
-    const ex = shadowEvidence && shadowEvidence.get(pk);
+    // 影子账本的 pkey 是 promptKey(原文前 200 字)。代签原文用默认 400 会让超长 prompt 对不上。
+    // 人工改档锚点仍按全文 400 存储,两边分开查,避免修好影子回流时拆掉锚点。
+    const pkShadow = promptKey(String(s.prompt || ''), 200);
+    const pkAnchor = promptKey(String(s.prompt || ''));
+    const ex = shadowEvidence && shadowEvidence.get(pkShadow);
     const extra = {};
     if (ex) {
       if (ex.escalated === true) extra.escalated = true;
@@ -474,7 +477,7 @@ export async function autoSignGolden({ dataDir = DATA_DIR, labels = null, minVot
       if (ex.escalationTo) extra.escalationTo = ex.escalationTo;
     }
     if (msLive && msAnchors) {
-      const a = msAnchors.get(pk);
+      const a = msAnchors.get(pkAnchor);
       if (a) { extra.manualSwitch = true; extra.manualSwitchTo = a.toTier; extra.manualSwitchDir = a.dir; extra.manualSwitchLive = true; }
     }
     if (!Object.keys(extra).length) return { ...s, signedAt };

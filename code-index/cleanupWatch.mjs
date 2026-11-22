@@ -27,6 +27,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 /** 宿主应用映像名(小写比对):机器上还有这些在跑 ⇒ 宿主没退。 */
 export const HOST_IMAGES = ['zcode.exe', 'cursor.exe', 'qoder.exe'];
 
+/** 桌面壳等不会随宿主退出的祖先。放进看护链会让 hostGone 一直为假。 */
+export const IMMORTAL_IMAGES = ['explorer.exe', 'winlogon.exe', 'sihost.exe', 'dwm.exe'];
+
 /** 看护登记表:每个活跃会话一条。 */
 export const WATCHERS_PATH = path.join(DATA_DIR, '.cleanup-watchers.json');
 
@@ -144,6 +147,24 @@ export function findHostImages(chain = []) {
   return [...new Set(chain.map((c) => String(c.name || '').toLowerCase()).filter((n) => HOST_IMAGES.includes(n)))];
 }
 
+/**
+ * 看护只盯到最远的那个宿主映像(含它自己)。
+ * 再往上是 explorer 一类不死祖先;认不出宿主时保持全链,避免 CLI 场景被截空。
+ */
+export function hostWatchChain(chain = []) {
+  const hosts = findHostPids(chain);
+  if (!hosts.length) return chain.slice();
+  const last = hosts[hosts.length - 1];
+  const idx = chain.findIndex((c) => Number(c.pid) === Number(last));
+  return idx >= 0 ? chain.slice(0, idx + 1) : chain.slice();
+}
+
+/** 已在跑的看护若把不死祖先写进了 --chain,下一轮会话开始时换掉它。新链不再包含这些映像。 */
+export function watcherChainStale(args = {}, procs = new Map()) {
+  const immortal = new Set(IMMORTAL_IMAGES);
+  return (args.chain || []).some((pid) => immortal.has(String(procs.get(Number(pid)) || '').toLowerCase()));
+}
+
 /** 机器上还有宿主应用在跑吗(任一实例即可)。 */
 export function hostImageAlive(procs = aliveProcesses(), images = HOST_IMAGES) {
   const want = new Set(images);
@@ -210,7 +231,11 @@ export function startWatcher({ onInfo = () => {}, logPath = path.join(DATA_DIR, 
   // 值班判定 = 它盯的链/宿主还活着;链已死的看护马上要自退,此时必须拉新的接上,
   // 否则旧看护卸模型时会把新会话的模型一起卸掉。
   const running = liveWatchers();
-  const onDuty = running.filter((w) => watcherStillWatching(parseWatcherArgs(w.cmd), procs));
+  const onDuty = running.filter((w) => {
+    const args = parseWatcherArgs(w.cmd);
+    if (watcherChainStale(args, procs)) return false;
+    return watcherStillWatching(args, procs);
+  });
   // 已该退的看护(链死)直接扫杀:旧版看护因全局兜底永不退出,只能手动清(实测堆 63 个/2.8GB)
   for (const w of running) {
     if (onDuty.some((d) => d.pid === w.pid)) continue;
@@ -224,7 +249,7 @@ export function startWatcher({ onInfo = () => {}, logPath = path.join(DATA_DIR, 
     if (!procs.has(Number(w.pid))) removeWatcher(w.pid);
   }
   const tree = procTree();
-  const chain = ancestorChain(process.pid, tree);
+  const chain = hostWatchChain(ancestorChain(process.pid, tree));
   if (!chain.length) {
     onInfo('[cleanup] 认不出宿主进程链,本会话不拉看护(退出后模型靠空闲时限自退)');
     return { started: false, reason: '无进程链' };

@@ -19,6 +19,7 @@ import { createRequire } from 'node:module';
 import { tierOfModel, TIER_RANK } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs';
 import { DATA_DIR } from './config.mjs';
+import { atomicWriteFileSync } from './proc.mjs';
 
 const require = createRequire(import.meta.url);
 const DEFAULT_DB = path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite');
@@ -119,8 +120,8 @@ export function collectSwitchEvents({ dbPath = DEFAULT_DB, host = null, tierOpts
 }
 
 /** 采集并追加落盘 manual-switch.jsonl(按 pkey+ts+to 去重);旧行缺 session/promptTs 时就地升级(db 重采匹配)。返回 {added, upgraded, total}。 */
-export function refreshSwitchLedger({ dataDir = DATA_DIR, dbPath = DEFAULT_DB, host = null, tierOpts = {} } = {}) {
-  const events = collectSwitchEvents({ dbPath, host, tierOpts });
+export function refreshSwitchLedger({ dataDir = DATA_DIR, dbPath = DEFAULT_DB, host = null, tierOpts = {}, collectFn = null } = {}) {
+  const events = typeof collectFn === 'function' ? collectFn() : collectSwitchEvents({ dbPath, host, tierOpts });
   const file = path.join(dataDir, 'routing', LEDGER);
   let existing = [];
   try { existing = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { /* 无账本 */ }
@@ -142,10 +143,13 @@ export function refreshSwitchLedger({ dataDir = DATA_DIR, dbPath = DEFAULT_DB, h
   }
   if (upgraded) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, [...existing, ...fresh].map((e) => JSON.stringify(e)).join('\n') + '\n');
+    atomicWriteFileSync(file, [...existing, ...fresh].map((e) => JSON.stringify(e)).join('\n') + '\n');
   } else if (fresh.length) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(file, fresh.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    let raw = '';
+    try { raw = fs.readFileSync(file, 'utf8'); } catch { /* 新账本 */ }
+    if (raw && !raw.endsWith('\n')) raw += '\n';
+    atomicWriteFileSync(file, raw + fresh.map((e) => JSON.stringify(e)).join('\n') + '\n');
   }
   return { added: fresh.length, upgraded, total: existing.length + fresh.length };
 }

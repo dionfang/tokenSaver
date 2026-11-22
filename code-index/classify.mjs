@@ -361,7 +361,7 @@ export function routingContextLine(c, diff, { tierLive = false } = {}) {
 
 /** 影子分类(model-routing.md #9 Step③):L1 uncertain 时派发 modelRoute.mjs 影子子进程
  *  跑级联,结果只写 routing-shadow.jsonl(不影响注入,零延迟)。级联为 L1→L2(L3 远端兜底已取消):
- *  L2 要 modelRouting.l2.shadow=true(旧顶层 l2Shadow 兼容)才通电(影子子进程加载嵌入模型会与主会话争资源)。
+ *  L2 恒开(2026-11-14 用户裁定,l2ShadowEnabled 恒 true;l2.shadow 等键不再读取),影子子进程加载嵌入模型的资源代价已随裁定接受。
  *  dataDir 与向量判定同源:测试注入临时目录时无向量文件,自然不派发。 */
 export function spawnShadow(prompt, { dataDir = DATA_DIR } = {}) {
   try {

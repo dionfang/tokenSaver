@@ -12,7 +12,7 @@
  *   `--review-golden`(对黄金集已签条目只出报告,不改量尺)。
  * **断路器**:本地判定失败即跳闸(data/routing/decision-model-breaker.json),决策票整体弃权
  *   (定档退词法、代签退三票,fail-open);恢复=人工 `--probe` 探活成功,或下次会话启动自动探活成功。
- * **模型判定档案(v3 方案 §2)**:resolveDecisionProfile——门槛跟随被选模型(tev1 0.4 / strands 0.8),
+ * **模型判定档案(v3 方案 §2)**:resolveDecisionProfile——门槛跟随被选模型(tev1 0.4 / strands 0.4,两后端同值;
  *   未建档模型回退 FALLBACK(旧硬编码默认,行为零漂移)。
  */
 import fs from 'node:fs';

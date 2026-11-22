@@ -43,7 +43,7 @@ function usageReport({ dataDir = DATA_DIR } = {}) {
 const TOOLS = [
   {
     name: 'routing_decision',
-    description: '动态模型路由:对用户 prompt 做任务类型分类(L1 规则→L2 向量;L2 需 modelRouting.l2Shadow=true 才通电,默认跳过;L3 已于 2026-11-03 取消,语义兜底由四档分档承担),返回类型与置信度。主路由由本地代理(modelRouteProxy.mjs)按 turn 改写 model,本工具供查询与审计(role 两档制与角色子代理形态均已废弃)。',
+    description: '动态模型路由:对用户 prompt 做任务类型分类(L1 规则→L2 向量;L2 恒开(2026-11-14 裁定,l2Shadow 旧键不再读取);L3 已于 2026-11-03 取消,语义兜底由四档分档承担),返回类型与置信度。主路由由本地代理(modelRouteProxy.mjs)按 turn 改写 model,本工具供查询与审计(role 两档制与角色子代理形态均已废弃)。',
     inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: '用户 prompt 原文' } }, required: ['prompt'] },
   },
   {
@@ -69,7 +69,7 @@ const TOOLS = [
 async function callTool(name, args = {}) {
   if (name === 'routing_decision') {
     if (!args.prompt) return { error: '缺少 prompt' };
-    // L2 需要 embedFn 才会跑(默认关:见 modelRoute.l2Shadow);不传则级联为 L1→(跳过 L2)→L3
+    // L2 需要 embedFn 才会跑(恒开,嵌入器未就绪时 l2EmbedFn 返回 null 即跳过:见 modelRoute.l2Shadow);级联为 L1→L2(L3 已取消)
     return await classifyRoute(args.prompt, { embedFn: await l2EmbedFn() });
   }
   if (name === 'model_health') {

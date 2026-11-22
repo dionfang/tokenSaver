@@ -1,7 +1,8 @@
 /**
  * 动态模型路由核心(model-routing.md #9/#7/#8;学名「动态模型路由」):
- *   L2 向量分类 --build-vectors 构建 + cosine kNN(影子模式,只写 shadow 日志;默认**不通电**——
- *     影子/CLI 需 --l2 或 modelRouting.l2Shadow=true 才加载嵌入模型,2026-11-01 实测此前 L2 从未运行过)
+ *   L2 向量分类 --build-vectors 构建 + cosine kNN(影子模式,只写 shadow 日志;**恒开**(2026-11-14 用户裁定)——
+ *     历史口径备档:2026-11-01 实测此前所有入口都不传 embedFn,L2 从未运行过,故当时做成显式开关
+ *     (--l2 / modelRouting.l2Shadow=true 才通电);现 l2ShadowEnabled 恒 true,开关键不再读取)
  *   L3 已取消(2026-11-03 用户定档:语义兜底由四档分档承担)——级联收敛为 L1→L2
  *   四档链派生 deriveTierChains(快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序)
  *     + 级联解析 resolveTier(目标档起 R4→R3→R2→R1 逐档下滑;档内解析复用 resolveRole:
@@ -1134,10 +1135,10 @@ export function resolveL2Config(mr = {}) {
   };
 }
 
-/** L2 通电开关:显式 --l2 或配置 l2.shadow=true(旧顶层 l2Shadow 兼容)才加载嵌入模型。
- *  默认关=影子/CLI 不碰嵌入后端(每轮影子子进程加载模型会与主会话争资源,而影子日志只是观测)。
- *  2026-11-01 实测:此前所有入口(--shadow-async/--classify)都不传 embedFn ⇒ L2 从未运行过,
- *  routing-shadow.jsonl 193 条全为 source:'none'。这里把"通电"变成一条开关,而不是默认行为。 */
+/** L2 通电开关:**恒开**(2026-11-14 用户裁定:嵌入器总闸默认开启不支持关闭;explicit/cfg 参数保留签名兼容)。
+ *  历史口径备档(2026-11-01 实测):曾为显式开关(--l2 或 l2.shadow=true 旧顶层 l2Shadow 兼容才加载,默认关,
+ *  影子/CLI 不碰嵌入后端)——当时所有入口都不传 embedFn ⇒ L2 从未运行过,routing-shadow.jsonl 193 条全为
+ *  source:'none';2026-11-14 起升为恒开,调用方以返回值恒 true 为事实,开关语义只作占位。 */
 export function l2ShadowEnabled(cfg = {}, explicit = false) {
   return true; // 2026-11-14 用户裁定:嵌入器总闸恒开(默认开启不支持关闭);参数保留签名兼容
 }

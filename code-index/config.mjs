@@ -100,7 +100,7 @@ export function loadKnownAnnotations(file = KNOWN_ANNOTATIONS_PATH) {
 }
 /**
  * Ollama 加载参数。warm、search、embed 必须用同一组:
- * 换 num_ctx 会重载模型,更短的 keep_alive 会把预热的 2 小时驻留改掉。
+ * 换 num_ctx 会重载模型,更短的 keep_alive 会把预热的 24h 驻留(OLLAMA_KEEP_ALIVE,2026-11-14 定案 B)改掉。
  */
 /** Ollama 模型空闲驻留时长,也是 local 常驻进程的空闲自退周期(2026-11-14 用户定案 B:'2h'→'24h',
  *  三模型常驻不因空闲消失,状态句不再反复"未拉起";显存恒占 ≈4.5GB,桌面上由 Ollama 按压力自行驱逐并自愈)。

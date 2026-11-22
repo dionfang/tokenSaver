@@ -1289,7 +1289,7 @@ function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG, configPath = null) {
 export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE, basePath = '/apps/anthropic', chainsOverride = null, usageFile = PROXY_USAGE_LOG, healthDataDir = DATA_DIR, configPath = path.join(DATA_DIR, 'code-index.config.json'), l2Override = null } = {}) {
   // chainsOverride:测试注入的四档位链(生产恒走快照派生)
   const state = new Map(); // convKey → {model,baseRequested,humanTurns}:升档阶段驻留(#1/#5 阶段粘住)
-  const sessionL2 = { embedFn: undefined, vectors: undefined }; // L2 融合票缓存(l2Live 关着时永不初始化)
+  const sessionL2 = { embedFn: undefined, vectors: undefined }; // L2 融合票缓存(懒初始化:首次 L2 票时挂 embedFn/vectors;l2Live 恒开)
   const server = http.createServer((req, res) => {
     const chunks = [];
     let size = 0;
@@ -1762,8 +1762,8 @@ function fallbackUpstream(upstreams) {
 
 /** 代理改写端的解析输入:两个键一次取齐,缺省回落解析器默认。 */
 /** L2 融合票开关(嵌套收口后由 resolveL2Config 统一解析,本函数保留供外部核对):
- *  l2.live.enabled(旧顶层 l2Live.enabled 兼容)显式 true 才通电,默认关——
- *  每轮嵌入与 3MB 向量表加载有成本;开着 live 不开 shadow 时 l2EmbedFn 返回 null(嵌入器未就绪),零影响。 */
+ *  **恒开**(2026-11-14 用户裁定)——l2.live.enabled/旧 l2Live.enabled 键不再读取,catch 回落 false 仅作
+ *  读配置失败兜底;每轮嵌入与 3MB 向量表加载有成本已随恒开裁定接受,嵌入器未就绪时 l2EmbedFn 返回 null,零影响。 */
 export function l2LiveEnabled(configPath = path.join(DATA_DIR, 'code-index.config.json')) {
   try {
     return resolveL2Config(readJson(configPath)?.modelRouting || {}).liveEnabled;
