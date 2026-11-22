@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { app, dialog } from 'electron';
 import { compareVersions } from './manifest.mjs';
 import { httpRequest } from './downloader.mjs';
@@ -94,9 +94,12 @@ function spawnInstaller(exe, { silent = false } = {}) {
     if (!exe || !fs.existsSync(exe)) return false; // 安装包被清/缺件时显式失败,调用方给用户可见错误
     const safe = String(exe).replaceAll('"', '""');
     const command = `ping 127.0.0.1 -n 3 >nul & start "" /wait "${safe}"${silent ? ' /S' : ''}`;
-    execFile(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command], {
-      detached: true, stdio: 'ignore', windowsHide: true,
-    }).unref();
+    // 20261123 修复(测试机「点安装向导不出现」):旧 execFile(cmd,['/d','/s','/c',command]) 形态,
+    // node 对含引号/空格的参数在 CreateProcess 命令行上**外层再包引号并把内部 " 转成 \"**——
+    // cmd 不认 \" 转义,命令串含 start "" /wait "路径" 时必炸「语法不正确」且 stdio ignore 全静默。
+    // 改 shell:true 整串原样传(实测:旧形态 cmd 命令行带 \" 畸形/落盘全失败;shell:true ping&start
+    // 拉起 notepad 实证)。detached+unref 语义不变(宿主退出后 3 秒窗由 cmd 内 ping 承担,N86)。
+    spawn(command, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref();
     return true;
   } catch { return false; }
 }
