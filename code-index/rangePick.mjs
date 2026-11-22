@@ -200,27 +200,36 @@ export async function pickRangeForFile(absFile, sessionId, { maxLines = 625, cos
   try {
     chunks = fs.readFileSync(CHUNKS_PATH, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch { return null; }
-  const mine = chunks.map((c, i) => ({ c, i })).filter(({ c }) => pathMatchesChunk(absFile, c.p));
+  let mine = chunks.map((c, i) => ({ c, i })).filter(({ c }) => pathMatchesChunk(absFile, c.p));
   if (!mine.length) return null;
 
   const backend = activeBackend();
   const vmeta = readVectorMeta(backend);
   const embPath = vectorPaths(backend).emb;
   if (!vmeta?.dim || !fs.existsSync(embPath)) return null;
+  const dim = Number(vmeta.dim);
+  // S4-F3(20261122):intent 维度必须与库 dim 一致——后端切换 TTL 窗(1024 vs 768)长 intent 截断=半维点积静默错分;
+  // 短 intent→NaN→null 本就安全,长 intent 是错位方向,统一按维度守卫拒
+  if (!Array.isArray(intent.v) || intent.v.length !== dim) return null;
+  let onSnapshot = false;
   if (Number(vmeta.chunks) !== chunks.length) {
-    // S4-2(20261119):重嵌窗口块清单与向量不配对→回退嵌入时快照(与 search 同口径),不再恒 null 静默失效
+    // S4-2(20261119)+S4-F1/F2(20261122):重嵌窗口回退嵌入时快照(与 search 同口径+同款覆盖度守卫)
     try {
       const paired = fs.readFileSync(vectorPaths(backend).paired, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
       const raw0 = fs.readFileSync(embPath);
-      if (paired.length && raw0.byteLength === paired.length * vmeta.dim * 4) chunks = paired;
-      else return null;
+      if (paired.length && paired.length * 2 >= chunks.length && Math.abs(raw0.byteLength - paired.length * vmeta.dim * 4) <= 4) {
+        chunks = paired;
+        // S4-F1:快照回退必须按快照重挑 mine——旧实现沿用当前块清单的 {c,i},当前文本×快照向量错位打分,新块 NaN 静默丢弃
+        mine = chunks.map((c, i) => ({ c, i })).filter(({ c }) => pathMatchesChunk(absFile, c.p));
+        if (!mine.length) return null;
+        onSnapshot = true;
+      } else return null;
     } catch { return null; }
   }
   const raw = fs.readFileSync(embPath);
   // 必须带 byteOffset:小文件读出的 Buffer 常落在共享内存池里,漏掉偏移会读到其他对象的数据
   if (raw.byteLength % 4 !== 0) return null;
   const buf = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
-  const dim = vmeta.dim;
   const scored = mine.map(({ c, i }) => {
     let dot = 0;
     const off = i * dim;
@@ -228,6 +237,14 @@ export async function pickRangeForFile(absFile, sessionId, { maxLines = 625, cos
     return { s: c.s, e: c.e, score: dot, body: String(c.t || ''), i };
   }).filter((x) => Number.isFinite(x.score));
   if (!scored.length) return null;
+  // S4-F2:快照回退时行区间=嵌入时旧行号,按当前文件行数过滤越界段(防错位行写进 read-guard 区间改写)
+  if (onSnapshot) {
+    let lineCount = 0;
+    try { lineCount = fs.readFileSync(absFile, 'utf8').split('\n').length; } catch { return null; }
+    const inRange = scored.filter((x) => Number(x.s) >= 1 && Number(x.e) <= lineCount);
+    if (!inRange.length) return null;
+    scored.splice(0, scored.length, ...inRange);
+  }
 
   const byCos = [...scored].sort((a, b) => b.score - a.score).slice(0, cosTop);
   if (byCos[0].score < minScore) return null; // 意图与文件不相关(可能只是想浏览),交回 deny

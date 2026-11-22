@@ -265,8 +265,11 @@ export function classifyShortTurn(text) {
 
 /** 换题标记:命中即"这是新任务",阶段档不延续(续接闸对它放行,按当轮难度重定档)。 */
 const SWITCH_TOPIC_MARKS = ['另外', '换个', '换一个', '换任务', '先不管', '新任务', '还有一件事', '题外话'];
-/** 指代/续接标记:长轮须含其一才算续接(短轮凭长度已够);不含"它"(避开"其他"误命中)。 */
-const CONTINUATION_MARKS = ['这个', '那个', '这些', '那些', '刚才', '上面', '继续', '接着', '然后', '下一步', '还是', '该'];
+/** 指代/续接标记:长轮须命中其一才算续接(短轮凭长度已够)。
+ *  20261122-S1-N1 收窄:①「该/还是」连接词误命中普通新任务/疑问轮,整删;②「这个/那个」中位子串
+ *  误命中普通疑问轮(「应该怎么修复这个报错」),移入 LEADING_DEICTIC 仅句首算指代;不含"它"(避开"其他")。 */
+const CONTINUATION_MARKS = ['这些', '那些', '刚才', '上面', '继续', '接着', '然后', '下一步'];
+const LEADING_DEICTIC = ['这个', '那个'];
 
 /**
  * 续接轮判定(2026-11-22 第一档,进实弹 decideTarget):判断本轮是否在延续阶段内的任务。
@@ -281,7 +284,8 @@ export function isContinuationTurn(text) {
   if (SWITCH_TOPIC_MARKS.some((m) => norm.includes(m))) return { continuation: false, kind: 'switch', norm };
   if (ACK_TURNS.has(norm)) return { continuation: true, kind: 'ack', norm };
   if (norm.length <= SHORT_TURN_MAX) return { continuation: true, kind: 'instr', norm };
-  if (CONTINUATION_MARKS.some((m) => norm.includes(m))) return { continuation: true, kind: 'deictic', norm };
+  if (CONTINUATION_MARKS.some((m) => norm.includes(m)) || LEADING_DEICTIC.some((m) => norm.startsWith(m)))
+    return { continuation: true, kind: 'deictic', norm };
   return { continuation: false, kind: null, norm };
 }
 

@@ -206,7 +206,9 @@ async function makeEmbedder() {
           const rows = [];
           for (let b = 0; b * BATCH < texts.length; b++) {
             const slice = texts.slice(b * BATCH, (b + 1) * BATCH).map(t => trimToBudget(t));
-            const part = await residentEmbed(slice);
+            // S14-F2(20261122):批嵌入必须给显式预算——慢机(≈1s/块)16 块 slice 必超 10s 默认(该默认动机=L2 票/单条查询)
+            // →首批即死零进展,冷却重跑无限空转;120s 与单批最长耗时同量级,查询路径 10s 默认不动
+            const part = await residentEmbed(slice, 120_000);
             if (!part) throw new Error('local 常驻进程中断');
             rows.push(...part);
             console.log(`[progress] 嵌入 ${Math.min((b + 1) * BATCH, texts.length)}/${texts.length}`);
