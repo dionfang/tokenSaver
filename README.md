@@ -14,7 +14,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 另有可选的桌面托盘客户端 `tray/`(Electron):托盘状态灯 + 轮询双通道 + 安装向导/自检面板 + 公共决策包一键更新/本地向量上传(均带同意门禁)+ 应用自更新(唯一入口=托盘菜单「检查应用更新」,无自动静默检查;差量下载 + sha512 完整性门 fail-closed,下载完成弹「立即安装(推荐)/稍后」→ 可见安装向导,启动时已下载未装的新版只提示不自动装,仅升不降);能力一律 spawn `code-index` 微 CLI,与宿主零 import 耦合(工程红线,`test/tray/importBan.test.mjs` 守护)。
 ![微信图片_20261105220119.png](https://raw.gitcode.com/user-images/assets/11189521/7fabff6c-6f9b-44a9-943b-fbc69d24b447/微信图片_20261105220119.png '微信图片_20261105220119.png')
-
+![default.jpg](https://raw.gitcode.com/user-images/assets/11189521/99072fb5-0580-4656-a221-c58602df62ec/default.jpg 'default.jpg')
 ### 工作方式
 
 #### 省耗记账(要点)
