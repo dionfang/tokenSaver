@@ -12,4 +12,9 @@ const tray = path.resolve(here, '..');
 const stage = spawnSync(process.execPath, [path.join(here, 'stage-weights.mjs')], { cwd: tray, stdio: 'inherit', windowsHide: true });
 if (stage.status !== 0) process.exit(stage.status ?? 1);
 const build = spawnSync(process.execPath, [path.join(tray, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'), '--win', 'nsis', '-c', 'electron-builder.offline.yml'], { cwd: tray, stdio: 'inherit', windowsHide: true, env: { ...process.env } });
-process.exit(build.status ?? 1);
+if (build.status !== 0) process.exit(build.status ?? 1);
+const { stripExeDescription, exeCandidates } = await import('./strip-exe-description.mjs');
+const targets = exeCandidates(path.join(tray, 'release-offline'));
+if (targets.length === 0) { console.error('[strip] release-offline 下未找到待清写 exe'); process.exit(1); }
+try { stripExeDescription(targets); process.exit(0); }
+catch (e) { console.error(`[strip] ${e.message}`); process.exit(1); }
