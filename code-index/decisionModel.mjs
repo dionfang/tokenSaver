@@ -356,6 +356,9 @@ export async function classifyBatch(prompts, { criteria = TYPE_CRITERIA, ...opts
   return { ...r, byId: new Map(r.answers.map((a) => [a.id, a])) };
 }
 
+/** 法官看见的前文上限。调用方要在这个长度内自己留好各段,这里仍会截断。 */
+export const JUDGE_CONTEXT_CHARS = 400;
+
 /**
  * 单条 prompt → 需求档位判定(R-ref 预兜底票,2026-11-08 v2.1)。
  * criteria=TIER_CRITERIA、值域白名单 R1-R4;返回 {answer:{type,confidence}|null, error, endpoint, latencyMs, usage}。
@@ -363,10 +366,10 @@ export async function classifyBatch(prompts, { criteria = TYPE_CRITERIA, ...opts
  * fetchFn 缺省不注入 → judgeBatch 走本地判定(2026-11-08 本地化);注入时走显式远程。
  */
 export async function judgeTier(prompt, { context = null, config = null, dataDir = DATA_DIR, fetchFn = null, timeoutMs = 8000, chunkSize = 1, concurrency = 1, retries = 1, baseDelay = 150 } = {}) {
-  // 上下文并入(S3,2026-11-09 v3 方案):调用方传入"前轮人类 prompt 摘要",在拼接层实现——零协议改动,
+  // 上下文并入(S3,2026-11-09 v3 方案):调用方传入前文摘要,在拼接层实现——零协议改动,
   // ollama systemone/文本生成/ONNX 打分三条判定路径同效(判的是同一份全文)。指代类("刚才的测试…")不再盲判。
   // S4-F3(2026-11-11 夜审):provider/providers/local 三个死参数清理——v4 判定恒本地,传入即被忽略。
-  const text = context ? `【前文摘要】${String(context).slice(0, 400)}\n【本轮任务】${String(prompt || '')}` : String(prompt || '');
+  const text = context ? `【前文摘要】${String(context).slice(0, JUDGE_CONTEXT_CHARS)}\n【本轮任务】${String(prompt || '')}` : String(prompt || '');
   const r = await judgeBatch({
     items: [{ id: 1, text }], criteria: TIER_CRITERIA,
     valueRe: /^R[1-4]$/i, config, dataDir, fetchFn: fetchFn || undefined, timeoutMs, chunkSize, concurrency, retries, baseDelay,

@@ -237,6 +237,54 @@ export function classifyDifficulty(text, { calibration = null } = {}) {
   return { tier: 'R1', confidence: 0.4, signals: [], reason: '无信号命中 → 默认日常主力档' };
 }
 
+// ---------- 短轮判定(2026-11-22) ----------
+// 历史会话数据:难度影子账本 877 轮里 ≤30 字短轮占 36.9%;其中 71% 是无信号兜底/纯提问拦截——
+// 不是因为"简单",而是"单看这句判不出"。任务档是任务的属性不是单句的属性:
+// 第一档落地(用户定档 2026-11-22):isContinuationTurn 进实弹 decideTarget——续接轮在阶段内
+// 沿用阶段档,不触发 R1 降档拆阶段;classifyShortTurn 保留为影子账 shortTurn 字段的细分类。
+
+/** 确认句词集(归一后精确相等才算,避免"对这个函数…"里的"对"误判)。ASCII 小写比较。 */
+const ACK_TURNS = new Set(['好的', '好', '好嘞', '好滴', '收到', '对', '对的', '嗯', '嗯嗯', '是的', '可以', '行', 'ok', 'okay', '继续', '明白', '懂了', '了解', '同意', 'yes', 'right', 'continue', 'go on']);
+/** 短轮阈值:归一后(去空白/标点)≤8 字符——好的/继续/对/修一下/改成蓝色 都在内;完整指令不会,会被当非短轮。 */
+const SHORT_TURN_MAX = 8;
+const _noiseRe = /[\s，。,.\u0021\u003f\u3001\u2026~～]/g;
+
+/** 归一:去中英标点与空白(做类别判定用,不含词法信号语义)。 */
+function _normalizeShort(text) { return String(text || '').replace(_noiseRe, '').toLowerCase(); }
+
+/**
+ * 短轮类别(2026-11-22 影子账 shortTurn 字段细分类):short=归一后字符数 ≤8;kind ∈ 'ack'(确认句)|'instr'(新短指令)|null(非短轮)。
+ * 非短轮 kind=null,调用方跳过。续接闸的粗判定用 isContinuationTurn(下方);本函数只管影子账细分类,不改实弹。
+ */
+export function classifyShortTurn(text) {
+  const norm = _normalizeShort(text);
+  if (!norm || norm.length > SHORT_TURN_MAX) return { short: false, kind: null, norm };
+  const kind = ACK_TURNS.has(norm) ? 'ack' : 'instr';
+  return { short: true, kind, norm };
+}
+
+/** 换题标记:命中即"这是新任务",阶段档不延续(续接闸对它放行,按当轮难度重定档)。 */
+const SWITCH_TOPIC_MARKS = ['另外', '换个', '换一个', '换任务', '先不管', '新任务', '还有一件事', '题外话'];
+/** 指代/续接标记:长轮须含其一才算续接(短轮凭长度已够);不含"它"(避开"其他"误命中)。 */
+const CONTINUATION_MARKS = ['这个', '那个', '这些', '那些', '刚才', '上面', '继续', '接着', '然后', '下一步', '还是', '该'];
+
+/**
+ * 续接轮判定(2026-11-22 第一档,进实弹 decideTarget):判断本轮是否在延续阶段内的任务。
+ * 多信号,按优先级:①换题标记 → 明确新任务(kind='switch');②确认句精确命中(kind='ack');
+ * ③短碎片(归一后 ≤8)一律当续接(kind='instr',阶段在途时短指令/短插问都 presumption 续接,
+ * 阶段轮数上限+cache TTL 兜底);④长轮须含指代标记才算(kind='deictic')。
+ * 非短轮且无指代 → 不是续接,按当轮难度独立定档(纯新指令不受影响)。
+ */
+export function isContinuationTurn(text) {
+  const norm = _normalizeShort(text);
+  if (!norm) return { continuation: false, kind: null, norm };
+  if (SWITCH_TOPIC_MARKS.some((m) => norm.includes(m))) return { continuation: false, kind: 'switch', norm };
+  if (ACK_TURNS.has(norm)) return { continuation: true, kind: 'ack', norm };
+  if (norm.length <= SHORT_TURN_MAX) return { continuation: true, kind: 'instr', norm };
+  if (CONTINUATION_MARKS.some((m) => norm.includes(m))) return { continuation: true, kind: 'deictic', norm };
+  return { continuation: false, kind: null, norm };
+}
+
 /**
  * 任务型 → R1-R2 难度档的**设计映射**(黄金集 R 真值来源,scoreGoldenTier 用)。
  * 2026-11-06 三档定稿:multi(多点改组,旧 T4/T5)= 慎重工作起步 R2;routine(例行,旧 T2/T3/T6/T7)

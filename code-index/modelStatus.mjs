@@ -1038,9 +1038,11 @@ export function formatSavedClause(state) {
 function formatTokenCount(n) {
   const v = Math.max(0, Math.round(n || 0));
   if (v < 10000) return String(v);
-  const wan = v / 10000;
-  const text = wan >= 10 ? String(Math.round(wan)) : wan.toFixed(1).replace(/\.0$/, '');
-  return `${text} 万`;
+  // 百万单位(2026-11-22 用户定档):状态句大数字读得清——634 万 → 6.34 百万,76949 万 → 769.49 百万;
+  // 两位小数,尾零舍去;万以下(<1 万)仍显原数(面板"节约 700 tokens"类小值不受影响)。
+  const mil = v / 1e6;
+  const text = mil.toFixed(2).replace(/\.?0+$/, '');
+  return `${text} 百万`;
 }
 
 /** 读嵌入进度(2026-11-14 用户定案:状态句给具体进度,不再只说"建立中"):

@@ -48,11 +48,11 @@ import { fileURLToPath } from 'node:url';
 import { DATA_DIR, loadConfig } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
-import { classifyDifficulty, loadTierCalibration } from './tierClassify.mjs';
+import { classifyDifficulty, loadTierCalibration, classifyShortTurn, isContinuationTurn } from './tierClassify.mjs';
 import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, RREF_CONSULT_TIMEOUT_MS, CACHE_TTL_MS as THRESHOLD_CACHE_TTL_MS } from './thresholds.mjs'; // S1-F4 单源;S1-F2 门控两值并入;S2-F1(20261118) 咨询超时并入
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
-import { resolveDecisionProfile, DECISION_PROFILE_FALLBACK } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
+import { resolveDecisionProfile, DECISION_PROFILE_FALLBACK, JUDGE_CONTEXT_CHARS } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
 import { blendedRate, loadModelPrices } from './costProfile.mjs';
 import { isAutoModelName, normalizeAutoModel, resolveZcodeV2Dir } from './virtualProvider.mjs';
 
@@ -91,6 +91,31 @@ const RREF_CACHE_MAX = 200;
 const rRefCache = new Map(); // key = pkey|decisionModel|contextHash:前文不同不得复用 6h 判定票
 function contextHash(context) {
   return crypto.createHash('sha256').update(String(context || '')).digest('hex').slice(0, 16);
+}
+
+/**
+ * 臂 1/臂 2 的前文。法官只保留 JUDGE_CONTEXT_CHARS 字,所以额度在这里拆:
+ * 两边都很长时助手摘要先留一半,人类前文用剩下来的;哪边更短,剩额让给另一边。
+ * 只有人类前文时行为与原来一致。
+ */
+export function buildConsultContext(prevHuman, prevAssistant, budget = JUDGE_CONTEXT_CHARS) {
+  const human = String(prevHuman || '').trim();
+  const assistant = String(prevAssistant || '').trim();
+  const cap = Math.max(0, Number(budget) || 0);
+  if (!human && !assistant) return null;
+  if (!assistant) return human.slice(0, cap);
+  const mark = '[assistant] ';
+  if (cap <= mark.length) return (human || assistant).slice(0, cap);
+  const sep = human ? '\n' : '';
+  const room = cap - sep.length - mark.length;
+  const half = Math.ceil(room / 2);
+  let aKeep = Math.min(assistant.length, half);
+  let hKeep = Math.min(human.length, room - aKeep);
+  const left = room - aKeep - hKeep;
+  if (left > 0) aKeep = Math.min(assistant.length, aKeep + left);
+  const h = human.slice(0, hKeep);
+  const a = assistant.slice(0, aKeep);
+  return `${h}${h ? '\n' : ''}${mark}${a}`;
 }
 function rRefCacheGet(pkey, decisionModel = '', ctxHash = '') {
   const k = pkey ? `${pkey}|${decisionModel}|${ctxHash}` : null;
@@ -842,7 +867,7 @@ export function resolveAutoBase({ tierChains = {}, providerPriority = [], provid
   return { modelId: null, providerId: null, warn: '四档链全部为空', tier: null };
 }
 
-export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, eagerR3 = false, loopStreak = 0, tierClassify = null } = {}) {
+export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, eagerR3 = false, loopStreak = 0, tierClassify = null, continuation = false } = {}) {
   const g = { ...DEFAULT_GUARD, ...(guard && typeof guard === 'object' ? guard : {}) };
   const inPhase = !!(phase && phase.model);
   // 档位分类配置(2026-11-06 v4):品牌三档表+轻量后缀(调用方注入,缺省=内置默认)
@@ -955,10 +980,15 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   const ambiguousR1 = r1Asks && Number(diff?.confidence) <= AMBIGUOUS_R1_CONF;
   const r1Streak = phase?.r1Streak || 0;
   const phaseAtCap = inPhase && (phase.humanTurns || 0) >= g.maxPhaseTurns;
+  // 续接轮保留(2026-11-22 第一档,用户定档):任务档是任务的属性不是单句的属性——
+  // 短确认句/短指代轮("好的/继续/修一下")在阶段内沿用阶段档,不进 R1 宽限/降档/阶段结束分支
+  // (阶段不被两条 ack 拆掉);R3/R4 均维持原档(阶段轮数上限 maxPhaseTurns+cache TTL 兜底,不另设 R2 封顶);
+  // 缓存已冷仍保留(任务连续性优先于热缓存经济学),阶段轮数到顶照常回主循环(有界衰减,不无限付)。
+  const continuationKeep = !!(continuation && inPhase && r1Asks);
   // R1 宽限:热缓存 + 服务档 R2-R4 + 未到轮数上限 + 非歧义轮 → 第 1 个连续 R1 轮留在现档;第 2 连/缓存已冷/到顶/歧义才降档。
   // S1-F5(2026-11-10 夜审):无状态(无阶段)会话 cacheCold 恒真,旧口径下宽限分支永不可达——明确 R1 冷启动轮被
   // 即时降档;冷启动会话同样进宽限计数(维持现档一轮,r1Streak 落阶段,下轮仍 R1 再降档)。
-  if (r1Asks && !ambiguousR1 && (!cacheCold || !inPhase) && !phaseAtCap && r1Streak < 1 && (effTier === 'R2' || effTier === 'R3' || effTier === 'R4')) {
+  if (r1Asks && !ambiguousR1 && !continuationKeep && (!cacheCold || !inPhase) && !phaseAtCap && r1Streak < 1 && (effTier === 'R2' || effTier === 'R3' || effTier === 'R4')) {
     const keep = inPhase ? phase.model : baseModel;
     return {
       model: keep, ...provKey(inPhase ? phase.providerId : baseProvider),
@@ -967,7 +997,7 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
       nextPhase: inPhase ? { ...phase, r1Streak: 1 } : (gateTomb() ? { ...gateTomb(), r1Streak: 1 } : { r1Streak: 1 }),
     };
   }
-  const r1Down = r1Asks && (baseTier === 'R2' || baseTier === 'R3' || baseTier === 'R4');
+  const r1Down = r1Asks && !continuationKeep && (baseTier === 'R2' || baseTier === 'R3' || baseTier === 'R4');
   if (r1Down) {
     const tr = resolveTier('R1', { cfg: { modelRouting: { chains: tc, providerPriority, providerOrder, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
     if (tr && tr.modelId && isProxyReachable({ providerId: tr.providerId, model: tr.modelId, upstreams })) {
@@ -978,17 +1008,18 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   if (phaseAtCap) {
     return { model: baseModel, ...provKey(baseProvider), switched: baseModel !== requestedModel, reason: `阶段轮数到顶(${g.maxPhaseTurns}),回主循环`, nextPhase: gateTomb() };
   }
-  if (inPhase && r1Asks) {
+  if (inPhase && r1Asks && !continuationKeep) {
     return { model: baseModel, ...provKey(baseProvider), switched: baseModel !== requestedModel, reason: '阶段结束(R1 问答/杂务:连续第 2 个 R1 轮或缓存已冷)', nextPhase: gateTomb() };
   }
   const wantTier = diff && diff.tier && diff.tier !== 'R1' ? diff.tier : null;
   const RANK = { R1: 1, R2: 2, R3: 3, R4: 4 };
   // 粘住门槛(修正#2/#3/#4):目标档高于阶段档(旗舰点名)→ 不粘,立即升;
   // 阶段在 R4 且目标不是 R4 → 不粘(100x 盈亏平衡 0.3 轮),按目标档步降;缓存已冷(超 TTL)→ 不粘,按当轮难度重定档。
+  // 续接轮豁免 cacheCold(2026-11-22):任务连续性优先于热缓存经济学,轮数上限(phaseAtCap)仍是硬边界。
   const wantAbove = !!(inPhase && wantTier && phaseTier && RANK[wantTier] > RANK[phaseTier]);
   const r4StepDown = !!(inPhase && phaseTier === 'R4' && wantTier && wantTier !== 'R4');
-  if (inPhase && !wantAbove && !r4StepDown && !cacheCold) {
-    return { model: phase.model, providerId: phase.providerId, switched: phase.model !== baseModel, reason: `阶段粘住延续(${phase.tier || phaseTier || '升档'}档,第 ${(phase.humanTurns || 0) + 1} 人类轮)`, nextPhase: { ...nextTurnOf(phase), r1Streak: 0 } };
+  if (inPhase && !wantAbove && !r4StepDown && (!cacheCold || continuationKeep)) {
+    return { model: phase.model, providerId: phase.providerId, switched: phase.model !== baseModel, reason: `阶段粘住延续(${phase.tier || phaseTier || '升档'}档,第 ${(phase.humanTurns || 0) + 1} 人类轮)${continuationKeep ? ';续接轮沿用任务档' : ''}`, nextPhase: { ...nextTurnOf(phase), r1Streak: 0 } };
   }
   if (wantTier) {
     const tr = resolveTier(wantTier, { cfg: { modelRouting: { chains: tc, providerPriority, providerOrder, aliases } }, inventory, health, reachable: (r) => isProxyReachable({ ...r, upstreams }) });
@@ -1334,6 +1365,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       let rRefUsed = null; // R-ref 预兜底票(v2.1):本轮被救到的档位(账本结构化留痕;影子账里另有逐条明细)
       let lastKindLog = null; // 显式轮型(此前靠 reason 反推,v2 起直接落账)
       let prevHuman = null; // 前轮人类 prompt 摘要≤400 字(人类轮提取;rRef/D4 咨询 context 与账本 prevHead 共用)
+      let prevAssistant = null; // 上一条助手回复摘要≤400 字(2026-11-22:续接轮任务难度只能从上一轮回复内容推断,接进 tev1 arm1 context)
       let promptHeadLog = null; // 本轮任务的人类 prompt 头(与影子/黄金集同 200 字口径,pkey join 用)
       if (adapter && Array.isArray(bodyObj.messages)) {
         const ro = mrRoutingOptions(configPath);
@@ -1363,6 +1395,21 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               }
             }
           } catch { /* 取不到不带上下文 */ }
+          // 上一条助手回复摘要≤400 字(2026-11-22 用户定档):"继续/好的"这类续接轮的任务难度只能从上一轮
+          // 回复内容推断,接进 tev1 arm1 的 context(只喂决策模型,不进词法/L2——助手文本满是词表词会污染词法)。
+          // 与前轮人类 prompt 并列拼进同一 context(见下行 rRef 咨询),blocks 数组形态同 S14-P4 口径。
+          try {
+            const msgs = bodyObj.messages || [];
+            for (let i = msgs.length - 2; i >= 0; i--) {
+              const m = msgs[i];
+              if (m && m.role === 'assistant') {
+                const txt = Array.isArray(m.content)
+                  ? m.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
+                  : String(m.content || '');
+                if (txt.trim()) { prevAssistant = txt.slice(0, 400); break; }
+              }
+            }
+          } catch { /* 取不到不接 */ }
         }
         const l1 = lastKind === 'human' ? classifyPrompt(adapter.lastHumanText(bodyObj.messages)) : null;
         // 难度定档:人类轮算一次,tier 实弹决策与四档影子共用同一结果
@@ -1409,6 +1456,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           const d4Flags = diffDecision && diffDecision.flags && typeof diffDecision.flags === 'object' ? diffDecision.flags : null;
           const d4L1Tier = lexSnapshot ? lexSnapshot.tier : null; // S2-F2:词法原始(融合前)
           const d4L1Conf = lexSnapshot ? lexSnapshot.confidence : null;
+          const consultCtx = buildConsultContext(prevHuman, prevAssistant);
           const rRefArm1 = !!(diffDecision && diffDecision.tier === 'R1'
             && (ro.rRef.window === 'all-r1' || Number(diffDecision.confidence) <= RREF_AMB_CONF)
             && ro.decisionOn);
@@ -1416,9 +1464,10 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           if (rRefArm1 || rRefArm2) {
             const consultText = String(adapter.lastHumanText(bodyObj.messages) || '');
             if (consultText.length <= ro.rRef.maxChars) {
-              // 前轮摘要已在人类轮公共处提取(prevHuman):指代类 prompt("刚才的测试…")盲判是决策模型漏判主因
+              // 前轮摘要已在人类轮公共处提取(prevHuman/prevAssistant):指代类 prompt("刚才的测试…")盲判是决策模型漏判主因
+              // 2026-11-22:context 扩入上一条助手回复摘要,并在法官 400 字额度内为它留位;缓存键一并算入。
               const cKey = promptHeadLog ? promptKey(promptHeadLog) : null;
-              const cHash = contextHash(prevHuman);
+              const cHash = contextHash(consultCtx);
               const cached = rRefCacheGet(cKey, ro.decisionModel, cHash);
               const negCached = !!cached && cached.negative === true; // S2-F4:负缓存命中=短窗跳过咨询
               let vote = cached && !negCached ? { tier: cached.tier, confidence: cached.confidence, cached: true } : null;
@@ -1428,7 +1477,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                   const dm = await import('./decisionModel.mjs');
                   // 断路器按该实例配置目录隔离(生产=DATA_DIR,隔离测试=注入临时目录,互不绑架)
                   if (!dm.breakerOpen(path.dirname(configPath))) {
-                    const jr = await dm.judgeTier(consultText, { context: prevHuman, config: readJson(configPath), dataDir: path.dirname(configPath), timeoutMs: Math.min(RREF_CONSULT_TIMEOUT_MS, ro.rRef.maxLatencyMs || RREF_CONSULT_TIMEOUT_MS) }); // S2-F1:超时兜底单源(thresholds)
+                    const jr = await dm.judgeTier(consultText, { context: consultCtx, config: readJson(configPath), dataDir: path.dirname(configPath), timeoutMs: Math.min(RREF_CONSULT_TIMEOUT_MS, ro.rRef.maxLatencyMs || RREF_CONSULT_TIMEOUT_MS) }); // S2-F1:超时兜底单源(thresholds)
                     if (jr.answer && /^R[1-4]$/.test(String(jr.answer.type))) {
                       vote = { tier: String(jr.answer.type), confidence: Number(jr.answer.confidence) || 0, cached: false };
                       voteLatency = Number(jr.latencyMs) || null;
@@ -1471,7 +1520,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             const consultText4 = String(adapter.lastHumanText(bodyObj.messages) || '');
             if (consultText4.length <= ro.rRef.maxChars) {
               const cKey4 = promptHeadLog ? promptKey(promptHeadLog) : null;
-              const cHash4 = contextHash(prevHuman);
+              const cHash4 = contextHash(consultCtx);
               const cached4 = rRefCacheGet(cKey4, ro.decisionModel, cHash4);
               let vote4 = cached4 ? { tier: cached4.tier, confidence: cached4.confidence, cached: true } : null;
               let latency4 = null;
@@ -1479,7 +1528,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 try {
                   const dm4 = await import('./decisionModel.mjs');
                   if (!dm4.breakerOpen(path.dirname(configPath))) {
-                    const jr4 = await dm4.judgeTier(consultText4, { context: prevHuman, config: readJson(configPath), dataDir: path.dirname(configPath), timeoutMs: Math.min(RREF_CONSULT_TIMEOUT_MS, ro.rRef.maxLatencyMs || RREF_CONSULT_TIMEOUT_MS) }); // S2-F1:超时兜底单源(thresholds)
+                    const jr4 = await dm4.judgeTier(consultText4, { context: consultCtx, config: readJson(configPath), dataDir: path.dirname(configPath), timeoutMs: Math.min(RREF_CONSULT_TIMEOUT_MS, ro.rRef.maxLatencyMs || RREF_CONSULT_TIMEOUT_MS) }); // S2-F1:超时兜底单源(thresholds)
                     if (jr4.answer && /^R[1-4]$/.test(String(jr4.answer.type))) {
                       vote4 = { tier: String(jr4.answer.type), confidence: Number(jr4.answer.confidence) || 0, cached: false };
                       latency4 = Number(jr4.latencyMs) || null;
@@ -1540,6 +1589,8 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           phase: phase0, guard: switchGuard(configPath), contextBytes: size,
           errStreak, escalate, eagerR3, loopStreak,
           tierClassify: { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes },
+          // 续接轮保留(2026-11-22 第一档):人类轮判定是否续接(短确认/短指代),阶段内沿用任务档
+          continuation: lastKind === 'human' ? isContinuationTurn(adapter.lastHumanText(bodyObj.messages)).continuation : false,
         });
         decision = d;
         // 门控通知(2026-11-05):拦截连击/疲劳放行落 data/usage/gate-notice.json,prompt-guard 据此注入压缩建议
@@ -1579,6 +1630,23 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               inventory: inventory0, health: health0,
               reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
             }) : null;
+            // 短轮影子观察(2026-11-22 第一档,用户定档):确认句("好的/继续/对")记"继承上一档"会解析到哪
+            // (inheritWouldTier/Model,R3/R4 均维持原档,不封顶 R2——与实弹续接闸同口径),用于和 tev1 arm1
+            // 救回对账;新短指令("修一下")只打 shortTurn 标签。上一表现档取 state(此刻仍是上轮相位,下行才覆盖写)。
+            const shortSc = classifyShortTurn(adapter.lastHumanText(bodyObj.messages));
+            let inheritWouldTier = null;
+            let inheritWouldModel = null;
+            if (shortSc.kind === 'ack') {
+              inheritWouldTier = state.get(convKey)?.tier || null;
+              if (inheritWouldTier) {
+                const inr = resolveTier(inheritWouldTier, {
+                  cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
+                  inventory: inventory0, health: health0,
+                  reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+                });
+                inheritWouldModel = inr ? (inr.modelId || null) : null;
+              }
+            }
             logTierShadow({
               dataDir: healthDataDir, prompt: adapter.lastHumanText(bodyObj.messages),
               tier: diff.tier, tierConfidence: diff.confidence, tierReason: diff.reason,
@@ -1591,6 +1659,8 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               ambWouldTier: amb ? (amb.tier || null) : null,
               ambWouldModel: amb ? (amb.modelId || null) : null,
               host: reqHost,
+              shortTurn: shortSc.short ? shortSc.kind : null,
+              inheritWouldTier, inheritWouldModel,
             });
           } catch { /* 审计失败绝不影响实弹转发 */ }
         }
