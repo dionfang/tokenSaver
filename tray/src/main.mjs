@@ -167,6 +167,25 @@ function openWizard() {
   wizardController(); // IPC 注册与控制器就绪先于渲染层首问
 }
 
+/** 20261123 修复(用户令「修」):装完即用闭环——首轮索引自动建立(顶层助手,activateTray 首次激活调)。
+ *  纯托盘机无编辑器钩子触发面(SessionStart→auto.mjs 的 build→embed 链只在编辑器会话内跑),
+ *  chunks.jsonl 缺失且 roots 非空 → 后台自动 build→embed(与「立即同步」按钮同链:embed 族 6h 死线、
+ *  runner 互斥自带防重;embed.mjs 内部 cpu 线程限速慢跑不打扰用户)。失败静默——原因已进 embed.log,
+ *  面板「立即同步」按钮兜底可重试,不打扰首次使用体验(不弹错误框)。 */
+async function autoFirstIndex() {
+  const dataDir = ctx.paths?.dataDir;
+  if (dataDir == null) return;
+  if (fs.existsSync(path.join(dataDir, 'chunks.jsonl'))) return; // 已有索引(含向导后手动同步过)
+  if (!listRoots().length) return; // 未录目录:无内容可建,静默等用户进向导补
+  if (ctx.snapshot?.embedPid != null) return; // 已有嵌入在跑(编辑器钩子链先启动了)
+  const { nodeBin, codeIndexRoot } = ctx.paths || {};
+  if (!nodeBin || !codeIndexRoot) return;
+  const res = await runner.run('embed', nodeBin, [`${codeIndexRoot}/build.mjs`], { cwd: codeIndexRoot, label: '首次自动建索引 build.mjs' });
+  if (res.code !== 0 || res.timedOut) return; // build 失败即停(半截索引无意义);embed.log 有因
+  await runner.run('embed', nodeBin, [`${codeIndexRoot}/embed.mjs`], { cwd: codeIndexRoot, label: '首次自动嵌入 embed.mjs' });
+  try { await poller?.slowRefresh('auto-first-index'); } catch { /* 刷新失败不影响建链 */ }
+}
+
 /** 托盘模式激活(幂等):自启+轮询+托盘图标。仅向导完成后调用(2026-11-17 用户裁决)。 */
 function activateTray() {
   if (tray) return;
@@ -190,6 +209,10 @@ function activateTray() {
       setTimeout(() => { poller.fastTick(); loop(); }, d);
     };
     loop();
+    // 20261123 修复(用户令「修」):装完即用闭环——首轮索引无自动触发面(编辑器机靠 SessionStart 钩子
+    // 跑 auto.mjs,纯托盘机无钩子),首次激活时若 chunks.jsonl 缺失且 roots 非空 → 后台自动 build→embed
+    // (autoFirstIndex 顶层助手:cpu 线程限速慢跑不打扰;失败静默,原因在 embed.log,「立即同步」按钮兜底)。
+    autoFirstIndex().catch(() => {});
     // S14-F8(20261118):slowRefresh 是 async,fire-and-forget 未接 catch → 内部抛错即未处理 rejection
     powerMonitor.on('resume', () => { poller.slowRefresh('resume').catch(() => {}); });
     tray = new Tray(nativeImage.createFromPath(ICON));
