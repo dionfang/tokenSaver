@@ -15,6 +15,10 @@ import { stripExeDescription, exeCandidates } from './strip-exe-description.mjs'
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tray = path.resolve(here, '..');
 const version = JSON.parse(fs.readFileSync(path.join(tray, 'package.json'), 'utf8')).version;
+// 20261123 用户裁定「托盘图标与桌面图标使用同一个」:构建前从 build/icon.png 派生 assets/tray.png
+// (32×32 面积均值),托盘/桌面/exe/安装器四处单源;派生失败即中止构建(防旧绿点占位稿回潮入包)。
+const trayIcon = spawnSync(process.execPath, [path.join(here, 'tray-from-icon.mjs')], { cwd: tray, stdio: 'inherit', windowsHide: true });
+if (trayIcon.status !== 0) process.exit(trayIcon.status ?? 1);
 const build = spawnSync(process.execPath, [path.join(tray, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'), '--win', 'nsis'], { cwd: tray, stdio: 'inherit', windowsHide: true, env: { ...process.env } });
 if (build.status !== 0) process.exit(build.status ?? 1);
 const targets = exeCandidates(path.join(tray, 'release3'), version);

@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tray = path.resolve(here, '..');
+// 20261123 用户裁定「托盘图标与桌面图标使用同一个」:构建前从 build/icon.png 派生 assets/tray.png(与 dist-online 同口径,失败即中止)。
+const trayIcon = spawnSync(process.execPath, [path.join(here, 'tray-from-icon.mjs')], { cwd: tray, stdio: 'inherit', windowsHide: true });
+if (trayIcon.status !== 0) process.exit(trayIcon.status ?? 1);
 const stage = spawnSync(process.execPath, [path.join(here, 'stage-weights.mjs')], { cwd: tray, stdio: 'inherit', windowsHide: true });
 if (stage.status !== 0) process.exit(stage.status ?? 1);
 const build = spawnSync(process.execPath, [path.join(tray, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'), '--win', 'nsis', '-c', 'electron-builder.offline.yml'], { cwd: tray, stdio: 'inherit', windowsHide: true, env: { ...process.env } });

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * 占位托盘图标生成器(§18-A5 混合拍板:助手生成稿先行,安装包构建前用户素材定终稿)。
- * 纯 node:32×32 RGBA→PNG(zlib deflate+CRC32),深色圆角底+绿色状态点;输出 assets/tray.png。
- * 用法:node gen-icon.mjs
+ * 【已退役 20261123】占位托盘图标生成器——tray.png 改由 build/tray-from-icon.mjs 从
+ * build/icon.png 派生(用户裁定「托盘图标与桌面图标使用同一个」,单源防漂移;dist 双包装器
+ * 构建前自动调用)。本脚本保留仅作历史参考,**勿再运行**(运行会以绿点占位稿覆盖派生产物)。
  */
 import fs from 'node:fs';
 import path from 'node:path';
