@@ -400,7 +400,9 @@ function buildMenu() {
   return Menu.buildFromTemplate([
     { label: '切换运行模式', click: () => { openWizard(); } },
     { label: '管理代码目录', click: () => { openRoots(); } },
-    { label: '检查应用更新', click: () => { openPanel(); checkAppUpdate({ onEvent: pushBase, fromMenu: true }); } },
+    // 20261123 修复(用户报「更新下载进度占用公共决策包进度条」):应用更新的进度/结果事件打 kind:'app'
+    // 标再进面板——面板 onBaseEvent 按分流写【专属 app 进度行】,不再写 knn-base-bar/pct(那是公共决策包的)。
+    { label: '检查应用更新', click: () => { openPanel(); checkAppUpdate({ onEvent: (ev) => pushBase({ ...ev, kind: 'app' }), fromMenu: true }); } },
     { label: '打开数据目录', click: () => { if (ctx.paths?.dataDir) shell.openPath(ctx.paths.dataDir); } },
     { label: `开机自启    ${ctx.autorunOn ? '✓' : '✗'}`, click: async () => {
       const next = !ctx.autorunOn;
