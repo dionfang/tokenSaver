@@ -133,11 +133,15 @@
     el.textContent = text || '';
     el.style.color = kind === 'err' ? '#f85149' : kind === 'ok' ? '#3fb950' : '#8b949e';
   }
-  // 应用更新专属进度行(20261123):平时隐藏;有更新时显示并实时刷新;终态后 2s 隐藏恢复
+  // 应用更新专属进度行(20261123):默认隐藏;只有【确认存在新版】才显示——manifest 阶段区分
+  // 「检查应用更新…」(检查中,不显示条)与「发现新版本 x,下载中…」(存在新版,显示条);
+  // 下载 pct 实时刷新,完成 2s 后隐藏,已是最新/失败即隐藏(绿色文案在 base-update-msg 独立展示)。
   let appUpdateHideTimer = null;
   function paintAppUpdate(ev) {
     const row = $('app-update-row'); if (!row) return;
-    if (ev.phase === 'manifest' || ev.phase === 'download') {
+    const msg = String(ev.message || '');
+    const hasNew = ev.phase === 'download' || (ev.phase === 'manifest' && msg.includes('发现新版本'));
+    if (hasNew) {
       if (appUpdateHideTimer) { clearTimeout(appUpdateHideTimer); appUpdateHideTimer = null; }
       row.style.display = '';
       const pct = ev.pct;
@@ -146,10 +150,10 @@
       $('app-update-pct').textContent = pct != null ? `${pct}%` : '…';
       return;
     }
+    // 检查中(manifest「检查应用更新…」)→ 保持隐藏,不显示空条
+    if (ev.phase === 'manifest') return;
     if (ev.phase === 'result' || ev.phase === 'done') {
-      const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest' || ev.outcome === 'installing';
-      // already-latest(已是最新):不显示进度行,绿色文案在 base-update-msg 即够(用户裁定口径)
-      if (ev.outcome === 'already-latest') return;
+      const ok = ev.outcome === 'updated' || ev.outcome === 'installing'; // already-latest 不显条(绿文案即够,hasNew 门统一口径)
       if (ok) {
         $('app-update-bar').style.width = '100%';
         $('app-update-bar').className = 'full';
@@ -187,7 +191,7 @@ if (ev.kind === 'app') { paintAppUpdate(ev); return; }
     if (ev.phase === 'result' || ev.phase === 'done') {
       baseDownloading = false;
       baseHold = false; paintBaseBtn();
-      const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest' || ev.outcome === 'installing';
+      const ok = ev.outcome === 'updated' || ev.outcome === 'installing'; // already-latest 不显条(绿文案即够,hasNew 门统一口径)
       baseMsg(ev.message || '', ok ? 'ok' : 'err');
       // 成功即拉新快照,进度条从下载态转入真实 base 层条数比例(不再等周期 tick/被 slowInFlight 跳过)
       if (ok) window.trayPanel?.refresh?.().catch(() => {});
