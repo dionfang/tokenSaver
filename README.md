@@ -26,7 +26,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 #### 动态模型路由(要点)
 
-- 会话选 `auto` 虚拟模型即启用;每轮按难度定档 R1-R4,R1 为 sticky 基准,宽限/阶段粘住/切换税门控压低换档频率。
+- 会话选 `auto` 虚拟模型即启用;每轮按难度定档 R1-R4,R1 为 sticky 基准,宽限/阶段粘住/切换税门控压低换档频率;短确认/短指令等续接轮沿用阶段档不拆阶段(maxPhaseTurns 有界)。
 - 定档链:词法底档(L1 语义三类 + 品牌三档表 + 轻量后缀降档)→ 恒本地的判定模型双臂救回(词法 R1 过置信门升 R2、R2 强信号升 R3);R4 恒不由自动升档进入,唯一入口=显式点名旗舰模型。费率以 R3=1x 为基准(R1≈0.05x / R2≈0.5x / R4≈3.6x),长期实测综合费率 ≈0.15x。
 - 上游 429/配额墙同轮滑链或降档;门控连续拦截满 3 次疲劳放行,拦截时注入一次压缩建议。
 - 自进化闭环:真实流量自动生长黄金集,每 6h 学习信号权重与门槛,折外过门控自动晋升 live,观察窗成本恶化自动回滚。
@@ -210,7 +210,7 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 
 #### Dynamic model routing (key points)
 
-- Selecting the `auto` virtual model enables it; each turn is tiered R1-R4, with R1 as the sticky base and grace / phase stickiness / a switch-tax gate damping tier changes.
+- Selecting the `auto` virtual model enables it; each turn is tiered R1-R4, with R1 as the sticky base and grace / phase stickiness / a switch-tax gate damping tier changes. Short continuation turns (brief acknowledgments / short instructions) keep the current phase tier instead of splitting a new phase (bounded by maxPhaseTurns).
 - Tiering chain: a lexical base tier (L1 semantic classes + brand three-grade table + lightweight-suffix demotion) is rescued by the always-local judge model in two arms (lexical R1 passing the confidence gate goes to R2, a strong R2 signal goes to R3); R4 is never reached by auto-escalation — the only entry is explicitly naming a flagship model. Rates use R3 = 1x as base (R1≈0.05x / R2≈0.5x / R4≈3.6x), with the long-run blended rate measured at ≈0.15x.
 - Upstream 429 / quota walls trigger a same-turn chain slide or downgrade; the gate releases by fatigue after 3 consecutive blocks and injects a one-shot compression suggestion while blocking.
 - Self-evolution loop: real traffic grows the golden set automatically; every 6h signal weights and thresholds are learned, out-of-fold gate passing auto-promotes to live, and cost regressions inside the observation window auto-roll back.

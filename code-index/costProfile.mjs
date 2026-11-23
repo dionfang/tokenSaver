@@ -98,7 +98,7 @@ export function tierMultiplier(profile, tier) {
 }
 
 /**
- * 单轮基础价(M R1 等效,不含档位倍率)。
+ * 单轮基础价(M R3 等效,不含档位倍率)。
  * state: 'hot'(吃热缓存/命中) | 'cold'(冷读,含换档即付的切换税)。
  */
 export function baseTurn(profile, { state = 'hot', cacheMode = null } = {}) {
@@ -107,7 +107,7 @@ export function baseTurn(profile, { state = 'hot', cacheMode = null } = {}) {
   return state === 'cold' ? side.coldM : side.hotM;
 }
 
-/** 切换税(M R1 等效,按目标档倍率放大)——报告用,判定用不到(冷读里已含)。 */
+/** 切换税(M R3 等效,按目标档倍率放大)——报告用,判定用不到(冷读里已含)。 */
 export function switchTax(profile, { toTier = 'R1', cacheMode = null } = {}) {
   const cold = baseTurn(profile, { state: 'cold', cacheMode });
   const hot = baseTurn(profile, { state: 'hot', cacheMode });
@@ -115,7 +115,7 @@ export function switchTax(profile, { toTier = 'R1', cacheMode = null } = {}) {
 }
 
 /**
- * **一轮定档决定**的代价(M R1 等效)+ 转移后的档位状态。纯函数;序列由 policyCost 折叠。
+ * **一轮定档决定**的代价(M R3 等效)+ 转移后的档位状态。纯函数;序列由 policyCost 折叠。
  * 约定(关键是"换档必冷读"对正确/错误决定**一视同仁**,否则基线不公平):
  *   - 判对(pred===true):与上一轮同档 → 吃热缓存 hot×mult;跨档而来 → 冷读 cold×mult(正确的升档照样付税)
  *   - 误升(pred>true):当轮在高档付费(换档即冷读),阶段驻留 ⇒ 下一轮仍在这档(与代理阶段机制同口径)

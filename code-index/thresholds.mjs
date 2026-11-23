@@ -31,3 +31,12 @@ export const L2_LAYER_WEIGHTS = { base: 1, local: 0.6 };
 /** R-ref 决策咨询单次超时兜底上限(ms):与档案 maxLatencyMs 取 min(S2-F1 单源,20261118)。
  *  消费方:modelRouteProxy(arm1/arm2 judgeTier 超时、装配默认)。方案文档语义=「超时上限」,降窗未实现。 */
 export const RREF_CONSULT_TIMEOUT_MS = 5000;
+
+/** R3 硬真值种子入池门槛:tier-evidence 的 p2-escalated→R3 行攒够该数才按 R3 类入样本池
+ *  (沿 modelRoute.mjs l2TierRescue 头注"每类 ≥8 条后补嵌"的既定设计;不足则计数不入场,噪声隔离)。
+ *  消费方:autoExemplars(R3 种子通道)。 */
+export const R3_SEED_MIN = 8;
+
+/** L2 降档救援影子门槛:kNN 以 ≥ 此置信投 light 时,词法 R2 轮记"改判 R1"影子(l2DownWould*),
+ *  只记账对账不改实弹(2026-11-22 影子先行)。消费方:modelRouteProxy(影子账)。 */
+export const L2_DOWN_MIN_CONF = 0.85;

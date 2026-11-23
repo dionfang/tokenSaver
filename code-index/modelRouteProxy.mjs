@@ -49,7 +49,7 @@ import { DATA_DIR, loadConfig } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration, classifyShortTurn, isContinuationTurn } from './tierClassify.mjs';
-import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, RREF_CONSULT_TIMEOUT_MS, CACHE_TTL_MS as THRESHOLD_CACHE_TTL_MS } from './thresholds.mjs'; // S1-F4 单源;S1-F2 门控两值并入;S2-F1(20261118) 咨询超时并入
+import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, RREF_CONSULT_TIMEOUT_MS, CACHE_TTL_MS as THRESHOLD_CACHE_TTL_MS, L2_DOWN_MIN_CONF } from './thresholds.mjs'; // S1-F4 单源;S1-F2 门控两值并入;S2-F1(20261118) 咨询超时并入;L2 降档影子(20261122)
 import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
 import { resolveDecisionProfile, DECISION_PROFILE_FALLBACK, JUDGE_CONTEXT_CHARS } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
@@ -117,6 +117,15 @@ export function buildConsultContext(prevHuman, prevAssistant, budget = JUDGE_CON
   const a = assistant.slice(0, aKeep);
   return `${h}${h ? '\n' : ''}${mark}${a}`;
 }
+/**
+ * L2 降档救援影子资格判定(2026-11-22,纯函数):终判 R2 且 kNN 高置信投 light。
+ * 只判资格不解析模型——影子块里由调用方按资格 resolveTier('R1') 记 l2DownWould*;实弹不改。
+ * 单独成函数供单测钉住阈值口径(thresholds L2_DOWN_MIN_CONF 单源)。
+ */
+export function l2DownWouldTierOf(finalTier, knnVote, minConf = L2_DOWN_MIN_CONF) {
+  return !!(finalTier === 'R2' && knnVote && String(knnVote.type) === 'light' && Number(knnVote.confidence) >= minConf);
+}
+
 function rRefCacheGet(pkey, decisionModel = '', ctxHash = '') {
   const k = pkey ? `${pkey}|${decisionModel}|${ctxHash}` : null;
   const e = k ? rRefCache.get(k) : null;
@@ -148,7 +157,7 @@ function logRRefShadow(usageDir, rec) {
 const COOL_TTL = { config: 2 * 60 * 60 * 1000, transient: 5 * 60 * 1000, billing: 30 * 60 * 1000, unknown: 5 * 60 * 60 * 1000 };
 
 // 渐进退避上限(2026-11-04):同一 provider/model 连续失败 N 次,冷却=基础 TTL×2^(N-1),按族封顶。
-// 目的:额度墙等持久故障不再每 30min 被"探"一次(每次探测连带一次滑档冷读,R2 ≈6.2M R1 等效);
+// 目的:额度墙等持久故障不再每 30min 被"探"一次(每次探测连带一次滑档冷读,R2 冷读一轮 ≈0.025M R3 等效);
 // config/unknown 封顶=基础值(确定性错误探测成本低,过久冷却反而延迟恢复)。成功服务一次即清零(见转发成功路径)。
 const COOL_CAP = { config: 2 * 60 * 60 * 1000, transient: 60 * 60 * 1000, billing: 8 * 60 * 60 * 1000, unknown: 5 * 60 * 60 * 1000 };
 // billing 族(配额墙)直降映射(2026-11-04 用户定案):额度耗尽时跳过同档同价重试,从低一档重解析。
@@ -958,14 +967,18 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   }
 
   // 四档实弹路径(#16,2026-11-03 tier 唯一,role 两档制已废):难度定档 → resolveTier 级联降档。
-  // 粘住规则(2026-11-04 成本复算 v2,按 1M 画像包/隐式缓存 20% 计价;单位=R1 价 token 等效):
+  // 粘住规则(2026-11-04 成本复算 v2 定规则;数字 2026-11-22 按现行画像重算——口径=costProfile.mjs
+  //   DEFAULT_COST_PROFILE(2026-11-06 起 R3=1x 基准,R1/R2/R3/R4=0.05/0.5/1/3.625 倍,隐式缓存
+  //   hot 0.0115/cold 0.05,单位=M R3 等效;旧 R1 基准画像(1x/8x/15x/100x)时代的原数字见括号备档):
   //   - R1 宽限(修正#1/#1b):当前服务档在 R2-R4 且热缓存仍在时,连续第 1 个 R1 轮留在现档服务
-  //     (阶段与具体基座同口径),连续第 2 个才降档/收尾——"降完再升"的冷读税(R2 重升 ≈6.2M)
-  //     远大于留档一轮的空转(R2 热轮 1.82M vs R1 0.23M),单次插问降档净亏 ≈5.35M;
-  //   - 时间感知(修正#4):距上一轮超过缓存 TTL(5min)时热缓存假设失效,宽限与粘住偏好全部关闭,
-  //     直接按当轮难度定档——换档不再有额外税,黏在旧档只是多花钱;
-  //   - 阶段粘住只在一个档差内成立(R3→R2 盈亏平衡 ≈3.86 轮,与 maxPhaseTurns=4 重合,数值不动);
-  //   - R4 跨档不粘(修正#2:R4→R2 盈亏平衡 0.3 轮,100x 下步降当轮即回本);目标档高于阶段档不粘
+  //     (阶段与具体基座同口径),连续第 2 个才降档/收尾——"降完再升"的冷读税(R2 重升 ≈0.019M)
+  //     远大于留档一轮的空转(R2 热轮 ≈0.0058M vs R1 ≈0.0006M),单次插问降档净亏 ≈0.016M,仍净亏
+  //     (旧画像:6.2M / 1.82M vs 0.23M / 净亏 ≈5.35M);
+  //   - 时间感知(修正#4):距上一轮超过缓存 TTL(thresholds.mjs CACHE_TTL_MS=5min)时热缓存假设失效,
+  //     宽限与粘住偏好全部关闭,直接按当轮难度定档——换档不再有额外税,黏在旧档只是多花钱;
+  //   - 阶段粘住只在一个档差内成立(R3→R2 盈亏平衡 ≈3.3 轮,与 maxPhaseTurns=4 同量级;旧画像 ≈3.86
+  //     轮——换挡后规则常数未随新画像复核,留白昼统一复算,同 S14-F1 r4StepDown 项);
+  //   - R4 跨档不粘(修正#2:R4→R2 盈亏平衡 ≈0.5 轮 <1,步降当轮即回本;旧画像 0.3 轮);目标档高于阶段档不粘
   //     (修正#3:阶段里点名旗舰要立即升,不能被粘住吞掉);
   //   - R1 降档不受切换税门控(修正#5),门控只拦升档。
   const baseTier = tierOfModel(baseModel, tcls.modelTiers ? tcls : undefined) || null;
@@ -1366,6 +1379,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       let lastKindLog = null; // 显式轮型(此前靠 reason 反推,v2 起直接落账)
       let prevHuman = null; // 前轮人类 prompt 摘要≤400 字(人类轮提取;rRef/D4 咨询 context 与账本 prevHead 共用)
       let prevAssistant = null; // 上一条助手回复摘要≤400 字(2026-11-22:续接轮任务难度只能从上一轮回复内容推断,接进 tev1 arm1 context)
+      let l2KnnVote = null; // 本轮 kNN 原始票(L2 融合块落,影子账消费:2026-11-22 L2 降档救援影子)
       let promptHeadLog = null; // 本轮任务的人类 prompt 头(与影子/黄金集同 200 字口径,pkey join 用)
       if (adapter && Array.isArray(bodyObj.messages)) {
         const ro = mrRoutingOptions(configPath);
@@ -1431,6 +1445,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 if (doc && doc.vectors) {
                   const vec = await l2fn(adapter.lastHumanText(bodyObj.messages));
                   const knn = knnClassify(vec, doc);
+                  l2KnnVote = knn; // 影子账消费(L2 降档救援):留原始票,别只活在本块作用域里
                   const rescue = l2TierRescue(diffDecision, knn, { minConf: ro.l2Live.minConf });
                   if (rescue) diffDecision = { ...diffDecision, tier: rescue.tier, confidence: rescue.confidence, reason: `${diffDecision.reason}+${rescue.rule}` };
                 }
@@ -1647,6 +1662,14 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 inheritWouldModel = inr ? (inr.modelId || null) : null;
               }
             }
+            // L2 降档救援影子(2026-11-22 影子先行,只记账不改):终判 R2 但 kNN 以 ≥L2_DOWN_MIN_CONF 投 light
+            // ⇒ 记"改判 R1"会解析到哪(l2DownWould*)——与 ambWould*(改判 R2)镜像对账。升档花真钱、
+            // 降档有 P2 上梯兜底,代价不对称,先攒数据再谈转正。l2KnnVote 只在词法 R1/R2 轮被 L2 块置值。
+            const l2Down = l2DownWouldTierOf(diff.tier, l2KnnVote) ? resolveTier('R1', {
+                cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
+                inventory: inventory0, health: health0,
+                reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+              }) : null;
             logTierShadow({
               dataDir: healthDataDir, prompt: adapter.lastHumanText(bodyObj.messages),
               tier: diff.tier, tierConfidence: diff.confidence, tierReason: diff.reason,
@@ -1661,6 +1684,8 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               host: reqHost,
               shortTurn: shortSc.short ? shortSc.kind : null,
               inheritWouldTier, inheritWouldModel,
+              l2DownWouldTier: l2Down ? (l2Down.tier || 'R1') : null,
+              l2DownWouldModel: l2Down ? (l2Down.modelId || null) : null,
             });
           } catch { /* 审计失败绝不影响实弹转发 */ }
         }
@@ -1738,7 +1763,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           markHealthCool({ dataDir: healthDataDir, modelKey: `${failedProvider}/${curModel}`, reason: `${cool}(http ${usage.status ?? '-'})`, ttlMs: coolTtlMs(cool), capMs: COOL_CAP[cool] || coolTtlMs(cool) });
         }
         // billing 族(配额墙)直降(2026-11-04):额度耗尽时跳过同档同价重试——同档再试一次也要付一份
-        // 冷读税(R2≈6.2M),配额墙不会因换档内成员而解除;transient/config/unknown 保留档内滑动(限流是暂时的)。
+        // 冷读税(R2 冷读一轮 ≈0.025M R3 等效,口径见 decideTarget 粘住规则注),配额墙不会因换档内成员而解除;transient/config/unknown 保留档内滑动(限流是暂时的)。
         if (cool === 'billing') curSlideTier = NEXT_LOWER_TIER[curSlideTier] || curSlideTier;
         // 本轮失败已在此 mark:清 cool,防止 break 出循环后"末次补记"对同一 provider/model 二次 mark
         // (2026-11-05 修复:无替代而 break 时 failCount 每轮 +2,渐进退避 2^(N-1) 提前翻倍封顶)。

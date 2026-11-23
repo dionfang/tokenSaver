@@ -583,10 +583,10 @@ export function l2TierRescue(diff, l2, { minConf = 0.8, r3MinConf = 0.85 } = {})
  *   escalated=true + escalationFrom/To),tierReason 前缀 'p2-escalation:' 可与人类轮定档行区分——
  *   修"影子 escalated 通道事实性失效"(此前全史仅 1 行)。
  */
-export function logTierShadow({ dataDir = DATA_DIR, prompt = '', tier = null, tierConfidence = 0, tierReason = '', wouldTier = null, wouldModel = null, wouldProvider = null, downgraded = false, servedModel = null, decisionTier = null, escalated = false, switched = null, servedTier = null, ambWouldTier = null, ambWouldModel = null, escalationFrom = null, escalationTo = null, host = null, shortTurn = null, inheritWouldTier = null, inheritWouldModel = null } = {}) {
+export function logTierShadow({ dataDir = DATA_DIR, prompt = '', tier = null, tierConfidence = 0, tierReason = '', wouldTier = null, wouldModel = null, wouldProvider = null, downgraded = false, servedModel = null, decisionTier = null, escalated = false, switched = null, servedTier = null, ambWouldTier = null, ambWouldModel = null, escalationFrom = null, escalationTo = null, host = null, shortTurn = null, inheritWouldTier = null, inheritWouldModel = null, l2DownWouldTier = null, l2DownWouldModel = null } = {}) {
   try {
     const head = String(prompt || '').slice(0, 200);
-    const rec = { ts: Date.now(), pkey: promptKey(head), promptHead: head, source: 'tier', tier, confidence: tierConfidence, tierReason, wouldTier, wouldModel, wouldProvider, downgraded, servedModel, decisionTier, escalated, switched, servedTier, ambWouldTier, ambWouldModel, escalationFrom, escalationTo, host, shortTurn, inheritWouldTier, inheritWouldModel };
+    const rec = { ts: Date.now(), pkey: promptKey(head), promptHead: head, source: 'tier', tier, confidence: tierConfidence, tierReason, wouldTier, wouldModel, wouldProvider, downgraded, servedModel, decisionTier, escalated, switched, servedTier, ambWouldTier, ambWouldModel, escalationFrom, escalationTo, host, shortTurn, inheritWouldTier, inheritWouldModel, l2DownWouldTier, l2DownWouldModel };
     const file = path.join(dataDir, 'usage', 'routing-shadow.jsonl');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, JSON.stringify(rec) + '\n');

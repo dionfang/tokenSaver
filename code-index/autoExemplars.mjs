@@ -21,6 +21,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR, decisionActive, loadConfig } from './config.mjs';
 import { isInquiryShape, normalizeType, classifyPrompt } from './classify.mjs';
+import { deriveTierTruth } from './tierTruth.mjs';
+import { R3_SEED_MIN } from './thresholds.mjs';
 import { buildExemplars, loadPool, promptKey, resolveExemplarCaps } from './buildExemplars.mjs';
 import { atomicWriteFileSync, takeJsonLock, releaseJsonLock } from './proc.mjs';
 
@@ -31,6 +33,7 @@ const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const CONTESTED_FILE = 'contested-pool.jsonl';
 const LABEL_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 标签有效期 90 天(复核正常时每周期刷新 reviewedAt)
 const CONTESTED_CAP = 500;
+const ARB_REASK_MS = 30 * 24 * 60 * 60 * 1000; // 争议池仲裁重问间隔(2026-11-22):决策票免费但每 6h 重投整池是浪费
 
 /** 标签 TTL 执行:autoSigned 行 reviewedAt 超期 → 摘签退池;缺失 reviewedAt(迁移期)盖戳保留。
  *  独立于 grow 分支(2026-11-10):长期无新对齐数据时也要能摘掉过期标签。返回 {stamped,demoted,entries}。 */
@@ -132,6 +135,37 @@ export function toPoolRows(labels) {
 }
 
 /**
+ * R3 硬真值种子(2026-11-22 R3 种子通道):tier-evidence 行 → 'R3' 类池条目。
+ * 只认 deriveTierTruth 判 R3 的 p2-escalated 行(escalationTo=R3 或 from=R2 上梯)——
+ * R2 档真值不入(multi 类已覆盖 R2 救回,再设 'R2' 类只会稀释 multi 票);非 escalated /
+ * 上梯后仍 R1-R2 的行不碰。预测不回灌(#14)不破:deriveTierTruth 签名无 prompt,只吃证据字段;
+ * 这也是黄金集治理红线「R3 真值仅 P2 行为证据可达」的既有口径。纯函数,证据字段按
+ * tier-evidence 顶层结构适配(escalated/servedTier/escalationFrom·To/calls/writes/errTotal)。
+ */
+export function r3SeedRows(teRows = []) {
+  const out = [];
+  for (const r of teRows || []) {
+    if (!r || r.escalated !== true || !r.prompt) continue;
+    const truth = deriveTierTruth({
+      escalated: true,
+      escalationTo: r.escalationTo, escalationFrom: r.escalationFrom, servedTier: r.servedTier,
+      calls: r.calls, writes: r.writes, errors: r.errTotal,
+    });
+    if (!truth || truth.tier !== 'R3' || !String(truth.rule || '').startsWith('p2-escalated')) continue;
+    out.push({
+      id: `te-${String(r.pkey || '').slice(0, 12)}`,
+      project: 'TokenSaver',
+      prompt: r.prompt,
+      label: 'R3',
+      confidence: Number(truth.confidence) || 0.8,
+      labelRule: 'tier-evidence:p2-escalated(R3 硬真值)',
+      source: 'tier-evidence',
+    });
+  }
+  return out;
+}
+
+/**
  * 读四档影子账本(usage/routing-shadow.jsonl,source:'tier')→ promptKey → {escalated, servedTier}。
  * 自进化证据回流(2026-11-04):P2 上梯 + 实弹服务档是"低档干不动"的唯一硬证据——黄金集的
  * toolCalls/writeEdits 只能证"活多",证不了"能力不够";这份账本把 R2/R3 真值从恒 0 变成有样本。
@@ -214,6 +248,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     let signStats = null;
     let signedRows = [];
     let reviewStats = null;
+    let arbStats = null; // 争议池二轮仲裁(2026-11-22):{asked, signed, stillContested, note}
     if (label) {
       // 影子证据按宿主过滤:两端模型池隔离,qoder 行的 escalated/servedTier 对 zcode 路由无证据意义
       // (promptKey 对齐器不带端信息;宿主名从代理账本口径取,影子行缺 host 的旧记录按通配收进)
@@ -224,6 +259,9 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       signedRows = r.signed || [];
       // 复核翻案(2026-11-04 全自动纠错通道):与代签同周期,同一套四票复核已签机器条目
       try { reviewStats = await reviewGolden({ dataDir }); } catch { /* 复核 fail-open */ }
+      // 争议池二轮仲裁(2026-11-22):tev1 对池内 quorum-not-met 条目带外重投一票,与已记的
+      // l1/l2/behavior 票合议(voteLabel 同口径,1B 行为否决照旧);达成则签入黄金集并移出争议池。
+      try { arbStats = await arbitrateContested({ dataDir, now }); } catch { /* 仲裁 fail-open */ }
     }
     // ---------- 阶段①(2026-11-10):争议池 + 标签 TTL ----------
     // 争议池:四票未签出的候选 + 复核翻案行 → data/routing/contested-pool.jsonl(不进黄金集),
@@ -272,7 +310,13 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
       signedAt: Number(s.signedAt) || 0,
       source: 'auto-signed',
     }));
-    const merged = mergePools([...signedPool, ...primary], extra);
+    // R3 硬真值种子通道(2026-11-22):tier-evidence 的 p2-escalated→R3 行按 'R3' 类入池——
+    // l2TierRescue 的 R2→R3 救援分支有类才通电(此前库内 R3 类恒 0,分支结构性死亡)。门槛
+    // R3_SEED_MIN(thresholds 单源,沿"每类 ≥8 条补嵌"既定设计):不足则计数不入场,噪声隔离。
+    // 种子排池首(硬真值优先于弱标签同 prompt 去重);R2 档真值不入池(multi 类已覆盖 R2 救回)。
+    const r3SeedsAll = r3SeedRows(readJsonl(path.join(dataDir, 'routing', 'tier-evidence.jsonl')));
+    const r3Seeds = r3SeedsAll.length >= R3_SEED_MIN ? r3SeedsAll : [];
+    const merged = mergePools([...r3Seeds, ...signedPool, ...primary], extra);
     const exCfg = (() => {
       const c = loadConfig({ soft: true }); // S14-F1(20261120 夜审):后台路径禁 process.exit,坏 JSON 走默认空
       return c._configError ? {} : (c.exemplars || {});
@@ -290,7 +334,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
     const changed = sig(exemplars) !== beforeSig;
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     const slim = (o) => (o ? Object.fromEntries(Object.entries(o).filter(([k]) => !/Rows$/.test(k))) : o); // 状态文件不落整批行(防膨胀)
-    fs.writeFileSync(statePath, JSON.stringify({ at: now, pool: merged.length, exemplars: exemplars.length, changed, sign: slim(signStats), review: slim(reviewStats) }) + '\n');
+    fs.writeFileSync(statePath, JSON.stringify({ at: now, pool: merged.length, exemplars: exemplars.length, changed, r3Seeds: r3SeedsAll.length, sign: slim(signStats), review: slim(reviewStats), arb: slim(arbStats) }) + '\n');
     if (changed && spawnVectors) {
       // 向量重建耗时十几秒 → 分离后台,不等它
       try {
@@ -308,7 +352,7 @@ export async function maybeGrowPool({ dataDir = DATA_DIR, minIntervalMs = DEFAUL
         });
       } catch { /* 起不来不影响样本库本身 */ }
     }
-    return { state: 'grown', pool: merged.length, exemplars: exemplars.length, before: beforeN, changed, contestedPooled: contestedEntries.length, sign: signStats, review: reviewStats };
+    return { state: 'grown', pool: merged.length, exemplars: exemplars.length, before: beforeN, changed, r3Seeds: r3SeedsAll.length, contestedPooled: contestedEntries.length, sign: signStats, review: reviewStats, arb: arbStats };
   } catch (e) {
     // S5-F1(20261118):失败也回写 state.at——原 catch 直接 return,节流看旧 at 连续放行,
     // 黄金集空/报告写失败窗口每轮空转烧 CPU。回写 at 让节流在失败后同样生效。
@@ -631,6 +675,97 @@ export async function reviewGolden({ dataDir = DATA_DIR, minVotes = 2, decisionM
     fs.appendFileSync(path.join(dataDir, 'routing', 'auto-label-report.md'), sec.join('\n'));
   } catch { /* 报告失败不影响降级 */ }
   return { candidates: cand.length, demoted: demotedSet.size, demotedRows: [...demotedSet.values()], golden: rows.length, decisionNote: decisionNote || null };
+}
+
+/**
+ * 争议池二轮仲裁(2026-11-22):contested-pool.jsonl 此前零消费方、500 条纯积灰——四票未签
+ * 候选(quorum-not-met)每周期照旧进出。本通道让决策模型对池内条目**带外重投一票**:新鲜决策票
+ * 替换池内陈旧决策票,与已记的 l1/l2/behavior 票重新合议(voteLabel 同口径:唯一领先+权重≥2+
+ * ≥2 源,1B 行为否决照旧——单模仍不独签,quorum 纪律不动)。
+ *   达成 ⇒ ensemble-arb 签入黄金集(mergeAutoSigned 防丢工)并把条目**移出争议池**;
+ *   仍争议 ⇒ 盖 arbAt(ARB_REASK_MS 内不重问:决策票本地免费,但每 6h 重投整池是浪费);
+ *   决策跳闸/批量失败 ⇒ 弃权仲裁(fail-open,池与黄金集照旧)。
+ * 不带上下文:离线池无 prevAssistant 通道(那是代理 arm 的地),靠重投的置信门槛本身。
+ * classifyBatchFn 注入缝供测试密闭。返回 {asked, signed, stillContested, note}。
+ */
+export async function arbitrateContested({ dataDir = DATA_DIR, now = Date.now(), decisionMinConf = null, twoVoteConf = null, classifyBatchFn = null, arbTtlMs = ARB_REASK_MS } = {}) {
+  const rows = readJsonl(path.join(dataDir, 'routing', CONTESTED_FILE));
+  if (!rows.length) return { asked: 0, signed: 0, stillContested: 0, note: null };
+  // 只仲裁带 voters 的 quorum-not-met 条目(review-demoted/ttl 行无 voters,天然排除);
+  // arbAt 未过期的跳过(上轮问过、没结论,30 天内不再烧这批)。
+  const cand = rows.filter((r) => r && r.prompt && r.voters && typeof r.voters === 'object'
+    && Object.keys(r.voters).length
+    && !(Number(r.arbAt) > 0 && now - Number(r.arbAt) < arbTtlMs));
+  if (!cand.length) return { asked: 0, signed: 0, stillContested: rows.length, note: '无待仲裁条目' };
+  if (decisionMinConf == null || twoVoteConf == null) {
+    const { resolveDecisionProfile } = await import('./decisionModel.mjs');
+    const prof = resolveDecisionProfile();
+    if (decisionMinConf == null) decisionMinConf = Number(prof.signing.min) || 0.6;
+    if (twoVoteConf == null) twoVoteConf = Number(prof.signing.twoVote) || 0.9;
+  }
+  const dm = await import('./decisionModel.mjs');
+  const cfgRaw = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'code-index.config.json'), 'utf8')); } catch { return {}; }
+  })();
+  // 与 gatherVoters 同闸:本地判定恒启用 + 断路器开 → 本轮弃权仲裁
+  if (!(decisionActive(cfgRaw) && !dm.breakerOpen(dataDir))) {
+    return { asked: 0, signed: 0, stillContested: rows.length, note: '决策模型断路器开启,本轮弃权仲裁' };
+  }
+  const { signable, voteLabel, mergeAutoSigned } = await import('./autoLabel.mjs');
+  const { renumberGolden } = await import('./buildExemplars.mjs');
+  const batch = classifyBatchFn || dm.classifyBatch;
+  const targets = cand.filter((c) => signable(c.prompt)).slice(0, CONTESTED_CAP);
+  let answers = new Map(); // text → {type, confidence}
+  let dmModel = null;
+  let note = null;
+  try {
+    const dr = await batch(targets.map((c) => String(c.prompt || '')), { config: cfgRaw });
+    if (dr.error) { note = `决策模型失败,本轮弃权仲裁:${dr.error}`; targets.length = 0; }
+    else {
+      dmModel = dr.backend || null;
+      targets.forEach((c, i) => { const a = (dr.answers || []).find((x) => x.id === i + 1); if (a) answers.set(String(c.prompt || ''), a); });
+      if (dr.failedChunks) note = `决策模型 ${dr.failedChunks}/${dr.chunks} 个分片失败已跳过(其余照常仲裁)`;
+    }
+  } catch (e) { note = `仲裁决策票异常,本轮弃权:${e && e.message ? e.message : e}`; targets.length = 0; }
+  const signedRows = [];
+  const resolved = new Set();
+  const nextRows = rows.map((r) => {
+    const hit = targets.find((c) => c === r);
+    if (!hit) return r;
+    const fresh = answers.get(String(r.prompt || ''));
+    const voters = { ...r.voters };
+    if (fresh && Number(fresh.confidence) >= decisionMinConf) {
+      voters.decision = { type: fresh.type, confidence: Number(fresh.confidence), weight: Number(fresh.confidence) >= twoVoteConf ? 2 : 1, ...(dmModel ? { model: dmModel } : {}), fresh: true };
+    } else {
+      delete voters.decision; // 重投未起投 ⇒ 决策票弃权(不带池内陈旧决策票充数)
+    }
+    const v = voteLabel(voters);
+    if (v.type && !v.contested && v.votes >= 2) {
+      resolved.add(r);
+      signedRows.push({
+        project: r.project || 'TokenSaver',
+        prompt: r.prompt,
+        autoLabel: v.type, humanLabel: v.type,
+        semanticType: v.type, intensityType: null,
+        reviewed: true, autoSigned: true, arbitrated: true,
+        labelRule: `ensemble-arb(${Object.values(v.voters).flat().join('+')})`,
+        agreement: v.agreement, votes: v.votes, sources: v.sources,
+        voters,
+        evidence: { toolCalls: r.toolCalls != null ? r.toolCalls : '-', writeEdits: r.writeEdits != null ? r.writeEdits : '-' },
+        signedAt: now,
+      });
+      return null; // 仲裁达成,移出争议池
+    }
+    return { ...r, arbAt: now, arbResult: 'still-contested' }; // 未达成:盖戳,重问间隔内跳过
+  }).filter(Boolean);
+  if (signedRows.length) {
+    const goldenFile = path.join(dataDir, 'routing', 'golden-set.jsonl');
+    const existing = readJsonl(goldenFile);
+    const merged = renumberGolden(mergeAutoSigned(signedRows, existing));
+    atomicWriteFileSync(goldenFile, merged.map((x) => JSON.stringify(x)).join('\n') + '\n');
+  }
+  atomicWriteFileSync(path.join(dataDir, 'routing', CONTESTED_FILE), nextRows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  return { asked: targets.length, signed: signedRows.length, stillContested: nextRows.length, note };
 }
 
 function readJsonl(f) {

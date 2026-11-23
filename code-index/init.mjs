@@ -364,7 +364,8 @@ export function modelRoutingScaffold() {
 /**
  * 确保 cfg 有 modelRouting 段(三级播种,人工配置零覆盖):
  *   ① modelRouting 段缺失 → 播种整骨架;
- *   ② 段在但缺 decisionModel / tierOptimize / blendNotice(或非对象)→ 只补缺的键,骨架各参数全关(enabled:false);
+ *   ② 段在但缺 tierOptimize / blendNotice / modelTiers / lightSuffixes(或非对象)→ 只补缺的键,骨架各参数全关(enabled:false);
+ *      (decisionModel / l2 / r3Lexical / l2Live 已回收不再补段,见函数体内 2026-11-14 裁定注);
  *   ③ 已存在 → 原样保留(含人工配置的 model/providers/key),init 绝不覆盖。
  * 返回 {cfg,seeded,patched}:seeded=整段新建,patched=只补了缺失子键。
  */
@@ -520,7 +521,7 @@ if (configExisted) {
       ok(`嵌入路径已是 ${modelInArg}`);
     }
   }
-  // modelRouting 骨架播种(#11):段缺失建整骨架,缺可选子键(decisionModel/tierOptimize/blendNotice/modelTiers/lightSuffixes/l2Live)只补对应键;人工配置原样保留
+  // modelRouting 骨架播种(#11):段缺失建整骨架,缺可选子键(tierOptimize/blendNotice/modelTiers/lightSuffixes)只补对应键(l2/decisionModel/l2Live 已回收不补,见 ensureModelRoutingSection);人工配置原样保留
   const mr = ensureModelRoutingSection(cfgOld);
   if (mr.seeded) {
     cfgOld.modelRouting = mr.cfg.modelRouting;
