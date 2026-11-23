@@ -193,12 +193,21 @@ function computeDeltaPlan(oldBm, newBm) {
 async function downloadDelta({ oldExe, plan, newUrl, partPath, httpReq, onEvent }) {
   const total = plan.totalBytes;
   let done = 0;
-  const emit = () => onEvent?.({
+  // 20261123 修复(用户报「点检查更新进度条不动、右侧无百分比」):差量路径 ① 只用 done/total 报进度——
+  // deltaBytes 常远小于 total(225MB 里只下 1-3MB),pct 恒 1-2%;② 本地组装阶段 emit 极密但瞬间冲到 100%。
+  // 两段语义拆开:①「下载中 x%」分母=deltaBytes(新块下载,可见动);②「组装中 x%」分母=total(本地重组)。
+  const emitDl = (n) => onEvent?.({
+    phase: 'download', pct: plan.deltaBytes ? Math.min(100, Math.round((n / plan.deltaBytes) * 100)) : 100,
+    bytesDone: n, bytesTotal: plan.deltaBytes, mode: 'delta', stage: 'download', message: '下载中(差量)',
+  });
+  const emitAsm = () => onEvent?.({
     phase: 'download', pct: Math.min(100, Math.round((done / total) * 100)),
-    bytesDone: done, bytesTotal: total, mode: 'delta', reusedBytes: total - plan.deltaBytes,
+    bytesDone: done, bytesTotal: total, mode: 'delta', stage: 'assemble', message: '组装中',
+    reusedBytes: total - plan.deltaBytes,
   });
   // ① 拉新块段
   const runBufs = [];
+  let dlDone = 0;
   for (const r of plan.runs) {
     const { status, res } = await httpReq(newUrl, { headers: { Range: `bytes=${r.offset}-${r.offset + r.size - 1}` }, timeoutMs: 60_000 });
     if (status !== 206) throw new Error(`Range 未生效(HTTP ${status})`);
@@ -206,7 +215,7 @@ async function downloadDelta({ oldExe, plan, newUrl, partPath, httpReq, onEvent 
     for await (const c of res) { cs.push(c); n += c.length; }
     if (n !== r.size) throw new Error(`块段长度不符(${n}≠${r.size})`);
     runBufs.push(Buffer.concat(cs));
-    done += n; emit();
+    done += n; dlDone += n; emitDl(dlDone);
   }
   // ② 按序重组
   const out = fs.createWriteStream(partPath);
@@ -216,7 +225,7 @@ async function downloadDelta({ oldExe, plan, newUrl, partPath, httpReq, onEvent 
     for (const it of plan.items) {
       if (it.from != null) {
         for await (const c of fs.createReadStream(oldExe, { start: it.from, end: it.from + it.size - 1 })) await writeOut(c);
-        done += it.size; emit(); // 复用块字节在此计入(新块字节已在①计入)
+        done += it.size; emitAsm(); // 复用块字节在此计入(新块字节已在①计入)
       } else {
         const buf = runBufs[ri].subarray(ro, ro + it.size);
         ro += it.size;
@@ -395,6 +404,9 @@ export async function checkAppUpdate({ onEvent, fromMenu = false } = {}) {
     }
     onEvent?.({ phase: 'manifest', message: `发现新版本 ${info.version},下载中…` });
     const instPath = info.path || info.files[0]?.url;
+    // 20261123:准备差量(拉新旧 blockmap/找旧安装包)期间无进度事件 → 面板右侧只显示「…」;
+    // 先发一条带文案的准备事件,面板显示「准备差量…」,不再是无语义的空条等。
+    onEvent?.({ phase: 'download', message: '准备差量…', stage: 'prepare' });
     const deltaCtx = await prepareDeltaCtx({ ...info, path: instPath }, { appLike: app, httpReq: httpRequest, dir: updatesDir() }).catch(() => null);
     const f = await fetchInstaller({ ...info, path: instPath }, onEvent, deltaCtx);
     if (!f.ok) throw new Error(f.error);

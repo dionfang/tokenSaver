@@ -147,7 +147,10 @@
       const pct = ev.pct;
       $('app-update-bar').style.width = `${pct != null ? pct : 0}%`;
       $('app-update-bar').className = pct != null && pct >= 100 ? 'full' : '';
-      $('app-update-pct').textContent = pct != null ? `${pct}%` : '…';
+      // 20261123:无 pct 时显示阶段文案——准备期「准备差量…」/组装期「组装中 x%」/manifest 期「下载中…」,
+      // 不再是无信息省略号;事件自带 message 优先(组装中/准备差量),否则回「下载中…」。
+      const short = ev.stage === 'assemble' ? '组装中…' : ev.message ? String(ev.message).slice(0, 14) : '下载中…';
+      $('app-update-pct').textContent = pct != null ? `${pct}%` : short;
       return;
     }
     // 检查中(manifest「检查应用更新…」)→ 保持隐藏,不显示空条
