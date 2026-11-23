@@ -171,12 +171,12 @@ if (ev.kind === 'app') { paintAppUpdate(ev); return; }
     if (ev.phase === 'consent') { consentOn = ev.consent?.uploadLocalKnn === true; paintBaseBtn(); return; }
     if (ev.phase === 'download') {
       // 下载进度实时上条(此前仅文字行更新,进度条不动=用户报「下载完进度条没对应更新」)
+      // 20261123 用户裁定:百分比只在条右侧 pct 一处显示,下方 base-update-msg 行不再重复「下载中 x%」
       baseDownloading = true;
       const pct = ev.pct ?? 0;
       $('knn-base-bar').style.width = `${pct}%`;
       $('knn-base-bar').className = pct >= 100 ? 'full' : '';
       $('knn-base-pct').textContent = ev.pct != null ? `下载中 ${pct}%` : '下载中…';
-      baseMsg(ev.pct != null ? `下载中 ${ev.pct}%` : '下载中…');
       return;
     }
     if (ev.phase === 'import') {
