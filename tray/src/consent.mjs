@@ -18,6 +18,10 @@ export function writeConsent(dataDir, uploadLocalKnn, { io = fs, now = () => new
   const next = uploadLocalKnn
     ? { uploadLocalKnn: true, consentedAt: now(), ...(prev?.uploadLocalKnn === true ? { revokedAt: prev.revokedAt ?? null } : {}) }
     : { ...prev, uploadLocalKnn: false, revokedAt: now() };
+  // 20261123 修复(0.2.19 全新装用户实测):人工删除 data 目录后全新安装,勾「同意上传」写
+  // tray-consent.json 时 dataDir 不存在 → ENOENT → 向导第 4 步红条卡死。写前 recursive mkdir
+  // (N51 同族:凡写盘函数必 mkdir;读侧 readConsentFile 缺失=null 本就不炸)。
+  io.mkdirSync(dataDir, { recursive: true });
   io.writeFileSync(path.join(dataDir, CONSENT_FILE), JSON.stringify(next, null, 1));
   return next;
 }
