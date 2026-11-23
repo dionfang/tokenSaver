@@ -92,14 +92,13 @@ export function pendingGate(pending, currentVersion, cmp = compareVersions) {
 function spawnInstaller(exe, { silent = false } = {}) {
   try {
     if (!exe || !fs.existsSync(exe)) return false; // 安装包被清/缺件时显式失败,调用方给用户可见错误
-    const safe = String(exe).replaceAll('"', '""');
-    const command = `ping 127.0.0.1 -n 3 >nul & start "" /wait "${safe}"${silent ? ' /S' : ''}`;
-    // 20261123 修复(测试机「点安装向导不出现」):旧 execFile(cmd,['/d','/s','/c',command]) 形态,
-    // node 对含引号/空格的参数在 CreateProcess 命令行上**外层再包引号并把内部 " 转成 \"**——
-    // cmd 不认 \" 转义,命令串含 start "" /wait "路径" 时必炸「语法不正确」且 stdio ignore 全静默。
-    // 改 shell:true 整串原样传(实测:旧形态 cmd 命令行带 \" 畸形/落盘全失败;shell:true ping&start
-    // 拉起 notepad 实证)。detached+unref 语义不变(宿主退出后 3 秒窗由 cmd 内 ping 承担,N86)。
-    spawn(command, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const safe = String(exe).replaceAll("'", "''"); // PS 单引号串内 ' 需翻倍转义(路径含单引号时)
+    // 20261123 修复(用户报「点安装弹黑窗」):旧 cmd ping&start 形态(shell:true)在本机 windowsHide 失效
+    // 露出 conhost 黑窗。改用 PS 单层形态:Start-Sleep 3(替代 cmd 内 ping,给宿主退出窗口)+ Start-Process
+    // 直拉安装器(替代 start /wait)。PS 无控制台窗口=无黑窗;路径在 PS 单引号串内,避开 N97 的 node argv
+    // 外层引号加写+cmd 转义地狱。detached+unref 语义不变(PS 进程独立存活,宿主退出后照常拉起)。
+    const psScript = `Start-Sleep -Seconds 3; Start-Process -FilePath '${safe}'${silent ? " -ArgumentList '/S'" : ''}`;
+    spawn('powershell.exe', ['-NoProfile', '-Command', psScript], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
     return true;
   } catch { return false; }
 }
@@ -417,8 +416,8 @@ export async function checkAppUpdate({ onEvent, fromMenu = false } = {}) {
       if (response === 0) {
         onEvent?.({ phase: 'result', outcome: 'installing', message: '正在退出并打开新版安装向导…' });
         // 同步拉起再退出(20261121 修):旧写法 setTimeout(…,800)+app.quit() 里定时器随主进程退出被吞,
-        // 测试机实锤点「立即安装」托盘退掉但向导永不出现。3 秒延时本就应放 spawnInstaller 的 detached cmd
-        // 内(ping -n 3,子进程独立存活不随宿主消亡,顺带覆盖退出窗口防 NSIS 文件占用竞态)。
+        // 测试机实锤点「立即安装」托盘退掉但向导永不出现。3 秒延时放 spawnInstaller 的 detached PS 子进程
+        // 内(Start-Sleep,子进程独立存活不随宿主消亡,顺带覆盖退出窗口防 NSIS 文件占用竞态)。
         if (!spawnInstaller(readyInfo.file)) {
           dialog.showErrorBox('应用更新', '安装程序启动失败;下次启动会再次提示,或到安装包目录手动运行。');
         }
