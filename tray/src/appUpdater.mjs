@@ -417,8 +417,8 @@ export async function checkAppUpdate({ onEvent, fromMenu = false } = {}) {
       if (response === 0) {
         onEvent?.({ phase: 'result', outcome: 'installing', message: '正在退出并打开新版安装向导…' });
         // 同步拉起再退出(20261121 修):旧写法 setTimeout(…,800)+app.quit() 里定时器随主进程退出被吞,
-        // 测试机实锤点「立即安装」托盘退掉但向导永不出现。3 秒延时放 spawnInstaller 的 detached PS 子进程
-        // 内(Start-Sleep,子进程独立存活不随宿主消亡,顺带覆盖退出窗口防 NSIS 文件占用竞态)。
+        // 测试机实锤点「立即安装」托盘退掉但向导永不出现。3 秒延时放 spawnInstaller 的 detached cmd 子进程
+        // 内(ping -n 3,子进程独立存活不随宿主消亡,顺带覆盖退出窗口防 NSIS 文件占用竞态)。
         if (!spawnInstaller(readyInfo.file)) {
           dialog.showErrorBox('应用更新', '安装程序启动失败;下次启动会再次提示,或到安装包目录手动运行。');
         }
