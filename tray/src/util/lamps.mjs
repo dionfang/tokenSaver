@@ -89,17 +89,24 @@ export function embedLamp({ health, vectors, chunksLines }) {
   return { lamp: reasons.length ? 'yellow' : 'green', reasons };
 }
 
-/** §5.3.3 决策 KNN 灯:红=缺 local / 黄=缺 base / 绿=齐。
- * 2026-11-15 用户裁决:互惠文案(「未同意上传…」)不再上面板——consent 只影响「更新 base」按钮门禁(§16.3),
- * 灯色与文案仅由双层文件实际存在性决定。 */
-export function knnLamp({ knn }) {
+/** §5.3.3 决策 KNN 灯。20261123 用户裁定(推翻 2026-11-15「consent 不影响灯」):consent 定模式——
+ *  在线模式(consent=true):灯只看公共决策包——未就绪红/就绪绿;本地决策包只作补充,不影响灯。
+ *  离线模式(consent=false/null,公共包文件已随互惠删除):红=本地未嵌入 / 黄=嵌入中 / 绿=嵌入完成
+ *  (knnEmbedding 由采集层注入=build-vectors 进度在跑,见 computeLamps knnCovered 口径)。 */
+export function knnLamp({ knn, consent, knnEmbedding = false } = {}) {
   const baseEntries = knn?.baseEntries ?? null;
   const localEntries = knn?.localEntries ?? null;
   const baseExists = knn?.baseExists === true;
   const baseBuiltAt = knn?.baseBuiltAt ?? null;
-  if (!knn || !knn.localExists) return { lamp: 'red', notes: ['本地 local 向量 KNN 不存在(先完成嵌入)'], baseEntries, localEntries, baseExists, baseBuiltAt };
-  if (!knn.baseExists) return { lamp: 'yellow', notes: ['base 向量包缺失(权威层不可用)'], baseEntries, localEntries, baseExists, baseBuiltAt };
-  return { lamp: 'green', notes: [], baseEntries, localEntries, baseExists, baseBuiltAt };
+  if (consent?.uploadLocalKnn === true) {
+    return baseExists
+      ? { lamp: 'green', notes: [], baseEntries, localEntries, baseExists, baseBuiltAt }
+      : { lamp: 'red', notes: ['公共决策包未就绪(未下载/下载未完成,可点「更新」获取)'], baseEntries, localEntries, baseExists, baseBuiltAt };
+  }
+  if (knnEmbedding) return { lamp: 'yellow', notes: ['本地决策包嵌入中'], baseEntries, localEntries, baseExists, baseBuiltAt };
+  return (knn && knn.localExists)
+    ? { lamp: 'green', notes: [], baseEntries, localEntries, baseExists, baseBuiltAt }
+    : { lamp: 'red', notes: ['本地决策包未嵌入(点「立即同步」构建)'], baseEntries, localEntries, baseExists, baseBuiltAt };
 }
 
 /** §5.3.4 三端钩子灯:直接映射 hooksStatus.mjs 的 state;拿不到结果(未跑/失败)按 absent 不判红。 */
@@ -112,13 +119,16 @@ export function hooksLamps(hooksResult) {
 export function computeLamps({ health, vectors, chunksLines, knn, hooks: hooksInput, consent, progress, localWeights, exemplarCount = null, knnCovered = null, embedCovered = null } = {}) {
   const models = modelLamps(health, { localWeights });
   const embed = embedLamp({ health, vectors, chunksLines });
-  const knnR = knnLamp({ knn });
+  // 20261123:决策嵌入中(离线模式黄灯判据)=build-vectors 进度在跑(knnCovered 非 null;poller 注入)
+  const knnR = knnLamp({ knn, consent, knnEmbedding: knnCovered != null });
   const hooks = hooksLamps(hooksInput);
+  // missing 优先级(20261123 随模式更新):模型红 > 决策包红——在线红=公共包缺(baseKnn),离线红=本地未嵌入(localKnn)
+  const knnMissingKey = consent?.uploadLocalKnn === true ? 'baseKnn' : 'localKnn';
   const missing = models.embedding === 'red' ? 'embedding'
     : models.reranker === 'red' ? 'reranker'
       : models.decision === 'red' ? 'decision'
-        : knnR.lamp === 'red' ? 'localKnn'
-          : knnR.lamp === 'yellow' ? 'baseKnn' : null;
+        : knnR.lamp === 'red' ? knnMissingKey
+          : null;
   // 2026-11-15 用户裁决:面板进度=总体状态——done=向量 meta 已嵌块数,total=chunks.jsonl 总索引块
   // (progress 实时批次仅供内部展示用途,不再进入 detail;embedPct 由总体口径计算)。
   // 2026-11-21 延伸(用户问「进度条为何不动」):嵌入中 meta 只在收尾落盘,分子冻结在旧值——

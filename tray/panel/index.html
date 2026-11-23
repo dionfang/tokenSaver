@@ -68,9 +68,10 @@
   const HOOK_TEXT = { green: '接线正确', red: '接线错误', absent: '未安装' };
   const MODEL_TEXT = { green: '已运行', yellow: '未运行', red: '未安装' };
   const EMBED_TEXT = { green: '全量嵌入', yellow: '部分嵌入', red: '无嵌入', empty: '未选目录' };
-  // 2026-11-15 用户裁决:启用 base+local=「在线模式」;仅 local=「离线模式」(原名中的 local/base+local 前缀去掉)
-  const KNN_TEXT = { green: '在线模式', yellow: '离线模式', red: '离线模式', absent: '未检测' };
-  const KNN_NAME = { green: '在线模式', yellow: '离线模式', red: '离线模式', absent: '模型决策状态' };
+  // 20261123 用户裁定:灯文案随模式(consent)切换——在线=公共决策包红/绿;离线=本地决策包红/黄/绿。
+  // (推翻 2026-11-15 旧「双层存在性」口径;名称不再跟灯色走,恒由 consent 定在线/离线。)
+  const KNN_ONLINE_TEXT = { green: '公共决策包就绪', red: '公共决策包未就绪', absent: '未检测' };
+  const KNN_OFFLINE_TEXT = { green: '本地决策包就绪', yellow: '本地决策包嵌入中', red: '本地决策包未嵌入', absent: '未检测' };
   const $ = (id) => document.getElementById(id);
 
   function setLamp(id, lamp, textMap) {
@@ -94,8 +95,11 @@
     $('embed-bar').className = pct != null && pct >= 100 ? 'full' : '';
     // 2026-11-15 用户裁决:总体状态——已嵌/总索引块+总比例;100%=绿条,不足=黄条;下方不显示状态原因文案
     $('embed-pct').textContent = total != null ? `${done}/${total}(${pct ?? 0}%)` : '未选目录';
-    setLamp('knn', L.knn, KNN_TEXT);
-    $('knn-name').textContent = KNN_NAME[L.knn] || '模型决策状态';
+    // consent 前移(20261123):knn 灯文案/模式名/公共包条都按模式走,须先拿到
+    consentOn = s.consent?.uploadLocalKnn === true;
+    setLamp('knn', L.knn, consentOn ? KNN_ONLINE_TEXT : KNN_OFFLINE_TEXT);
+    // 模式名恒由 consent 定(20261123):同意上传=在线模式;不同意/撤回=离线模式(本地包承担决策)
+    $('knn-name').textContent = consentOn ? '在线模式' : '离线模式';
     // 本地决策包(20261120 显示逻辑与公共决策包对齐):无样本库=灰条+「无本地样本」(旧版显示「—」
     // =查不到状态,用户投诉);有样本=同语法 done/total(pct%),100% 绿满条,不足=黄条。
     const kd = p.knnDone ?? 0, kt = p.knnTotal, kpct = p.knnPct;
@@ -104,21 +108,28 @@
     $('knn-pct').textContent = kt != null ? `${kd}/${kt}(${kpct ?? 0}%)` : '无本地样本';
     // 公共决策包(原名 base 向量包):未下载=灰条且无文案;已下载=同本地格式「done/total(pct%)」
     // 下载/导入进行中(baseDownloading)由 onBaseEvent 实时驱动进度条,周期快照不覆盖,避免条来回跳。
+    // 离线模式(20261123 用户裁定):公共包文件已随撤回删除——灰条+「无公共决策包」,不走在线显示分支。
     const bd = p.knnBaseDone, bt = p.knnBaseTotal, bpct = p.knnBasePct;
     if (!baseDownloading) {
-      $('knn-base-bar').style.width = `${bd != null ? (bpct ?? 0) : 0}%`;
-      $('knn-base-bar').className = bd == null ? 'grey' : (bpct != null && bpct >= 100 ? 'full' : '');
-      $('knn-base-pct').textContent = bd != null && bt != null ? `${bd}/${bt}(${bpct ?? 0}%)` : '';
+      if (!consentOn) {
+        $('knn-base-bar').style.width = '0%';
+        $('knn-base-bar').className = 'grey';
+        $('knn-base-pct').textContent = '无公共决策包';
+      } else {
+        $('knn-base-bar').style.width = `${bd != null ? (bpct ?? 0) : 0}%`;
+        $('knn-base-bar').className = bd == null ? 'grey' : (bpct != null && bpct >= 100 ? 'full' : '');
+        $('knn-base-pct').textContent = bd != null && bt != null ? `${bd}/${bt}(${bpct ?? 0}%)` : '';
+      }
     }
     for (const k of ['zcode', 'cursor', 'qoder']) setLamp(k, L.hooks?.[k], HOOK_TEXT);
     embedRunning = s.embedPid != null;
     paintSyncBtn();
-    consentOn = s.consent?.uploadLocalKnn === true;
     paintBaseBtn();
   }
 
-  // ---------- M4/M5(2026-11-18 交互裁决):「更新」=互惠动作(先上传本地已签向量再下载);
-  // 同意唯一入口=安装向导数据上传步,面板保持监控定位(上传/同意开关已删) ----------
+  // ---------- M4/M5(2026-11-18 交互裁决;20261123 用户改口径):「更新」=先下载公共决策包,
+  // 再上传本地决策包(本地不存在静默跳过——首装未建向量不异常);同意唯一入口=安装向导数据上传步,
+  // 面板保持监控定位(上传/同意开关已删) ----------
   let baseHold = false;
   let baseDownloading = false; // 公共决策包下载/导入进行中:进度条改由 onBaseEvent 驱动,render 暂不覆盖
   let consentOn = false;
@@ -126,7 +137,7 @@
     const btn = $('base-update');
     btn.disabled = baseHold || !consentOn;
     btn.textContent = baseHold ? '更新中' : '更新';
-    btn.title = consentOn ? '互惠更新:先上传本地已签向量,再从发行源下载公共决策包' : '未同意上传本地向量(安装向导-数据上传步勾选后可用)';
+    btn.title = consentOn ? '下载最新公共决策包,并上传本地决策包(本地不存在时静默跳过)' : '未同意上传本地向量(安装向导-数据上传步勾选后可用)';
   }
   function baseMsg(text, kind) {
     const el = $('base-update-msg');
@@ -210,7 +221,7 @@ if (ev.kind === 'app') { paintAppUpdate(ev); return; }
   });
   $('base-update').addEventListener('click', async () => {
     if (!window.trayPanel?.updateBase || baseHold || !consentOn) return;
-    baseHold = true; paintBaseBtn(); baseMsg('互惠更新中:先上传本地向量…');
+    baseHold = true; paintBaseBtn(); baseMsg('更新中:下载公共决策包…');
     try { await window.trayPanel.updateBase(); }
     finally { baseHold = false; paintBaseBtn(); }
   });

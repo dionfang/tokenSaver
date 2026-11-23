@@ -436,6 +436,49 @@ let weightsAuto = null, autoDownloader = null; // 2026-11-18 托盘自动补权�
 // 模型下载进度登记簿(2026-11-18 交互同步):wizard 权重下载/托盘自动补/gpu pull 三路共用;
 // 面板模型行「下载中 pct%」+ 自检行/下一步门禁(下载中可跳过)。
 const weightRegistry = createDownloadRegistry({ onChange: (snap) => { if (panel && !panel.isDestroyed()) panel.webContents.send('tray:weight-download', snap); } });
+
+// ---------- 决策包在线/离线模式(20261123 用户裁定) ----------
+/** 离线互惠:consent≠true ⇒ 公共决策包文件不留在盘上(首装不同意/重开向导改不同意,两路都归这里)。
+ *  幂等:有才删(applySnapshot 每 5s 调);删 data/routing/exemplars-vectors.base.*.json(全部 slug,
+ *  含换嵌入模型后的旧档)+旧固定名;lastAppliedBuiltAt 指向已删包一并清。面板灰条「无公共决策包」
+ *  与灯转本地口径,靠下一轮 fastTick 自然刷新,不另推事件。 */
+function enforceOfflineBase(consent) {
+  if (consent?.uploadLocalKnn === true) return;
+  const dataDir = ctx.paths?.dataDir;
+  if (!dataDir) return;
+  const dir = path.join(dataDir, 'routing');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return; } // 目录不存在=无事可删
+  let removed = false;
+  for (const f of names) {
+    if (!/^exemplars-vectors\.base(\..*)?\.json$/.test(f)) continue;
+    try { fs.unlinkSync(path.join(dir, f)); removed = true; } catch { /* 尽力 */ }
+  }
+  if (removed && readTrayState().lastAppliedBuiltAt != null) writeTrayState({ lastAppliedBuiltAt: null });
+}
+
+/** 启动静默装公共决策包(20261123 用户裁定):同意上传 → 启动后 base 未就绪即后台静默下载+导入
+ *  (下载→导入→再上传本地决策包,本地不存在静默跳过,首装零异常);失败不弹窗——终态进面板
+ *  base-update-msg(baseLastResult 回放),「更新」按钮是人工兜底。每 app 会话自动发起一轮;
+ *  no-model(健康缓存未带模型名)60s 后随快照重试(慢刷未完成时的正常窗)。 */
+let autoBaseFired = false;
+let autoBaseNoModelTries = 0;
+function maybeAutoBaseInstall(snapshot) {
+  if (autoBaseFired) return;
+  if (snapshot?.consent?.uploadLocalKnn !== true) return;
+  if (snapshot?.healthAt == null) return; // 健康缓存未落:等慢刷出模型名再发起(否则必 no-model)
+  if (snapshot?.lamps?.detail?.baseExists === true) { autoBaseFired = true; return; } // 已就绪不重装
+  autoBaseFired = true;
+  runUpdateBase(false)
+    .then((r) => {
+      if (r?.outcome === 'no-model' && ++autoBaseNoModelTries < 10) {
+        autoBaseFired = false;
+        setTimeout(() => { if (ctx.snapshot) maybeAutoBaseInstall(ctx.snapshot); }, 60_000).unref?.();
+      }
+    })
+    .catch(() => {});
+}
+
 function applySnapshot(snapshot) {
   ctx.snapshot = snapshot;
   // 2026-11-18:local 权重缺失且向导已完成时,托盘自动发起补下载(节流+防与向导并发)
@@ -448,6 +491,8 @@ function applySnapshot(snapshot) {
     weightsAuto.maybe(snapshot.localWeights, snapshot.modelIn, { busy }).catch(() => {});
   }
   ctx.consent = snapshot.consent;
+  enforceOfflineBase(snapshot.consent); // 离线互惠:不同意 ⇒ 盘上公共包删净(幂等)
+  maybeAutoBaseInstall(snapshot); // 在线且未就绪 ⇒ 启动静默装一轮
   if (panel && !panel.isDestroyed()) panel.webContents.send('tray:snapshot', { ...snapshot, weightDownload: weightRegistry.snapshot() });
   if (tray) {
     tray.setContextMenu(buildMenu());
