@@ -92,13 +92,14 @@ export function pendingGate(pending, currentVersion, cmp = compareVersions) {
 function spawnInstaller(exe, { silent = false } = {}) {
   try {
     if (!exe || !fs.existsSync(exe)) return false; // 安装包被清/缺件时显式失败,调用方给用户可见错误
-    const safe = String(exe).replaceAll("'", "''"); // PS 单引号串内 ' 需翻倍转义(路径含单引号时)
-    // 20261123 修复(用户报「点安装弹黑窗」):旧 cmd ping&start 形态(shell:true)在本机 windowsHide 失效
-    // 露出 conhost 黑窗。改用 PS 单层形态:Start-Sleep 3(替代 cmd 内 ping,给宿主退出窗口)+ Start-Process
-    // 直拉安装器(替代 start /wait)。PS 无控制台窗口=无黑窗;路径在 PS 单引号串内,避开 N97 的 node argv
-    // 外层引号加写+cmd 转义地狱。detached+unref 语义不变(PS 进程独立存活,宿主退出后照常拉起)。
-    const psScript = `Start-Sleep -Seconds 3; Start-Process -FilePath '${safe}'${silent ? " -ArgumentList '/S'" : ''}`;
-    spawn('powershell.exe', ['-NoProfile', '-Command', psScript], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const safe = String(exe).replaceAll('"', '""');
+    const command = `ping 127.0.0.1 -n 3 >nul & start "TokenSaver 更新" /wait "${safe}"${silent ? ' /S' : ''}`;
+    // 20261123(方案2,用户裁定):回退 shell:true cmd 形态(N97 引号灾难的正确修法),黑窗转正经用途——
+    // start 的首个引号参数=窗口标题「TokenSaver 更新」:控制台窗口即「正在准备安装…」进度窗,3 秒退出
+    // 窗口(ping)后向导在其上拉起,安装器退出后窗口自动关闭。PS 单层形态实测拉起失败(用户裁定废弃)。
+    // (/q 需 cmd argv 形态=N97 引号灾难,与 shell:true 互斥,故不加;窗口标题由 start 参数承担。)
+    // detached+unref 语义不变(宿主退出后 3 秒窗由 cmd 内 ping 承担,N86)。
+    spawn(command, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref();
     return true;
   } catch { return false; }
 }
