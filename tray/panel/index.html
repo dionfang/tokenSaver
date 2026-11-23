@@ -194,7 +194,9 @@ if (ev.kind === 'app') { paintAppUpdate(ev); return; }
     if (ev.phase === 'result' || ev.phase === 'done') {
       baseDownloading = false;
       baseHold = false; paintBaseBtn();
-      const ok = ev.outcome === 'updated' || ev.outcome === 'installing'; // already-latest 不显条(绿文案即够,hasNew 门统一口径)
+      // 20261123 用户裁定:「已是最新」是更新状态文案,不是错误——base 结果分支 already-latest 属成功(绿);
+      // (上一轮把 already-latest 从 ok 集合误删导致红字,此处分回:app 分支不显条,base 分支照绿。)
+      const ok = ev.outcome === 'updated' || ev.outcome === 'already-latest' || ev.outcome === 'installing';
       baseMsg(ev.message || '', ok ? 'ok' : 'err');
       // 成功即拉新快照,进度条从下载态转入真实 base 层条数比例(不再等周期 tick/被 slowInFlight 跳过)
       if (ok) window.trayPanel?.refresh?.().catch(() => {});
