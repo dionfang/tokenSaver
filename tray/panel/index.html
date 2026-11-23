@@ -157,6 +157,9 @@
     if (ev.phase === 'manifest') return;
     if (ev.phase === 'result' || ev.phase === 'done') {
       const ok = ev.outcome === 'updated' || ev.outcome === 'installing'; // already-latest 不显条(绿文案即够,hasNew 门统一口径)
+      // 20261123 审查修复:终态文案必须上屏——此前「已是最新」绿字/失败红字从未渲染(注释声称走
+      // base-update-msg,实现漏写),「检查应用更新」已是最新时面板完全静默(20261121「绿文案即够」裁定落空)。
+      baseMsg(ev.message || '', ok ? 'ok' : 'err');
       if (ok) {
         $('app-update-bar').style.width = '100%';
         $('app-update-bar').className = 'full';

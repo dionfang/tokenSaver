@@ -84,7 +84,7 @@ function openPanel() {
   if (panel && !panel.isDestroyed()) { panel.show(); panel.focus(); return; }
   panel = new BrowserWindow({
     title: 'TokenSaver 状态面板',
-    width: 460, height: 620, resizable: false, maximizable: false, fullscreenable: false, show: false, // 2026-11-18 用户裁决:加高,三端钩子三行完整显示
+    width: 460, height: 640, resizable: false, maximizable: false, fullscreenable: false, show: false, // 2026-11-18 用户裁决:加高,三端钩子三行完整显示;20261123 再加 20px:app-update-row 增行不挤掉钩子行(用户裁定不滚动,加高替代)
     autoHideMenuBar: true,
     webPreferences: { preload: PANEL_PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
@@ -95,7 +95,12 @@ function openPanel() {
   panel.on('close', (e) => { if (!quitting) { e.preventDefault(); panel.hide(); } });
   panel.webContents.on('before-input-event', (_e, input) => { if (input.key === 'F11') _e.preventDefault(); });
   panel.on('closed', () => { panel = null; });
-  if (ctx.snapshot) panel.webContents.once('did-finish-load', () => panel?.webContents.send('tray:snapshot', ctx.snapshot));
+  // 20261123 审查修复:首开回放补齐——①快照合并 weightDownload(applySnapshot 活推带、首开回放漏,
+  // 模型行「下载中 pct%」首开有 ≤5s 空窗);②回放最近 app/base 终态(装载窗内丢事件的兜底)。
+  if (ctx.snapshot) panel.webContents.once('did-finish-load', () => {
+    panel?.webContents.send('tray:snapshot', { ...ctx.snapshot, weightDownload: weightRegistry.snapshot() });
+    for (const ev of [baseLastResult.base, baseLastResult.app]) if (ev) panel?.webContents.send('tray:base-update', ev);
+  });
 }
 
 // ---------- 安装向导(M2,§5.5/§16.4):启动无 done 记录即弹;未完成=继续引导 ----------
@@ -323,7 +328,14 @@ async function repairHooks(host) {
 
 // ---------- T4 更新公共决策包(M4,§5.4/§16.3):菜单+面板双入口,进度/结果经 tray:base-update 推面板 ----------
 let baseUpdater = null;
-function pushBase(ev) { if (panel && !panel.isDestroyed()) panel.webContents.send('tray:base-update', ev); }
+// 20261123 审查修复(首开竞态丢终态):面板窗口创建→did-finish-load 之间推的 tray:base-update 会被丢
+// (渲染层未就绪);「检查应用更新」的已是最新/失败结果常在此窗内到达 → 用户点菜单后面板零反馈。
+// 记录最近一条带 outcome 的 result(app/base 分桶),面板装载完成时回放;重开面板也能看到上次终态文案。
+const baseLastResult = { app: null, base: null };
+function pushBase(ev) {
+  if (ev && ev.phase === 'result' && ev.outcome) baseLastResult[ev.kind === 'app' ? 'app' : 'base'] = ev;
+  if (panel && !panel.isDestroyed()) panel.webContents.send('tray:base-update', ev);
+}
 function getBaseUpdater() {
   if (baseUpdater) return baseUpdater;
   const dl = createDownloader({ onProgress: (p) => pushBase({ phase: 'download', pct: p.pct, bytesDone: p.bytesDone, bytesTotal: p.bytesTotal }) });
@@ -374,7 +386,10 @@ async function runUpdateBase(fromMenu) {
     ? `;已上传 ${up.accepted ?? 0} 条`
     : skipUpload ? '' : `;上传本地向量失败:${up.message || up.outcome}`;
   const summary = `${r.outcome === 'updated' ? `公共决策包已更新(${r.accepted ?? '?'} 条)` : '公共决策包已是最新'}${upMsg}`;
-  pushBase({ phase: 'result', outcome: up.outcome === 'updated' ? 'updated' : r.outcome, message: summary });
+  // 20261123 审查修复:上传失败时 summary 不得沿用下载侧绿 outcome——失败文案藏在绿字里违背
+  // 「失败必须可见」(20261120 裁定);判 error 走红,内容仍完整叙述下载成功+上传失败。
+  const uploadFailed = up.outcome !== 'updated' && !skipUpload;
+  pushBase({ phase: 'result', outcome: uploadFailed ? 'error' : r.outcome, message: summary });
   if (fromMenu) dialog.showMessageBox({ message: summary, buttons: ['知道了'] });
   return { ...r, upload: up, message: summary };
 }
@@ -387,7 +402,10 @@ function getUploadKnn() {
     cmdRun: runner.run.bind(runner),
     readState: readTrayState,
     writeState: writeTrayState,
-    onEvent: (ev) => pushBase({ ...ev, phase: ev.phase === 'facts' || ev.phase === 'upload' ? 'manifest' : ev.phase }), // 复用面板 base 进度行
+    // 复用面板 base 进度行;20261123 审查修复:'done' 无 outcome,透传进面板 result 分支会被误染红
+    // ('上传完成:N 条接收'红字挂数秒,直到 slowRefresh 后绿色 summary 覆盖)——一律归 manifest 灰字进度,
+    // 权威终态由 runUpdateBase 的 summary result 事件单独推送。
+    onEvent: (ev) => pushBase({ ...ev, phase: ['facts', 'upload', 'done'].includes(ev.phase) ? 'manifest' : ev.phase }),
   });
   return uploadKnn;
 }
@@ -487,8 +505,14 @@ if (!gotLock) {
         return { ok: false, skipped: true };
       }
       if (res.timedOut) {
-        dialog.showErrorBox('立即同步', '同步超过 1 小时被终止');
+        dialog.showErrorBox('立即同步', '同步超时被终止(死线 6 小时)');
         return { ok: false, timedOut: true };
+      }
+      if (res.code === 3) {
+        // 20261123 审查修复:exit 3=embed.mjs 锁忙让行(S4-3,已有嵌入在跑)——面板 5s 快照窗内没看到
+        // .embed.pid 时按钮仍可点,此处按「已在跑」提示,不算失败(旧口径弹红框+[exit] code=3 误导)。
+        dialog.showMessageBox({ message: '已有嵌入进程在运行,本次未重复启动;进度见面板「向量嵌入」条', buttons: ['知道了'] });
+        return { ok: true, busy: true };
       }
       if (res.code !== 0) {
         // 20261120(测试机静默死亡修复):退出码恒显——旧 `stderr||stdout` 把 code 遮住,
