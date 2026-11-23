@@ -36,7 +36,9 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 - Node.js ≥ 18,以及 git。
 - local:模型在 `code-index/hf-cache`(三个本地模型——嵌入/精排 transformers.js、决策 Strands ONNX,约 1.5GB)。该目录超过 git 单文件上限,不入库;缺失时首次使用才下载。复制部署时请整目录带走。
+  内存需求:纯 CPU 运行,无显卡要求;三模型常驻内存合计约 2-3GB(权重约 1.5GB + ONNX 运行时),嵌入线程默认限 `min(4, max(2, 物理核数/4))`(`embedCpuThreads`),慢机也不占满核。
 - ollama:本机先安装并自行启动 Ollama,再手工 pull。Ollama 模型不随目录复制。
+  显存需求:`gpu=auto`(默认)按**总显存 ≥6GB** 判定走 GPU(给系统/其他程序留余量),三模型常驻显存 **≈4.5GB**(`OLLAMA_KEEP_ALIVE=24h` 恒占,空闲不驱逐);总显存不足 6GB 或无独立显卡时自动改用 CPU 跑——功能不变,嵌入吞吐显著变慢。
   版本推荐:**钉 Ollama 0.40.15**——实测嵌入批量 ~0.83s/块;0.40.16 退化至 1.17-1.42s/块(约 1.5 倍慢),0.40.7 居中且波动大;三个版本的 /v1/systemone 决策端点均兼容。升级前先按同口径复测嵌入吞吐(batch 32、腾显存、90s 双采样)。
 
 
@@ -220,7 +222,9 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 
 - Node.js ≥ 18, and git.
 - local: models live in `code-index/hf-cache` (three local models — embedding / reranker via transformers.js, decision via resident Strands ONNX, about 1.5GB). That directory exceeds git's per-file limit and is not in the repository. Missing models are downloaded on first use. When you copy the tool, take the whole directory with you.
+  Memory: CPU-only, no GPU required; the three resident models together take about 2-3GB of RAM (~1.5GB weights + ONNX runtime). Embedding threads are capped at `min(4, max(2, cores/4))` by default (`embedCpuThreads`), so slow machines keep some cores free.
 - ollama: install and start Ollama yourself, then pull the models by hand. Ollama model weights are not copied with this directory.
+  VRAM: with the default `gpu=auto`, the GPU path is taken when **total VRAM ≥ 6GB** (headroom left for the system and other programs), and the three resident models occupy **≈4.5GB** (`OLLAMA_KEEP_ALIVE=24h`, steady, not evicted when idle). Below 6GB or without a discrete GPU, Ollama falls back to CPU — everything still works, but embedding throughput drops markedly.
    Version pin: **Ollama 0.40.15** — measured embedding throughput ~0.83s/chunk; 0.40.16 regressed to 1.17-1.42s/chunk (~1.5x slower), 0.40.7 sits in between with high variance; /v1/systemone decision endpoint is compatible on all three. Re-benchmark with the same protocol (batch 32, free VRAM, 90s double-sampling) before upgrading.
 
 
