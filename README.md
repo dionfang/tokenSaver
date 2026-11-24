@@ -9,7 +9,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 **模块一:省耗记账(Token Ledger)**——为代码库建语义检索索引,Agent 定位代码只读需要的区间;过长的整文件读取会被守卫改写为语义最相关区间,选不出才拒绝;每轮节约按 token 精确入账,会话状态句实时展示今日与累计。**Cursor、ZCode、Qoder 三端通用**。
 
-**模块二:动态模型路由(AutoTier)**——本地代理即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(R1-R4,以 R3=1x 为基准),贵模型只在必要时使用;自进化闭环持续降本。**仅 ZCode 与 Qoder 支持,且只对以 Anthropic Messages 协议接入的自定义模型生效**。
+**模块二:动态模型路由(AutoTier)**——本地代理即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(R1-R4,以 R3=1x 为基准),贵模型只在必要时使用;自进化闭环持续降本。**仅 ZCode 与 Qoder 支持,且只对以自定义模型接入的供应商生效——接入协议不限(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses 均可),跨协议选型由代理转信封,上下文输入/输出逐字保真**。
 
 适合在本地代码库上用 Agent 开发。默认推荐**桌面客户端(托盘守护程序)**安装,无需命令行;纯命令行只是不装守护程序时的备选。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
 
@@ -20,7 +20,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 #### 省耗记账(要点)
 
 - 混合检索:BM25 词法 + 向量余弦;需要更准再加 `--rerank`;嵌入拉起失败自动降为纯 BM25。嵌入默认 local(transformers.js),可选 `--model-in ollama`;判定模型本地运行、零远程调用。
-- 读取守卫:整文件 Read 超过 `readMaxLines`(默认 500)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制)直接放行。
+- 读取守卫:整文件 Read 超过 `readMaxLines`(默认 300)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制)直接放行。
 - 索引保鲜:git 仓库按 HEAD 判断过期;非 git 目录默认 24 小时重建。
 - 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次;状态句实时展示今日/累计。Cursor 端无 usage 数据源,只计入口一次、不计会话放大。
 - 模型清理:切换模型后开会话自动卸掉本工具拉起的驻留模型(自己 pull 的不碰);宿主关闭后统一卸载,不留驻留尾巴。手动清:`node cleanup.mjs --all`。
@@ -142,7 +142,7 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--set-roots "<路径1>[,<路
 | `exts` | 收录的扩展名,不带点 |
 | `jsonWhitelist` | 允许收录的 json 文件名 |
 | `maxFileBytes` | 单文件上限,默认 `819200` |
-| `readMaxLines` | 全量 Read 行数上限,默认 `500`。设得很大等于关掉拦截 |
+| `readMaxLines` | 全量 Read 行数上限,默认 `300`。设得很大等于关掉拦截 |
 | `chunk` | `targetLines` 70,`maxLines` 120,`overlapLines` 10,`minTail` 15 |
 | `staleNonGitMs` | 非 git 目录重建间隔,毫秒,默认 `86400000` |
 | `embedCpuThreads` | 本地嵌入的 CPU 线程上限。默认 `min(4, max(2, 物理核数/4))`;`0`=全核 |
@@ -169,7 +169,7 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--set-roots "<路径1>[,<路
 | `tierOptimize` | 自进化闭环 `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`:enabled=true 后每 6h 学习权重与门槛 |
 | `blendNotice` | auto 综合费率行注入开关(默认 true);关=只停注入,记账照常 |
 
-生效范围:仅 ZCode/Qoder 两端;auto 只调度以 Anthropic Messages 协议接入的自定义模型;模型分档按名字自动判定,两表都在 `modelTiers` / `lightSuffixes`,可改配置重排全链。
+生效范围:仅 ZCode/Qoder 两端;auto 只调度以**自定义模型**接入的供应商(接入协议不限,三种均可);模型分档按名字自动判定,两表都在 `modelTiers` / `lightSuffixes`,可改配置重排全链。
 
 ### 仓库模块
 
@@ -191,7 +191,7 @@ TokenSaver is a local agent productivity tool with two core feature modules.
 
 **Module 1: Token Ledger (省耗记账)** — builds a semantic search index over the codebase so the agent reads only the spans it needs; over-long full-file reads are rewritten to the closest semantic range, denied only when nothing fits; every turn's savings are accounted in tokens and shown live in the session status line. **Works on all three clients: Cursor, ZCode, and Qoder.**
 
-**Module 2: Dynamic Model Routing (AutoTier)** — the local proxy doubles as a custom-model endpoint and the client gains a virtual model tier `auto`; sessions that select it are dispatched across four difficulty tiers (R1-R4, with R3 = 1x as base), so expensive models run only when needed; a self-evolution loop keeps reducing cost. **ZCode and Qoder only, and only for custom models wired in via the Anthropic Messages protocol.**
+**Module 2: Dynamic Model Routing (AutoTier)** — the local proxy doubles as a custom-model endpoint and the client gains a virtual model tier `auto`; sessions that select it are dispatched across four difficulty tiers (R1-R4, with R3 = 1x as base), so expensive models run only when needed; a self-evolution loop keeps reducing cost. **ZCode and Qoder only, and only for providers wired in as custom models — the access protocol is unrestricted (Anthropic Messages / OpenAI Chat Completions / OpenAI Responses all work); cross-protocol picks get their envelope converted by the proxy with context input and output carried over verbatim.**
 
 Built for agent-based development on local repositories. The **desktop client (tray guardian)** is the recommended install — no command line needed; the pure CLI is the fallback for when you prefer not to install the guardian. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
@@ -202,7 +202,7 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 #### Token Ledger (key points)
 
 - Hybrid search: BM25 lexical + vector cosine; add `--rerank` for tighter ranking; falls back to BM25-only if the embedding model fails to start. Embedding defaults to local (transformers.js), optionally `--model-in ollama`; the decision model runs locally with zero remote calls.
-- Read guard: a full-file Read past 1.25 × `readMaxLines` (default 500) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. Only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries) passes through untouched.
+- Read guard: a full-file Read past 1.25 × `readMaxLines` (default 300) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. Only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries) passes through untouched.
 - Index freshness: git repositories go stale by HEAD; non-git directories rebuild every 24 hours by default.
 - Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point; the status line shows today/cumulative live. Cursor has no usage feed and is booked entry-once only, without session amplification.
 - Model cleanup: starting a session after a model switch unloads the leftovers this tool pulled up (chat models you pulled yourself are never touched); after the host closes, everything is unloaded with no resident tail. Manual cleanup: `node cleanup.mjs --all`.
@@ -324,7 +324,7 @@ Project settings live in `data/code-index.config.json`, beside `code-index/`. Ke
 | `exts` | Extensions to index, without the leading dot |
 | `jsonWhitelist` | JSON filenames allowed into the index |
 | `maxFileBytes` | Per-file size cap. Default `819200` |
-| `readMaxLines` | Line cap for a full-file Read. Default `500`. A very large value turns the guard off |
+| `readMaxLines` | Line cap for a full-file Read. Default `300`. A very large value turns the guard off |
 | `chunk` | `targetLines` 70, `maxLines` 120, `overlapLines` 10, `minTail` 15 |
 | `staleNonGitMs` | Non-git directory rebuild interval, in milliseconds. Default `86400000` |
 | `embedCpuThreads` | CPU thread cap for local embedding. Default `min(4, max(2, cores/4))`; `0` = all cores |
@@ -351,7 +351,7 @@ The `modelRouting` section is scaffolded by init (`enabled` defaults to `true`),
 | `tierOptimize` | Self-evolution loop `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`: with enabled=true, every 6h weights and thresholds are learned |
 | `blendNotice` | Injection switch for the auto blended-rate line (default true); off = stops the line, accounting continues |
 
-Scope: only ZCode/Qoder take part; auto dispatches only custom models wired via the Anthropic Messages protocol; model tiering is derived from the name, and both tables live in `modelTiers` / `lightSuffixes` and re-derive the whole chain from config.
+Scope: only ZCode/Qoder take part; auto dispatches only providers wired in as **custom models** (the access protocol is unrestricted — all three wire formats work); model tiering is derived from the name, and both tables live in `modelTiers` / `lightSuffixes` and re-derive the whole chain from config.
 
 ### Repository layout
 

@@ -7,6 +7,9 @@
  *   四档链派生 deriveTierChains(快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序)
  *     + 级联解析 resolveTier(目标档起 R4→R3→R2→R1 逐档下滑;档内解析复用 resolveRole:
  *       裸名/家族匹配/@pin/"default"/providerPriority/健康冷却)
+ *   链条目粒度(2026-11-24 用户定):派生链条目 = `modelId@providerId`(钉死供应商),
+ *     同名模型挂多家时**各家各自入链**并按 providerPriority→宿主UI拖动序→providerId 排序;
+ *     协议感知(同日):快照带 protocols(客户端 API 格式字段归一),入站协议不符的上游不入链。
  *   健康冷却 model-health.json(--health-mark/--health-clear/--health-list)
  *   doctor --doctor(门控/四档链/inventory/健康/L2 状态逐项报告)
  * 独立模块:不改任何既有代码;prompt-guard 的 L1 注入路径与本模块解耦(L2/L3 走 shadow 日志)。
@@ -470,14 +473,51 @@ function brandRank(brand, priority) {
   return i === -1 ? priority.length : i;
 }
 
+// ---------- 协议标签(2026-11-24 用户定:客户端 API 格式字段是协议真源) ----------
+/**
+ * 客户端自定义条目声明的 API 格式 → 归一协议数组([] = 未知,宽松不筛)。
+ *   ZCode:config.api.type('anthropic-messages' → anthropic);
+ *   Qoder:条目 protocol('anthropic')——**勿取 Qoder 的 type**,它恒为 'openai-compatible'(客户端分类,非报文协议)。
+ * protocol 优先于 apiType(两者同时给出时以 protocol 为准)。
+ */
+const PROTOCOL_ALIASES = {
+  'anthropic-messages': 'anthropic',
+  anthropic: 'anthropic',
+  // ZCode 内置供应商模板的 api.type 真实取值集合(ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,3.18.2):
+  // anthropic-messages(18) / openai-chat-completions(12) / openai-responses(4)——三种都要认,
+  // 漏认会把 openai 厂商标成"未知"→ 宽松入链 → anthropic 报文打 /chat/completions 端点 → 404。
+  'openai-chat-completions': 'openai',
+  'openai-compatible': 'openai', // Qoder 客户端分类(type),非报文协议
+  openai: 'openai',
+  'openai-responses': 'openai-responses', // 第三种形态(Responses API):与 chat-completions 不同端点,不混标
+};
+export function normalizeProtocols({ apiType = null, protocol = null } = {}) {
+  const raw = protocol != null && protocol !== '' ? protocol : apiType;
+  const hit = PROTOCOL_ALIASES[String(raw || '').toLowerCase()];
+  return hit ? [hit] : [];
+}
+
+/** 上游是否可服务给定协议(列表形态):protocols 为空=未知→宽松放行(兼容旧快照/缺字段条目)。 */
+export function providerAllowsProtocol(provider, protocols) {
+  const allow = Array.isArray(protocols) ? protocols.map(String) : [];
+  if (!allow.length) return true;
+  const list = Array.isArray(provider?.protocols) ? provider.protocols.map(String) : [];
+  if (!list.length) return true; // 未知协议不筛(只有一家时仍可路由)
+  return list.some((x) => allow.includes(x));
+}
+
 /**
  * 四档链自动派生:从实时上游快照按 tierOfModel 分桶(v4:品牌三档表+轻量后缀可经 modelTiers/lightSuffixes 配置覆盖)。
  * 档内排序(2026-11-03 用户裁定):**品牌优先序为主键**(config.modelRouting.brandPriority,决定"同档谁先被调"),
  *   同品牌再按档位序数升序(TIER_ORDER:flash0<normal1<plus2<pro3<max4,名字档位关键词的序数非真实单价,冷却时自然滑到次序),最后 modelId 保确定性。
  * 档位归属(tierOfModel)与降档级联(resolveTier)完全不受品牌序影响 —— 即"不影响动态模型路由的调用档位"。
+ * 链条目粒度(2026-11-24 用户定):条目 = `modelId@providerId`(钉死供应商),**同名模型挂多家时各家各自入链**
+ *   (去重粒度 providerId/modelId,不再按模型名去重);同名跨家次序 = providerPriority → 宿主UI拖动序(providerOrder)→ providerId。
+ *   裸名条目在 resolveRole 里会一次性吃掉该模型的全部候选(命中即返回),故钉死是"按排序链入"生效的前提。
+ * 协议感知:protocols 非空时,协议不符的上游不入链(上游 protocols 为空=未知→宽松放行)。
  * 返回 {r1,r2,r3,r4, derived:true};空档为 []。排除图像/语音/视频/判定 API(NON_CHAT_RE 同口径)。
  */
-export function deriveTierChains(upstreams, { brandPriority = DEFAULT_BRAND_PRIORITY, modelTiers = null, lightSuffixes = null } = {}) {
+export function deriveTierChains(upstreams, { brandPriority = DEFAULT_BRAND_PRIORITY, modelTiers = null, lightSuffixes = null, providerPriority = [], providerOrder = [], protocols = null } = {}) {
   const priority = Array.isArray(brandPriority) && brandPriority.length
     ? brandPriority.map((b) => String(b).toLowerCase())
     : DEFAULT_BRAND_PRIORITY;
@@ -485,23 +525,32 @@ export function deriveTierChains(upstreams, { brandPriority = DEFAULT_BRAND_PRIO
     modelTiers: modelTiers && typeof modelTiers === 'object' ? modelTiers : DEFAULT_MODEL_TIERS,
     lightSuffixes: Array.isArray(lightSuffixes) ? lightSuffixes.map((s) => String(s).toLowerCase()) : DEFAULT_LIGHT_SUFFIXES,
   };
+  const allow = Array.isArray(protocols) && protocols.length ? protocols.map(String) : null;
+  const prioList = Array.isArray(providerPriority) ? providerPriority.map(String) : [];
+  const orderList = Array.isArray(providerOrder) ? providerOrder.map(String) : [];
+  const rankOf = (list, id) => { const i = list.indexOf(id); return i === -1 ? list.length : i; };
   const buckets = { R1: [], R2: [], R3: [], R4: [] };
-  const seen = new Set();
+  const seen = new Set(); // 去重粒度 = providerId/modelId(同名模型挂多家各自入链)
   for (const [pid, p] of Object.entries(upstreams?.providers || {})) {
     if (p?.enabled === false || !p?.apiKey) continue;
+    if (allow && !providerAllowsProtocol(p, allow)) continue; // 协议不符的上游不入链
     for (const m of p.models || []) {
       const id = String(m || '');
-      if (!id || seen.has(id) || NON_CHAT_RE.test(id)) continue;
-      seen.add(id);
-      buckets[tierOfModel(id, tierOpts)].push({ modelId: id, price: TIER_ORDER[tierOf(id)] ?? 1, brand: brandOf(id) }); // price=名字档位序数,非真实单价
+      const key = `${pid}/${id}`;
+      if (!id || seen.has(key) || NON_CHAT_RE.test(id)) continue;
+      seen.add(key);
+      buckets[tierOfModel(id, tierOpts)].push({ modelId: id, providerId: pid, price: TIER_ORDER[tierOf(id)] ?? 1, brand: brandOf(id) }); // price=名字档位序数,非真实单价
     }
   }
   const out = { derived: true };
   for (const t of TIER_ORDER_DESC) {
     out[t.toLowerCase()] = buckets[t]
       .sort((a, b) => brandRank(a.brand, priority) - brandRank(b.brand, priority)
-        || a.price - b.price || a.modelId.localeCompare(b.modelId))
-      .map((c) => c.modelId);
+        || a.price - b.price || a.modelId.localeCompare(b.modelId)
+        || rankOf(prioList, a.providerId) - rankOf(prioList, b.providerId)
+        || rankOf(orderList, a.providerId) - rankOf(orderList, b.providerId)
+        || a.providerId.localeCompare(b.providerId))
+      .map((c) => `${c.modelId}@${c.providerId}`);
   }
   return out;
 }
@@ -762,7 +811,8 @@ export function readUpstreamsSnapshot(file = path.join(DATA_DIR, 'routing', 'pro
 export function inventoryFromUpstreams(upstreams) {
   const inv = [];
   for (const [providerId, p] of Object.entries(upstreams?.providers || {})) {
-    for (const m of p.models || []) inv.push({ providerId, modelId: m, enabled: p.enabled !== false });
+    const protocols = Array.isArray(p.protocols) ? p.protocols.map(String) : [];
+    for (const m of p.models || []) inv.push({ providerId, modelId: m, enabled: p.enabled !== false, protocols });
   }
   return inv;
 }
@@ -782,6 +832,21 @@ export function ingressProviders(upstreams) {
   const explicit = Array.isArray(upstreams?.ingress) ? upstreams.ingress : [];
   const marked = Object.entries(upstreams?.providers || {}).filter(([, p]) => p.ingress === true).map(([id]) => id);
   return [...new Set([...explicit, ...marked])];
+}
+
+/**
+ * 双端隔离(2026-11-04 用户定档):按请求宿主过滤路由清单(host=zcode|qoder)。
+ * 旧快照无 host 标签的条目两端通用(兼容未刷新部署,重抓快照后自动隔离);
+ * ingress 数组同步过滤,只留本宿主存活条目。
+ * 2026-11-24 起单源于此(查询端 doctor/CLI 与代理转发端同口径,doctor 合并池展示问题即此修复)。
+ */
+export function upstreamsForHost(upstreams, host) {
+  const providers = {};
+  for (const [pid, p] of Object.entries(upstreams?.providers || {})) {
+    if (p && (!p.host || p.host === host)) providers[pid] = p;
+  }
+  const ingress = (Array.isArray(upstreams?.ingress) ? upstreams.ingress : []).filter((pid) => providers[pid]);
+  return { ...(upstreams || { providers: {} }), providers, ingress };
 }
 
 // ---------- inventory 收集(best-effort) ----------
@@ -1042,13 +1107,15 @@ export function doctor({ home = HOME, dataDir = DATA_DIR, cfg = null, currentMod
   const inventory = collectInventory(home);
   const vec = loadVectors(dataDir);
   // 代理可达性用同一份快照、同一条判定(isProxyReachable),避免"doctor 说能解析、代理说不可达"(H2)
-  const upstreams = readUpstreamsSnapshot(upstreamsFile || path.join(dataDir, 'routing', 'proxy-upstreams.json'));
+  // 双端隔离(2026-11-24):报告口径与代理转发端同源——只看本宿主(--host)的条目,不再合并池展示
+  const upstreams = upstreamsForHost(readUpstreamsSnapshot(upstreamsFile || path.join(dataDir, 'routing', 'proxy-upstreams.json')), host);
   // 四档链与代理端同口径:从快照按 tierOfModel 派生(brandPriority 用配置覆盖默认);role 人工链已废(2026-11-03)
   const brandPriority = Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY;
-  const tierChains = deriveTierChains(upstreams, { brandPriority, ...tierClassifyOptions(c, dataDir) });
   // 同名取序(2026-11-05):providerPriority(配置)优先,未进表的同名供应商按快照采集的 providerOrder
   // (宿主 UI 拖动序;Qoder 端=设置文件键序)排;报告口径=--host(默认 zcode)。配置同键 providerOrder 可覆盖快照序。
   const providerOrder = Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[host]) ? upstreams.providerOrder[host] : []);
+  // 链条目钉死供应商(2026-11-24):同名模型挂多家时各家各自入链,次序=providerPriority→providerOrder→providerId
+  const tierChains = deriveTierChains(upstreams, { brandPriority, ...tierClassifyOptions(c, dataDir), providerPriority: mr.providerPriority || [], providerOrder });
   const snapInventory = inventoryFromUpstreams(upstreams);
   // 每档解析一次(快照口径,与代理转发同一份 inventory):报告各档链头与代理可达性
   const resolved = TIER_ORDER_DESC.map((t) => {
@@ -1216,9 +1283,12 @@ async function cli(argv) {
     const currentModel = cur.includes('/') ? { providerId: cur.split('/')[0], modelId: cur.split('/')[1] } : null;
     const cfg = readJson(path.join(dataDir, 'code-index.config.json')) || {};
     const mr = cfg.modelRouting || {};
-    const upstreams = readUpstreamsSnapshot(path.join(dataDir, 'routing', 'proxy-upstreams.json'));
+    // 双端隔离(2026-11-24):与 doctor 同口径——只看 --host 宿主的条目
+    const upstreams = upstreamsForHost(readUpstreamsSnapshot(path.join(dataDir, 'routing', 'proxy-upstreams.json')), val('--host', 'zcode'));
     const brandPriority = Array.isArray(mr.brandPriority) && mr.brandPriority.length ? mr.brandPriority : DEFAULT_BRAND_PRIORITY;
-    const r = resolveTier(tier, { cfg: { ...cfg, modelRouting: { ...mr, chains: deriveTierChains(upstreams, { brandPriority, ...tierClassifyOptions(cfg, dataDir) }), providerOrder: Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[val('--host', 'zcode')]) ? upstreams.providerOrder[val('--host', 'zcode')] : []) } }, inventory: inventoryFromUpstreams(upstreams), health: readHealth(dataDir), currentModel });
+    const providerOrder = Array.isArray(mr.providerOrder) ? mr.providerOrder : (Array.isArray(upstreams?.providerOrder?.[val('--host', 'zcode')]) ? upstreams.providerOrder[val('--host', 'zcode')] : []);
+    // 链条目钉死供应商(2026-11-24) + 同名跨家取序口径与代理端同源
+    const r = resolveTier(tier, { cfg: { ...cfg, modelRouting: { ...mr, chains: deriveTierChains(upstreams, { brandPriority, ...tierClassifyOptions(cfg, dataDir), providerPriority: mr.providerPriority || [], providerOrder }), providerOrder } }, inventory: inventoryFromUpstreams(upstreams), health: readHealth(dataDir), currentModel });
     console.log(JSON.stringify(r));
     return;
   }

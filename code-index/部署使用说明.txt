@@ -14,8 +14,9 @@ TokenSaver 部署使用说明
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16
        ollama pull tev1:0.8b(决策判定)
-3. 动态模型路由(可选功能)仅 ZCode 与 Qoder 两个客户端支持,且要求自定义模型
-   以 Anthropic Messages 协议接入(见三、配置说明)。
+3. 动态模型路由(可选功能)仅 ZCode 与 Qoder 两个客户端支持;模型须以**自定义模型**
+   接入(2026-11-24 起**不限接入协议**:Anthropic Messages / OpenAI Chat Completions /
+   OpenAI Responses 三种均可,跨协议选型由代理转信封,见三、配置说明)。
 
 ======================================================================
 二、安装介绍
@@ -77,7 +78,7 @@ TokenSaver 部署使用说明
   exts                收录的扩展名
   jsonWhitelist       允许收录的 json 文件名
   maxFileBytes        单文件上限(默认 819200)
-  readMaxLines        整文件 Read 行数上限(默认 500,设很大等于关闭拦截);
+  readMaxLines        整文件 Read 行数上限(默认 300,设很大等于关闭拦截);
                     护栏面与索引面统一:只对 exts 白名单内类型拦截记账,
                     白名单外(图片/二进制/未收录)直接放行不计入节约口径
   chunk               分块参数(targetLines/maxLines/overlapLines/minTail)
@@ -92,9 +93,23 @@ TokenSaver 部署使用说明
     ③ modelRouting.enabled 新装默认已开(2026-11-20 裁定A;控制定档建议行/L1 分类/
        routing-log 三件事,不影响 auto 路由本身;人工改 false 原样保留)。
 
-  接入要求:自定义模型必须以 Anthropic Messages 协议接入——
-    ZCode:供应商类型选 anthropic-messages,baseUrl 指向供应商的 anthropic 网关;
-    Qoder:条目 protocol 填 anthropic,baseUrl 指向 anthropic 兼容网关。
+  接入要求与协议口径(2026-11-24):
+    唯一硬要求 = 以**自定义模型**接入;**接入协议不限**。自定义条目的 API 格式字段
+    = 协议标签真源——
+      ZCode:api.type(anthropic-messages / openai-chat-completions / openai-responses);
+      Qoder:条目 protocol(anthropic / openai)。
+    代理支持三种报文形态:Anthropic Messages / OpenAI Chat Completions / OpenAI Responses;
+    **auto 池不限协议**(2026-11-24 用户定):三种协议的供应商都进档位链,按品牌/档位正常排序。
+    跨协议选型时由代理**转信封**:路径/鉴权头/字段名/事件名按上游声明的协议;
+    **上下文输入/输出逐字保真**(系统提示/每轮消息/工具定义与参数/工具结果/模型输出不改一字)。
+    fail-closed:含 thinking 块 / is_error 工具结果 / cache_control / 多模态块的请求**不跨协议选型**
+    (池子退回同协议),绝不静默丢。
+    跨协议 + 客户端要流式:上游强制非流式,整包转换后合成 SSE(文本逐字,无增量打字机)。
+    标签未声明/未知 → 按全协议入池,但仍以入站协议寻址上游(能力和声明一致才通)。
+
+  路由链粒度(2026-11-24):四档链的条目是 `模型@供应商`(钉死供应商)——
+    同一模型挂多家时各家各自入链,次序按 providerPriority → 宿主 UI 拖动序(providerOrder);
+    冷却/配额尽会自然滑到下一家的同名模型。
 
   modelRouting 可配置字段(data/code-index.config.json):
     enabled                    总开关(默认 true,2026-11-20 裁定A;控制定档建议行/L1
@@ -193,8 +208,10 @@ TokenSaver deployment guide
        ollama pull qwen3-embedding:0.6b
        ollama pull sam860/qwen3-reranker:0.6b-F16
        ollama pull tev1:0.8b (decision judge)
-3. Dynamic model routing (optional) supports ZCode and Qoder only, and requires
-   custom models wired in via the Anthropic Messages protocol (see 3. Configuration).
+3. Dynamic model routing (optional) supports ZCode and Qoder only; models must be
+   wired in as **custom models** (since 2026-11-24 the protocol is unrestricted:
+   Anthropic Messages / OpenAI Chat Completions / OpenAI Responses all work;
+   cross-protocol picks get their envelope converted by the proxy — see 3. Configuration).
 
 ======================================================================
 2. Installation
@@ -264,7 +281,7 @@ Project-level fields (data/code-index.config.json):
   exts                file extensions to index
   jsonWhitelist       json filenames allowed into the index
   maxFileBytes        per-file size cap (default 819200)
-  readMaxLines        full-file Read line cap (default 500; a huge value disables it);
+  readMaxLines        full-file Read line cap (default 300; a huge value disables it);
                     guard scope equals index scope: only exts-whitelisted types
                     are intercepted/accounted, others pass through untallied
   chunk               chunking parameters (targetLines/maxLines/overlapLines/minTail)
@@ -281,11 +298,33 @@ existing config is never overwritten):
         2026-11-20; it gates the tier line, L1 classification and routing-log — auto
         routing itself is unaffected; a manual false is preserved).
 
-  Wiring requirement: custom models must use the Anthropic Messages protocol —
-    ZCode: provider type anthropic-messages, baseUrl pointing at the provider's
-    anthropic gateway;
-    Qoder: entry protocol set to anthropic, baseUrl pointing at an anthropic-compatible
-    gateway.
+  Wiring requirement and protocol semantics (2026-11-24):
+    The only hard requirement is wiring in as a **custom model** — the access
+    protocol is unrestricted. The custom entry's API-format field is the protocol
+    label source of truth —
+      ZCode: api.type (anthropic-messages / openai-chat-completions / openai-responses);
+      Qoder: entry protocol (anthropic / openai).
+    The proxy supports three wire formats: Anthropic Messages, OpenAI Chat Completions
+    and OpenAI Responses. **The auto pool is protocol-agnostic** (2026-11-24 ruling):
+    providers of all three protocols enter the tier chain and are ordered by brand/tier
+    as usual.
+    On a cross-protocol pick the proxy rewrites the **envelope** (path / auth headers /
+    field names / event names) to the upstream's declared protocol while keeping the
+    **context input and output byte-faithful** (system prompt, every message, tool
+    definitions and arguments, tool results, model output are carried over verbatim).
+    fail-closed: requests containing thinking blocks / is_error tool results /
+    cache_control / multimodal blocks are **not** routed across protocols (the pool
+    falls back to the same protocol); nothing is silently dropped.
+    Cross-protocol + a streaming client: the upstream is forced non-stream and the
+    converted body is re-emitted as a synthesized SSE (verbatim text, no incremental
+    typing effect).
+    An undeclared/unknown label enters the pool for all protocols but the upstream is
+    still addressed in the inbound protocol (only a matching capability works).
+
+  Chain granularity (2026-11-24): tier-chain entries are `model@provider` (provider
+    pinned) — when one model spans several providers, every one of them enters the
+    chain, ordered by providerPriority then the host UI drag order (providerOrder);
+    cooling / quota exhaustion slides to the next provider's same model.
 
   modelRouting fields (data/code-index.config.json):
     enabled                    master switch (default true since ruling A 2026-11-20;

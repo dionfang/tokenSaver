@@ -128,7 +128,7 @@ export function oversizeGuidance({ file, lines, size, readMaxLines, searchCmd })
   const slack = Math.floor(cap * 1.25);
   return (
     `code-index: ${file} 共 ${lines} 行(~${kb} KB),超过全量 Read 上限 ${cap} 行(宽限至 ${slack} 行)。` +
-    `不要整文件 Read。先检索 \`${searchCmd} <符号或关键词> --k 5\`(命中的 file:起-止即大纲),` +
+    `不要整文件 Read。先检索 \`${searchCmd} <符号或关键词> --k 5\`(找定义可加 \`--symbol <符号>\`;命中的 file:起-止即大纲),` +
     `再按该区间用 Read 的 offset/limit 精读。` +
     `若确实需要全文,5 分钟内对同一文件再发一次同样的全量 Read 即放行。`
   );
@@ -351,7 +351,7 @@ export function bashOversizeGuidance({ files, lines, size, readMaxLines, searchC
   const target = files.length === 1 ? files[0] : `${files[0]}(多文件请逐个)`;
   return (
     `code-index: Bash 整读 ${files.join(' ')} 共 ${lines} 行(~${kb} KB),超过全量读上限 ${cap} 行(宽限至 ${slack} 行)。不要用 cat 整读大文件。替代方案:` +
-    `① 先检索 \`${searchCmd} <关键词> --k 5\` 定位内容(命中的 file:起-止即大纲);` +
+    `① 先检索 \`${searchCmd} <关键词> --k 5\` 定位内容(找定义可加 \`--symbol <符号>\`;命中的 file:起-止即大纲);` +
     `② 看片段可直接照抄 \`sed -n '1,${cap}p' ${target}\`(首 ${cap} 行,后续段改起止行号),或改用 Read 的 offset/limit;` +
     `③ 按内容定位用 \`grep -n <关键词> ${target}\` 拿行号后再区间读。` +
     `确实需要全量输出时,5 分钟内重发同一命令即放行。`

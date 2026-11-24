@@ -27,6 +27,10 @@ const PIDFILE = path.join(DATA_DIR, '.embed.pid');
 const SAVINGS_PATH = path.join(DATA_DIR, 'session-savings.json');
 const TOKEN_CACHE = path.join(DATA_DIR, 'tokenizers');
 const TOKEN_MODEL = 'qwen'; // exact,与本仓库 Qwen 嵌入/精排同一族
+// tokenizer 下载超时(2026-11-24):原实现无 signal,网络被墙/半连时 fetch 无界挂起——
+// search --symbol 的记账路径会因此永不返回(闸门里 search-symbol 套件 60s 超时的根因)。
+// 6s/主机:两主机(官方+镜像)各 6s,失败即抛,调用方 catch 跳过记账,工具链不再被网络拖死。
+const TOKEN_FETCH_TIMEOUT_MS = 6000;
 
 function fileReady(p) {
   try { return fs.statSync(p).size > 0; } catch { return false; }
@@ -994,7 +998,7 @@ async function cacheTokenizer(model) {
     let err;
     for (const host of ['https://huggingface.co', 'https://hf-mirror.com']) {
       try {
-        const res = await fetch(`${host}/${entry.repo}/resolve/${entry.sha}/${name}`);
+        const res = await fetch(`${host}/${entry.repo}/resolve/${entry.sha}/${name}`, { signal: AbortSignal.timeout(TOKEN_FETCH_TIMEOUT_MS) });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         JSON.parse(text);

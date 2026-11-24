@@ -3,13 +3,23 @@
  * ZCode 主会话的所有请求经本代理转发,按 turn 分类改写 model 字段——
  * 客户端交互与正常会话完全一致(同会话、同上下文、无确认窗),仅后台决定由哪个模型执行。
  *
- * 协议适配层(2026-11-01 重构):线上协议(Anthropic Messages / OpenAI Chat Completions)全部
+ * 协议适配层(2026-11-01 重构;2026-11-24 增第三种):线上协议(Anthropic Messages /
+ * OpenAI Chat Completions / OpenAI Responses)全部
  * 收敛到 PROTOCOL_ADAPTERS 的适配器对象里——端点识别、turn 检测、会话键材料、鉴权头、
  * usage 提取、请求体准备各一个钩子;决策内核(decideTarget/pickUpstream/健康冷却/记账)
  * 不感知协议,新增接口规范=新增一个适配器,核心零改动。
  *
  * 双端隔离(2026-11-04):/apps/qoder=Qoder 宿主、其余(/apps/anthropic)=ZCode;快照逐供应商带 host 标签,
  * 各宿主只在自己的路由清单里决策(auto 不再混入另一端配置的模型);旧快照无标签退回合并池,重抓后自动隔离。
+ *
+ * 协议感知选上游(2026-11-24):上游端点形态由**入站请求路径**决定(baseUrl+suffix 原样转发,报文按入站协议发),
+ * 而快照此前丢弃了客户端声明的协议字段(死字段 anthropic: 只是 URL 后缀启发式、生产代码从不读)——
+ * 混用协议时会把 anthropic 报文发给只懂 OpenAI 的上游(供应商侧 404/400 硬失败,裸 4xx 不冷却不重选)。
+ * 现快照逐供应商带 protocols(来源=客户端自定义条目的 API 格式字段:ZCode config.api.type / Qoder 条目 protocol;
+ * []=未知→宽松不筛,兼容旧快照),派生链与入口兜底都按入站协议筛;**不做报文互译**(上游须与入站同协议)。
+ *
+ * 链条目钉死供应商(2026-11-24):派生链条目 = `modelId@providerId`,同名模型挂多家时**各家各自入链**
+ * (次序 providerPriority→宿主UI拖动序→providerId),冷却/配额尽自然滑到下一家的同名模型。
  *
  * 策略(默认,保守;与协议无关;2026-11-03 用户终裁:role 两档制已废,tier 四档难度制唯一):
  *   - 四档难度路由:classifyDifficulty 定档(R1 日常主力/R2 增强能力/R3 最强=仅 P2 上梯/R4 奢侈=仅显式点名)→ resolveTier
@@ -50,7 +60,7 @@ import { atomicWriteFileSync } from './proc.mjs';
 import { classifyPrompt } from './classify.mjs';
 import { classifyDifficulty, loadTierCalibration, classifyShortTurn, isContinuationTurn } from './tierClassify.mjs';
 import { R1_AMBIGUOUS_CONF as RREF_AMB_CONF, ESC_NEXT as thresholdsEscNext, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, RREF_CONSULT_TIMEOUT_MS, CACHE_TTL_MS as THRESHOLD_CACHE_TTL_MS, L2_DOWN_MIN_CONF } from './thresholds.mjs'; // S1-F4 单源;S1-F2 门控两值并入;S2-F1(20261118) 咨询超时并入;L2 降档影子(20261122)
-import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config } from './modelRoute.mjs';
+import { readHealth, markHealth as markHealthCool, clearHealth, isProxyReachable, inventoryFromUpstreams, ingressProviders, upstreamsForHost, deriveTierChains, resolveTier, tierOfModel, logTierShadow, DEFAULT_BRAND_PRIORITY, DEFAULT_MODEL_TIERS, DEFAULT_LIGHT_SUFFIXES, loadVectors, knnClassify, l2TierRescue, l2EmbedFn, resolveL2Config, normalizeProtocols, providerAllowsProtocol } from './modelRoute.mjs';
 import { promptKey } from './buildExemplars.mjs'; // v2 证据采集:proxy 账本行带 pkey,与影子/黄金集同口径 join
 import { resolveDecisionProfile, DECISION_PROFILE_FALLBACK, JUDGE_CONTEXT_CHARS } from './decisionModel.mjs'; // v3 档案制(2026-11-09):rRef 本地路径门槛/窗口按被选模型档案标定
 import { blendedRate, loadModelPrices } from './costProfile.mjs';
@@ -176,6 +186,8 @@ const PHASE_MAX = 200;
 // ---------- 协议适配层 ----------
 // 适配器契约(全部为纯函数/纯数据变换,不碰网络):
 //   isChatRequest(url)              识别本协议的对话端点(决策门);null 分派=透传不改写
+//   messagesOf(bodyObj)             请求体 → 归一 messages(决策内核唯一认的形态;
+//                                   Chat 用 messages,Responses 把 input/instructions 映射过来)
 //   lastMessageKind(messages)       'human'(新人类轮) | 'tool'(工具续接) | 'other'
 //   lastHumanText(messages)         最后一条人类消息文本(L1 分类输入)
 //   convKeyMaterial(bodyObj, url)   会话键材料串(核心负责 hash 入桶)
@@ -199,7 +211,9 @@ export function stripHostReminders(text) {
 
 export const anthropicAdapter = {
   name: 'anthropic',
+  pathSuffix: '/v1/messages',
   isChatRequest(url) { return typeof url === 'string' && url.endsWith('/v1/messages'); },
+  messagesOf(bodyObj) { return Array.isArray(bodyObj?.messages) ? bodyObj.messages : null; },
   lastMessageKind(messages) {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const m = messages[i];
@@ -445,7 +459,9 @@ function anthropicGrab(u, acc) {
  */
 export const openaiAdapter = {
   name: 'openai',
+  pathSuffix: '/chat/completions',
   isChatRequest(url) { return typeof url === 'string' && url.endsWith('/chat/completions'); },
+  messagesOf(bodyObj) { return Array.isArray(bodyObj?.messages) ? bodyObj.messages : null; },
   lastMessageKind(messages) {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const m = messages[i];
@@ -544,21 +560,344 @@ function openaiToolLooksError(m) {
 
 function openaiGrab(u, acc) {
   acc.usageRaw = u;
-  // 缓存段判定:官方在 prompt_tokens_details.cached_tokens;部分兼容网关沿用 anthropic 风格字段名,一并认
+  // 缓存段判定:chat-completions 在 prompt_tokens_details.cached_tokens,Responses 在
+  // input_tokens_details.cached_tokens(2026-11-24 补);部分兼容网关沿用 anthropic 风格字段名,一并认
   if ((u.prompt_tokens_details && typeof u.prompt_tokens_details === 'object' && 'cached_tokens' in u.prompt_tokens_details)
+    || (u.input_tokens_details && typeof u.input_tokens_details === 'object' && 'cached_tokens' in u.input_tokens_details)
     || 'cache_read_input_tokens' in u || 'cache_creation_input_tokens' in u) acc.cacheReported = true;
   acc.inTok = num(u.prompt_tokens) ?? num(u.input_tokens) ?? acc.inTok;
   acc.outTok = num(u.completion_tokens) ?? num(u.output_tokens) ?? acc.outTok;
-  acc.cacheRead = num(u.prompt_tokens_details?.cached_tokens) ?? num(u.cache_read_input_tokens) ?? acc.cacheRead;
+  acc.cacheRead = num(u.prompt_tokens_details?.cached_tokens) ?? num(u.input_tokens_details?.cached_tokens) ?? num(u.cache_read_input_tokens) ?? acc.cacheRead;
   acc.cacheWrite = num(u.cache_creation_input_tokens) ?? acc.cacheWrite;
 }
 
-const PROTOCOL_ADAPTERS = [anthropicAdapter, openaiAdapter];
+/**
+ * OpenAI Responses 协议适配器(2026-11-24;ZCode api.type=openai-responses 的内置模板:
+ * OpenAI / xAI / opencode 等)。与 Chat Completions 的差异与映射:
+ *   - 请求体用 `input`(字符串或 item 数组)而非 messages;系统提示在顶层 `instructions`;
+ *   - item 形态:role 消息(content 为 input_text/output_text 块)、function_call、function_call_output、reasoning;
+ *   - 用量 `usage.input_tokens/output_tokens`,缓存段 `input_tokens_details.cached_tokens`;
+ *   - 流式是 `{type:'response.*', response:{...}}` 事件,用量随 `response.completed` 一起到(无需 stream_options)。
+ * 决策内核只认 messages:messagesOf 把 input 归一成 chat 风格(function_call→assistant tool_use、
+ * function_call_output→role:'tool'),其余钩子直接复用 chat 版;响应体/事件原样透传,不改写。
+ */
+export const responsesAdapter = {
+  name: 'openai-responses',
+  pathSuffix: '/responses',
+  isChatRequest(url) { return typeof url === 'string' && url.endsWith('/responses'); },
+  messagesOf(bodyObj) {
+    const input = bodyObj?.input;
+    if (typeof input === 'string') return [{ role: 'user', content: input }];
+    if (!Array.isArray(input)) return null;
+    const out = [];
+    for (const it of input) {
+      if (!it || typeof it !== 'object') continue;
+      if (it.type === 'function_call') {
+        out.push({ role: 'assistant', content: [{ type: 'tool_use', id: it.call_id || it.id || '', name: it.name || '', input: it.arguments }] });
+        continue;
+      }
+      if (it.type === 'function_call_output') {
+        const o = it.output;
+        out.push({ role: 'tool', tool_call_id: it.call_id || '', content: typeof o === 'string' ? o : JSON.stringify(o ?? '') });
+        continue;
+      }
+      if (it.type === 'reasoning') continue; // 思考项不参与轮型判定
+      const role = it.role === 'developer' ? 'system' : String(it.role || 'user');
+      const c = it.content;
+      if (typeof c === 'string') out.push({ role, content: c });
+      else if (Array.isArray(c)) {
+        out.push({
+          role,
+          content: c.filter((b) => b && typeof b.text === 'string' && (b.type === 'input_text' || b.type === 'output_text' || b.type === 'text'))
+            .map((b) => b.text).join('\n'),
+        });
+      } else out.push({ role, content: '' });
+    }
+    return out;
+  },
+  lastMessageKind(messages) { return openaiAdapter.lastMessageKind(messages); },
+  lastHumanText(messages) { return openaiAdapter.lastHumanText(messages); },
+  convKeyMaterial(bodyObj, reqUrl = '') {
+    const msgs = this.messagesOf(bodyObj) || [];
+    const sys = String(bodyObj?.instructions || '');
+    const first = msgs.find((m) => m && m.role === 'user');
+    return `${first ? String(first.content || '') : ''}|${sys.slice(0, 400)}|${reqUrl}`;
+  },
+  prepareBody(bodyObj) { return bodyObj; }, // Responses 流式用量随 completed 事件自带,无 stream_options
+  upstreamHeaders(apiKey) { return { authorization: `Bearer ${apiKey}` }; },
+  grabUsage(d, acc) {
+    const r = d?.response || d; // response.completed 等事件把响应对象包在 response 字段里
+    if (r?.usage) openaiGrab(r.usage, acc);
+    if (r?.model) acc.served = acc.served || r.model;
+  },
+  grabBodyUsage(d, acc) {
+    if (d?.usage) openaiGrab(d.usage, acc);
+    if (d?.model) acc.served = d.model || acc.served;
+  },
+  countToolErrors(messages) { return openaiAdapter.countToolErrors(messages); },
+  countRepeatCalls(messages) { return countRepeatCalls(messages, openaiToolCalls, openaiToolResults); },
+};
+
+const PROTOCOL_ADAPTERS = [anthropicAdapter, openaiAdapter, responsesAdapter];
 
 /** 按请求 URL 分派协议适配器;无可匹配端点返回 null(该请求透传不改写)。 */
 export function pickProtocolAdapter(url) {
   for (const a of PROTOCOL_ADAPTERS) if (a.isChatRequest(url)) return a;
   return null;
+}
+
+const ADAPTER_BY_NAME = Object.fromEntries(PROTOCOL_ADAPTERS.map((a) => [a.name, a]));
+
+// ---------- 协议桥(2026-11-24 用户定:auto 池不限协议;跨协议选型在此转信封) ----------
+// 红线(用户定):**上下文输入/输出逐字保真** —— 系统提示、每轮消息、工具定义与参数、工具结果、
+// 模型输出 token 全部原样搬运;桥只换信封(路径/鉴权头/字段名/事件名),不改写内容。
+// fail-closed(用户定):thinking 块 / is_error 工具结果 / cache_control / 多模态块无法跨协议无损
+// 映射 → 含这些内容的请求不跨协议选型(留在同协议池),绝不静默丢。
+// canonical 形态 = anthropic 报文形(最富:system 字段 + content 块 + tool_use/tool_result)。
+
+const LOSSY_BLOCK_TYPES = new Set(['thinking', 'redacted_thinking', 'image', 'input_image', 'image_url', 'audio', 'input_audio']);
+
+/** 深扫请求体,报告无法跨协议无损映射的内容。纯函数,单次遍历。 */
+export function scanLossy(bodyObj) {
+  const hit = { thinking: false, isError: false, cacheControl: false, multimodal: false };
+  const walk = (v, depth) => {
+    if (v == null || typeof v !== 'object' || depth > 24) return;
+    if (Array.isArray(v)) { for (const x of v) walk(x, depth + 1); return; }
+    for (const [k, val] of Object.entries(v)) {
+      if (k === 'cache_control' && val != null) { hit.cacheControl = true; continue; }
+      if (k === 'is_error' && val === true) { hit.isError = true; continue; }
+      if (k === 'type' && typeof val === 'string') {
+        if (val === 'thinking' || val === 'redacted_thinking') hit.thinking = true;
+        else if (LOSSY_BLOCK_TYPES.has(val)) hit.multimodal = true;
+      }
+      walk(val, depth + 1);
+    }
+  };
+  walk(bodyObj, 0);
+  return hit;
+}
+
+const parseArgs = (s) => { try { return typeof s === 'string' ? JSON.parse(s) : (s ?? {}); } catch { return {}; } };
+const textOf = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((b) => (typeof b === 'string' ? b : (b && b.text) || '')).join('\n') : String(c ?? ''));
+
+/** 入站请求体 → canonical(anthropic 形)。内容逐字搬运;多文本块按序 join('\n')。 */
+function chatToCanonical(b) {
+  const sys = [];
+  const messages = [];
+  for (const m of b.messages || []) {
+    if (!m) continue;
+    if (m.role === 'system' || m.role === 'developer') { sys.push(textOf(m.content)); continue; }
+    if (m.role === 'tool') {
+      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: m.tool_call_id || '', content: textOf(m.content) }] });
+      continue;
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const blocks = [];
+      const text = textOf(m.content);
+      if (text) blocks.push({ type: 'text', text });
+      for (const tc of m.tool_calls) blocks.push({ type: 'tool_use', id: tc.id || '', name: tc.function?.name || '', input: parseArgs(tc.function?.arguments) });
+      messages.push({ role: 'assistant', content: blocks });
+      continue;
+    }
+    messages.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: typeof m.content === 'string' ? m.content : textOf(m.content) });
+  }
+  return {
+    model: b.model,
+    system: sys.length ? sys.join('\n') : undefined,
+    messages,
+    tools: Array.isArray(b.tools) ? b.tools.map((t) => ({ name: t.function?.name ?? t.name, description: t.function?.description ?? t.description, input_schema: t.function?.parameters ?? t.parameters })) : undefined,
+    tool_choice: b.tool_choice && b.tool_choice !== 'none' ? (b.tool_choice.type === 'function' ? { type: 'tool', name: b.tool_choice.function?.name } : { type: b.tool_choice.type === 'required' ? 'any' : b.tool_choice.type }) : undefined,
+    max_tokens: b.max_tokens, temperature: b.temperature, top_p: b.top_p,
+    stop_sequences: b.stop != null ? (Array.isArray(b.stop) ? b.stop : [b.stop]) : undefined,
+    stream: b.stream,
+  };
+}
+
+function responsesToCanonical(b) {
+  const messages = [];
+  const input = typeof b.input === 'string'
+    ? [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: b.input }] }]
+    : (Array.isArray(b.input) ? b.input : []);
+  for (const it of input) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.type === 'function_call') { messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: it.call_id || it.id || '', name: it.name || '', input: parseArgs(it.arguments) }] }); continue; }
+    if (it.type === 'function_call_output') { messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: it.call_id || '', content: textOf(it.output) }] }); continue; }
+    if (it.type === 'reasoning') continue; // scanLossy 已 fail-closed,此处不再出现
+    const role = it.role === 'assistant' ? 'assistant' : 'user';
+    const c = it.content;
+    const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((p) => p && typeof p.text === 'string').map((p) => p.text).join('\n') : '';
+    messages.push({ role, content: text });
+  }
+  return {
+    model: b.model,
+    system: b.instructions || undefined,
+    messages,
+    tools: Array.isArray(b.tools) ? b.tools.filter((t) => t && (t.type === 'function' || !t.type)).map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters })) : undefined,
+    max_tokens: b.max_output_tokens ?? b.max_tokens, temperature: b.temperature, top_p: b.top_p,
+    stream: b.stream,
+  };
+}
+
+/** canonical → 目标协议请求体。 */
+function canonicalToChat(c) {
+  const messages = [];
+  if (c.system) messages.push({ role: 'system', content: typeof c.system === 'string' ? c.system : c.system.map((x) => x.text || '').join('\n') });
+  for (const m of c.messages || []) {
+    if (typeof m.content === 'string') { messages.push({ role: m.role, content: m.content }); continue; }
+    const texts = [];
+    const toolCalls = [];
+    const toolMsgs = [];
+    for (const blk of m.content || []) {
+      if (!blk) continue;
+      if (blk.type === 'text') texts.push(blk.text || '');
+      else if (blk.type === 'tool_use') toolCalls.push({ id: blk.id, type: 'function', function: { name: blk.name, arguments: JSON.stringify(blk.input ?? {}) } });
+      else if (blk.type === 'tool_result') toolMsgs.push({ role: 'tool', tool_call_id: blk.tool_use_id, content: textOf(blk.content) });
+    }
+    if (toolCalls.length) messages.push({ role: m.role, content: texts.join('\n') || null, tool_calls: toolCalls });
+    else if (texts.length) messages.push({ role: m.role, content: texts.join('\n') });
+    messages.push(...toolMsgs);
+  }
+  return {
+    model: c.model, messages,
+    tools: Array.isArray(c.tools) ? c.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } })) : undefined,
+    tool_choice: c.tool_choice ? (c.tool_choice.type === 'tool' ? { type: 'function', function: { name: c.tool_choice.name } } : { type: c.tool_choice.type === 'any' ? 'required' : c.tool_choice.type }) : undefined,
+    max_tokens: c.max_tokens, temperature: c.temperature, top_p: c.top_p,
+    stop: c.stop_sequences, stream: c.stream,
+  };
+}
+
+function canonicalToResponses(c) {
+  const input = [];
+  for (const m of c.messages || []) {
+    if (typeof m.content === 'string') { input.push({ type: 'message', role: m.role, content: [{ type: m.role === 'assistant' ? 'output_text' : 'input_text', text: m.content }] }); continue; }
+    for (const blk of m.content || []) {
+      if (!blk) continue;
+      if (blk.type === 'text') input.push({ type: 'message', role: m.role, content: [{ type: m.role === 'assistant' ? 'output_text' : 'input_text', text: blk.text || '' }] });
+      else if (blk.type === 'tool_use') input.push({ type: 'function_call', call_id: blk.id, name: blk.name, arguments: JSON.stringify(blk.input ?? {}) });
+      else if (blk.type === 'tool_result') input.push({ type: 'function_call_output', call_id: blk.tool_use_id, output: textOf(blk.content) });
+    }
+  }
+  return {
+    model: c.model,
+    instructions: c.system ? (typeof c.system === 'string' ? c.system : c.system.map((x) => x.text || '').join('\n')) : undefined,
+    input,
+    tools: Array.isArray(c.tools) ? c.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.input_schema })) : undefined,
+    max_output_tokens: c.max_tokens, temperature: c.temperature, top_p: c.top_p, stream: c.stream,
+  };
+}
+
+/** 跨协议请求桥:入站体 → canonical → 上游协议体。同协议直通;未知对 → fail。 */
+export function bridgeRequest(inboundAdapter, targetAdapter, bodyObj) {
+  if (!inboundAdapter || !targetAdapter || inboundAdapter.name === targetAdapter.name) return { body: bodyObj };
+  const toC = inboundAdapter.name === 'openai' ? chatToCanonical : inboundAdapter.name === 'openai-responses' ? responsesToCanonical : (b) => b; // anthropic = canonical 本形
+  const fromC = targetAdapter.name === 'openai' ? canonicalToChat : targetAdapter.name === 'openai-responses' ? canonicalToResponses : (c) => c;
+  if (!toC || !fromC) return { fail: `无跨协议桥:${inboundAdapter.name}->${targetAdapter.name}` };
+  const body = fromC(toC(bodyObj));
+  if (bodyObj.stream === true) body.stream = false; // v1:跨协议强制上游非流式,整包转换后按需合成流
+  return { body };
+}
+
+// ---------- 响应桥(上游协议体 → 入站协议体;usage 字段同步换算) ----------
+
+function chatResponseToCanonical(b) {
+  const msg = b.choices?.[0]?.message || {};
+  const blocks = [];
+  const text = textOf(msg.content);
+  if (text) blocks.push({ type: 'text', text });
+  for (const tc of msg.tool_calls || []) blocks.push({ type: 'tool_use', id: tc.id || '', name: tc.function?.name || '', input: parseArgs(tc.function?.arguments) });
+  const fr = b.choices?.[0]?.finish_reason;
+  const stopReason = fr === 'length' ? 'max_tokens' : (fr === 'tool_calls' || fr === 'function_call') ? 'tool_use' : 'end_turn';
+  const u = b.usage || {};
+  return {
+    id: b.id, model: b.model, role: 'assistant', type: 'message', content: blocks, stop_reason: stopReason,
+    usage: { input_tokens: u.prompt_tokens ?? null, output_tokens: u.completion_tokens ?? null, cache_read_input_tokens: u.prompt_tokens_details?.cached_tokens ?? undefined },
+  };
+}
+
+function responsesResponseToCanonical(b) {
+  const blocks = [];
+  for (const it of b.output || []) {
+    if (!it) continue;
+    if (it.type === 'message') { const t = (it.content || []).filter((p) => p && typeof p.text === 'string').map((p) => p.text).join('\n'); if (t) blocks.push({ type: 'text', text: t }); }
+    else if (it.type === 'function_call') blocks.push({ type: 'tool_use', id: it.call_id || it.id || '', name: it.name || '', input: parseArgs(it.arguments) });
+    // reasoning 项不进客户端视图(上游内部思考;anthropic 形无对应容器,丢弃已在本方向语义内)
+  }
+  const stopReason = b.status === 'incomplete' && b.incomplete_details?.reason === 'max_output_tokens' ? 'max_tokens' : 'end_turn';
+  const u = b.usage || {};
+  return {
+    id: b.id, model: b.model, role: 'assistant', type: 'message', content: blocks, stop_reason: stopReason,
+    usage: { input_tokens: u.input_tokens ?? null, output_tokens: u.output_tokens ?? null, cache_read_input_tokens: u.input_tokens_details?.cached_tokens ?? undefined },
+  };
+}
+
+function canonicalToChatResponse(c) {
+  const text = (c.content || []).filter((x) => x.type === 'text').map((x) => x.text || '').join('\n');
+  const toolCalls = (c.content || []).filter((x) => x.type === 'tool_use').map((x) => ({ id: x.id, type: 'function', function: { name: x.name, arguments: JSON.stringify(x.input ?? {}) } }));
+  const fr = c.stop_reason === 'max_tokens' ? 'length' : c.stop_reason === 'tool_use' ? 'tool_calls' : 'stop';
+  const u = c.usage || {};
+  return {
+    id: c.id || 'bridge', object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: c.model,
+    choices: [{ index: 0, message: { role: 'assistant', content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }, finish_reason: fr }],
+    usage: { prompt_tokens: u.input_tokens ?? 0, completion_tokens: u.output_tokens ?? 0, total_tokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0) },
+  };
+}
+
+function canonicalToResponsesResponse(c) {
+  const output = [];
+  for (const blk of c.content || []) {
+    if (blk.type === 'text') output.push({ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: blk.text || '' }] });
+    else if (blk.type === 'tool_use') output.push({ type: 'function_call', call_id: blk.id, name: blk.name, arguments: JSON.stringify(blk.input ?? {}) });
+  }
+  const u = c.usage || {};
+  return {
+    id: c.id || 'bridge', object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'completed', model: c.model, output,
+    usage: { input_tokens: u.input_tokens ?? 0, output_tokens: u.output_tokens ?? 0, total_tokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0) },
+  };
+}
+
+/** 跨协议响应桥:上游协议体 → 入站协议体。 */
+export function bridgeResponse(inboundAdapter, targetAdapter, upstreamBody) {
+  const toC = targetAdapter.name === 'openai' ? chatResponseToCanonical : targetAdapter.name === 'openai-responses' ? responsesResponseToCanonical : (b) => b;
+  const fromC = inboundAdapter.name === 'openai' ? canonicalToChatResponse : inboundAdapter.name === 'openai-responses' ? canonicalToResponsesResponse : (c) => c;
+  return fromC(toC(upstreamBody));
+}
+
+/** 跨协议 + 客户端要流式:整包转换后合成最小 SSE(文本逐字,无增量打字机)。 */
+export function synthesizeStream(inboundAdapter, clientBody) {
+  const ev = (name, data) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+  if (inboundAdapter.name === 'anthropic') {
+    const parts = [
+      ev('message_start', { type: 'message_start', message: { id: clientBody.id, type: 'message', role: 'assistant', model: clientBody.model, content: [], usage: { input_tokens: clientBody.usage?.input_tokens ?? 0, output_tokens: 0 } } }),
+    ];
+    let idx = 0;
+    for (const blk of clientBody.content || []) {
+      if (blk.type === 'text') {
+        parts.push(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
+        parts.push(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: blk.text || '' } }));
+      } else if (blk.type === 'tool_use') {
+        parts.push(ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: blk.id, name: blk.name, input: {} } }));
+        parts.push(ev('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(blk.input ?? {}) } }));
+      } else continue;
+      parts.push(ev('content_block_stop', { type: 'content_block_stop', index: idx }));
+      idx += 1;
+    }
+    parts.push(ev('message_delta', { type: 'message_delta', delta: { stop_reason: clientBody.stop_reason || 'end_turn', stop_sequence: null }, usage: { output_tokens: clientBody.usage?.output_tokens ?? 0 } }));
+    parts.push(ev('message_stop', { type: 'message_stop' }));
+    return parts.join('');
+  }
+  if (inboundAdapter.name === 'openai') {
+    const chunk = {
+      id: clientBody.id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: clientBody.model,
+      choices: [{ index: 0, delta: { content: clientBody.choices?.[0]?.message?.content ?? '' }, finish_reason: clientBody.choices?.[0]?.finish_reason ?? null }],
+    };
+    return `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
+  }
+  const text = ((clientBody.output || []).find((x) => x.type === 'message')?.content || []).map((p) => p.text || '').join('');
+  return [
+    ev('response.created', { type: 'response.created', response: { id: clientBody.id, object: 'response', model: clientBody.model } }),
+    ev('response.output_text.delta', { type: 'response.output_text.delta', delta: text }),
+    ev('response.completed', { type: 'response.completed', response: clientBody }),
+  ].join('');
 }
 
 // 便捷导出(Anthropic 口径,测试与既有消费者使用;服务端走 pickProtocolAdapter 分派)
@@ -601,6 +940,8 @@ function readQoderProviders(home = HOME) {
       apiKey: p?.apiKey || '',
       models: (Array.isArray(p?.models) ? p.models : []).map((m) => (typeof m === 'string' ? m : m?.model)).filter(Boolean),
       enabled: true, // Qoder 无 enabled 键,存在即启用
+      // 协议真源=条目 protocol(2026-11-24);**勿取 p.type**——它恒为 'openai-compatible'(客户端分类,非报文协议)
+      protocols: normalizeProtocols({ protocol: p?.protocol }),
       qoder: true,
     })));
   }
@@ -661,7 +1002,12 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE, zcode
     providers[pid] = {
       baseUrl: base,
       apiKey,
-      anthropic: base.endsWith('/anthropic'),
+      // 协议标签(2026-11-24 用户定):客户端自定义条目的 API 格式字段是真源——
+      // ZCode 读 config.api.type;Qoder 条目已在 readQoderProviders 里按 protocol 归一。
+      // 空数组 = 未知(宽松不筛,兼容旧快照/缺字段条目);旧死字段 anthropic:(URL 后缀启发式)已删。
+      protocols: host === 'zcode'
+        ? normalizeProtocols({ apiType: r.config?.api?.type })
+        : (Array.isArray(r.protocols) ? r.protocols : []),
       models: host === 'zcode' ? listed.filter((m) => zcodeModelEnabled(pid, m)) : listed,
       enabled: r.enabled !== false,
       host, // 双端隔离:zcode|qoder(2026-11-04)
@@ -670,32 +1016,32 @@ export function snapshotUpstreams({ home = HOME, outFile = UPSTREAMS_FILE, zcode
     if (isIngress) ingress.push(pid);
   }
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  atomicWriteFileSync(outFile, JSON.stringify({ version: 5, snapshottedAt: Date.now(), providers, ingress, providerOrder }, null, 1) + '\n');
+  atomicWriteFileSync(outFile, JSON.stringify({ version: 6, snapshottedAt: Date.now(), providers, ingress, providerOrder }, null, 1) + '\n');
   return { providers: Object.keys(providers).length, ingress, providerOrder, outFile };
 }
 
 /**
  * 双端隔离(2026-11-04 用户定档):按请求宿主过滤路由清单(host=zcode|qoder)。
- * 旧快照无 host 标签的条目两端通用(兼容未刷新部署,重抓快照后自动隔离);
- * ingress 数组同步过滤,只留本宿主存活条目。
+ * 2026-11-24 起实现单源迁至 modelRoute.mjs(doctor/CLI 查询端同口径),此处仅转发导出。
  */
-export function upstreamsForHost(upstreams, host) {
-  const providers = {};
-  for (const [pid, p] of Object.entries(upstreams?.providers || {})) {
-    if (p && (!p.host || p.host === host)) providers[pid] = p;
-  }
-  const ingress = (Array.isArray(upstreams?.ingress) ? upstreams.ingress : []).filter((pid) => providers[pid]);
-  return { ...(upstreams || { providers: {} }), providers, ingress };
-}
+export { upstreamsForHost } from './modelRoute.mjs';
 
 /** model → 拥有它的供应商条目(真实 upstream),不含指向代理自身的条目。 */
-export function resolveUpstreamForModel(model, upstreams) {
+export function resolveUpstreamForModel(model, upstreams, protocols = null) {
+  const cands = [];
   for (const [providerId, p] of Object.entries(upstreams.providers || {})) {
     if ((p.models || []).includes(model) && p.enabled !== false && p.apiKey) {
-      return { providerId, ...p };
+      cands.push({ providerId, ...p });
     }
   }
-  return null;
+  if (!cands.length) return null;
+  if (protocols) {
+    // 协议感知(2026-11-24):优先挑协议匹配的上游(未知协议宽松,仍可被选中);
+    // 一个都不匹配 → 不发(零互译前提下必 404),交由调用方 502。
+    const match = cands.filter((c) => providerAllowsProtocol(c, protocols));
+    return match.length ? match[0] : null;
+  }
+  return cands[0];
 }
 
 /**
@@ -706,43 +1052,57 @@ export function resolveUpstreamForModel(model, upstreams) {
  *   ③ 模型不在入口清单(客户端自选了入口供应商没列的模型)→ 仍发给入口供应商的真实上游,
  *      让"这个账号没有这个模型"的错误由它自己返回,**绝不越权打到另一个账户**(H4);
  *   ④ 无入口信息(未切 baseUrl 的裸用场景)→ 退回按模型名找持有者。
+ * 协议感知(2026-11-24):protocols 已知时,**已知协议不符的入口不发**——把 anthropic 报文
+ *   送给只懂 openai 的入口必然 404,不如本地 502 把原因说清;未知协议(protocols=[])宽松算匹配。
+ *   入口全都不匹配 → 空哨兵 502,仍不越权打别家账户(H4 红线不变)。
  */
-export function pickUpstream({ providerId, model, upstreams } = {}) {
+export function pickUpstream({ providerId, model, upstreams, protocols = null } = {}) {
   const ups = upstreams?.providers || {};
   const ingress = ingressProviders(upstreams);
   const ok = (id) => {
     const p = ups[id];
     return p && p.enabled !== false && !!p.apiKey ? p : null;
   };
+  // 可用入口 = 协议匹配的入口(未知协议宽松算匹配);原 ingress 序保持不变
+  const ingressOk = protocols ? ingress.filter((id) => providerAllowsProtocol(ups[id], protocols)) : ingress;
   if (providerId) {
     const p = ok(providerId);
     if (p && (p.models || []).includes(model)) return { providerId, ...p };
-    for (const id of ingress) {
+    for (const id of ingressOk) {
       const q = ok(id);
       if (q && (q.models || []).includes(model)) return { providerId: id, ...q };
     }
     // H4(2026-11-09 夜审 S1-F2 修复):与无钉住路径对齐——模型不在入口清单仍只发入口供应商
     // (modelNotListed 让"这个账号没有这个模型"的错由它自己返回),绝不越权兜底到别的账户
-    if (ingress.length) {
-      const q = ok(ingress[0]);
-      if (q) return { providerId: ingress[0], ...q, modelNotListed: true };
+    if (ingressOk.length) {
+      const q = ok(ingressOk[0]);
+      if (q) return { providerId: ingressOk[0], ...q, modelNotListed: true };
       // S1-F2(20261118):ingress 存在但全部不可用(disabled/无 key)→ 空上游走 502,
       // 绝不按模型名漂到同宿主其他账户(H4 红线;原 fallthrough 到 resolveUpstreamForModel 会越权)。
-      return { baseUrl: '', apiKey: '', anthropic: true, models: [] };
+      return { baseUrl: '', apiKey: '', protocols: [], models: [], why: '入口供应商不可用(禁用或无 key)' };
     }
-    return resolveUpstreamForModel(model, upstreams) || fallbackUpstream(upstreams);
+    if (ingress.length) {
+      // 有入口但全都不匹配入站协议 → 不发(把 anthropic 报文送进 openai 端点必 404),
+      // 也不漂到别家账户(H4 红线):本地 502 说清原因
+      return { baseUrl: '', apiKey: '', protocols: [], models: [], why: `入口供应商协议与入站不符(${protocols.join('/')})` };
+    }
+    // 无入口信息(裸用代理场景)→ 按模型名找持有者,协议感知
+    return resolveUpstreamForModel(model, upstreams, protocols) || fallbackUpstream(upstreams, protocols);
   }
-  for (const id of ingress) {
+  for (const id of ingressOk) {
     const q = ok(id);
     if (q && (q.models || []).includes(model)) return { providerId: id, ...q };
   }
-  if (ingress.length) {
-    const q = ok(ingress[0]);
-    if (q) return { providerId: ingress[0], ...q, modelNotListed: true };
+  if (ingressOk.length) {
+    const q = ok(ingressOk[0]);
+    if (q) return { providerId: ingressOk[0], ...q, modelNotListed: true };
     // S1-F2(20261118):无钉住路径同口径——ingress 全坏 → 空上游 502,不漂别账户
-    return { baseUrl: '', apiKey: '', anthropic: true, models: [] };
+    return { baseUrl: '', apiKey: '', protocols: [], models: [], why: '入口供应商不可用(禁用或无 key)' };
   }
-  return resolveUpstreamForModel(model, upstreams) || fallbackUpstream(upstreams);
+  if (ingress.length) {
+    return { baseUrl: '', apiKey: '', protocols: [], models: [], why: `入口供应商协议与入站不符(${protocols.join('/')})` };
+  }
+  return resolveUpstreamForModel(model, upstreams, protocols) || fallbackUpstream(upstreams, protocols);
 }
 
 /**
@@ -876,7 +1236,7 @@ export function resolveAutoBase({ tierChains = {}, providerPriority = [], provid
   return { modelId: null, providerId: null, warn: '四档链全部为空', tier: null };
 }
 
-export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, eagerR3 = false, loopStreak = 0, tierClassify = null, continuation = false } = {}) {
+export function decideTarget({ requestedModel, lastKind, diff = null, tierChains = null, providerPriority = [], providerOrder = [], aliases = {}, inventory, health, upstreams, phase = null, guard = null, contextBytes = 0, errStreak = 0, escalate = false, eagerR3 = false, loopStreak = 0, tierClassify = null, continuation = false, protocol = null, brandPriority = null } = {}) {
   const g = { ...DEFAULT_GUARD, ...(guard && typeof guard === 'object' ? guard : {}) };
   const inPhase = !!(phase && phase.model);
   // 档位分类配置(2026-11-06 v4):品牌三档表+轻量后缀(调用方注入,缺省=内置默认)
@@ -885,7 +1245,16 @@ export function decideTarget({ requestedModel, lastKind, diff = null, tierChains
   // sticky 基准=R1 档链头解析;阶段/门控逻辑对 auto 同样成立(客户端恒发 auto,不存在"人工改档"路径)。
   const isAuto = requestedModel === AUTO_MODEL;
   // 四档链解析源(优先级:调用方 tierChains > 快照自派生)
-  const tc = tierChains || deriveTierChains(upstreams, tcls.modelTiers ? tcls : {});
+  // 自派生口径与生产路径同源(2026-11-24):品牌优先序不再回落硬编码默认、provider 次级取序入链、
+  // 入站协议已知时只把协议匹配的上游入链(未知协议宽松)。
+  const tc = tierChains || deriveTierChains(upstreams, {
+    brandPriority: brandPriority || DEFAULT_BRAND_PRIORITY,
+    modelTiers: tcls.modelTiers || null,
+    lightSuffixes: tcls.lightSuffixes || null,
+    providerPriority,
+    providerOrder,
+    protocols: protocol ? [protocol] : null,
+  });
   // auto 基准供应商也要驻留并随决策带回(2026-11-05 修复):此前只回 model 不回 providerId,
   // pickUpstream 落到"按模型名找快照第一个持有者"——不查健康冷却、providerPriority 失效,
   // 同名多供应商时配额墙账号每轮被反复选中。
@@ -1102,7 +1471,7 @@ const ERR_ENVELOPE_RE = /"error"|"code"\s*:|error_?(code|type)|"errcode"|"succes
 // 对话载荷标记(2026-11-04 修复):2xx 响应里出现这些 = 上游真的在回话(anthropic content/content_block*/
 // message_*、openai choices/delta/text),bodyHead 就是**助手自己生成的正文**——正文里出现 "error"/quota/
 // rate limit/invalid api key 多半是在讨论报错,不是上游报错。真正的 200 裹错误体只有 code/msg 信封、没有这些标记。
-const CHAT_PAYLOAD_RE = /"(content|content_block[a-z_]*|message_start|message_delta|message_stop|choices|delta|text)"\s*:/;
+const CHAT_PAYLOAD_RE = /"(content|content_block[a-z_]*|message_start|message_delta|message_stop|choices|delta|text|output)"\s*:/; // 2026-11-24:补 Responses 的 output 载荷
 
 /**
  * 上游是否该进健康冷却(#8 运行时错误驱动 + "清单列出≠可调用"的首调负缓存)。
@@ -1179,10 +1548,10 @@ export function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter =
   return new Promise((resolve) => {
     const body = Buffer.from(JSON.stringify(bodyObj));
     if (!upstream.baseUrl) {
-      // 空上游(快照缺失/供应商池为空):直接 502,不让 new URL('') 抛 TypeError 击穿 async handler。
+      // 空上游(快照缺失/供应商池为空/入口协议不符):直接 502,不让 new URL('') 抛 TypeError 击穿 async handler。
       try {
         clientRes.writeHead(502, { 'content-type': 'application/json' });
-        clientRes.end(JSON.stringify({ error: { type: 'proxy_error', message: 'no usable upstream baseUrl (snapshot empty or provider unconfigured)' } }));
+        clientRes.end(JSON.stringify({ error: { type: 'proxy_error', message: `no usable upstream baseUrl (snapshot empty or provider unconfigured)${upstream.why ? ' — ' + upstream.why : ''}` } }));
       } catch { /* 客户端已断开 */ }
       resolve({ status: 502, retry: false, netError: false, body: '', headers: {} });
       return;
@@ -1281,7 +1650,8 @@ export function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter =
             }
             return;
           }
-          // 干净:补送头部并整体回放缓冲体
+          // 干净:补送头部并整体回放缓冲体(holdBody=桥模式:整包交调用方转换后再写客户端)
+          if (opts.holdBody) { resolve({ ...acc, status: up.statusCode, bodyHead: sbuf.slice(0, 2000), fullBody: sbuf }); return; }
           sendHead();
           for (const c of held) clientRes.write(c);
           held.length = 0;
@@ -1353,9 +1723,17 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       const upstreams = upstreamsForHost(readJson(upstreamsFile) || { providers: {} }, reqHost);
       let bodyObj = null;
       try { bodyObj = JSON.parse(raw); } catch { /* 非 JSON */ }
-      if (!bodyObj && /messages/.test(req.url)) { try { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'invalid JSON body' } })); } catch { /* 已断开 */ } return; } // S12-3:messages 端点非 JSON 400(其余路径仍透传)
+      if (!bodyObj && /(messages|responses)/.test(req.url)) { try { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'invalid JSON body' } })); } catch { /* 已断开 */ } return; } // S12-3:messages/responses 端点非 JSON 400(其余路径仍透传)
 
       const adapter = bodyObj ? pickProtocolAdapter(req.url) : null;
+      // 入站协议(2026-11-24):上游端点形态由入站路径决定,故选上游/派生链都要按入站协议筛;
+      // 非对话端点(adapter=null)不筛(透传)。
+      const inboundProtocols = adapter && adapter.name ? [adapter.name] : null;
+      // fail-closed 内容检测(2026-11-24 用户定):含不可跨协议无损映射内容的请求,池子退回同协议;
+      // 无损请求池子全协议(跨协议由桥转信封)。
+      const lossy = bodyObj ? scanLossy(bodyObj) : null;
+      const hasLossy = !!(lossy && (lossy.thinking || lossy.isError || lossy.cacheControl || lossy.multimodal));
+      const poolProtocols = hasLossy ? inboundProtocols : null;
       const convKey = convKeyOf(bodyObj, req.url, adapter || anthropicAdapter);
       prunePhases(state); // 空闲超限/超量的阶段先回收(H6)
       // 动态显示名规范化(2026-11-07):客户端条目名可为 "auto×0.189" 形态(综合费率后缀,由
@@ -1381,22 +1759,25 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       let prevAssistant = null; // 上一条助手回复摘要≤400 字(2026-11-22:续接轮任务难度只能从上一轮回复内容推断,接进 tev1 arm1 context)
       let l2KnnVote = null; // 本轮 kNN 原始票(L2 融合块落,影子账消费:2026-11-22 L2 降档救援影子)
       let promptHeadLog = null; // 本轮任务的人类 prompt 头(与影子/黄金集同 200 字口径,pkey join 用)
-      if (adapter && Array.isArray(bodyObj.messages)) {
+      // 归一消息(2026-11-24,Responses 接入):协议差异收敛在 adapter.messagesOf —
+      // 决策内核(轮型/人类文本/工具报错/重复调用)只认这一份 messages(Chat/Responses 各自的 input 由适配器映射)。
+      const routeMsgs = adapter && typeof adapter.messagesOf === 'function' ? adapter.messagesOf(bodyObj) : null;
+      if (adapter && Array.isArray(routeMsgs)) {
         const ro = mrRoutingOptions(configPath);
         // 同名取序(2026-11-05):快照采集的宿主 UI 拖动序(providerOrder[reqHost]),resolveRole 在
         // providerPriority 之后按它排同名供应商——UI 把谁排前,冷却滑动就先耗谁的额度。
         const providerOrder = Array.isArray(upstreams.providerOrder?.[reqHost]) ? upstreams.providerOrder[reqHost] : [];
-        const lastKind = adapter.lastMessageKind(bodyObj.messages);
+        const lastKind = adapter.lastMessageKind(routeMsgs);
         lastKindLog = lastKind;
         try {
-          const head = String(adapter.lastHumanText(bodyObj.messages) || '').slice(0, 200);
+          const head = String(adapter.lastHumanText(routeMsgs) || '').slice(0, 200);
           if (head) promptHeadLog = head;
         } catch { /* prompt 头取不到不阻塞记账 */ }
         // 前轮人类 prompt 摘要(2026-11-09 S3/D4):人类轮算一次——rRef/D4 咨询的 context 与账本 prevHead 字段共用;
         // 直接写外层 prevHuman(1262 行声明),勿在块内重复 let 同名遮蔽——账本在块外读同一变量(2026-11-10 审计 P0 修复)
         if (lastKind === 'human') {
           try {
-            const msgs = bodyObj.messages || [];
+            const msgs = routeMsgs || [];
             for (let i = msgs.length - 2; i >= 0; i--) {
               const m = msgs[i];
               // S14-P4(2026-11-14):content 支持 blocks 数组形态(Anthropic [{type:'text',text}])——
@@ -1413,7 +1794,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           // 回复内容推断,接进 tev1 arm1 的 context(只喂决策模型,不进词法/L2——助手文本满是词表词会污染词法)。
           // 与前轮人类 prompt 并列拼进同一 context(见下行 rRef 咨询),blocks 数组形态同 S14-P4 口径。
           try {
-            const msgs = bodyObj.messages || [];
+            const msgs = routeMsgs || [];
             for (let i = msgs.length - 2; i >= 0; i--) {
               const m = msgs[i];
               if (m && m.role === 'assistant') {
@@ -1425,11 +1806,11 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             }
           } catch { /* 取不到不接 */ }
         }
-        const l1 = lastKind === 'human' ? classifyPrompt(adapter.lastHumanText(bodyObj.messages)) : null;
+        const l1 = lastKind === 'human' ? classifyPrompt(adapter.lastHumanText(routeMsgs)) : null;
         // 难度定档:人类轮算一次,tier 实弹决策与四档影子共用同一结果
         // 档案(mtime 缓存,默认 disabled)⇒ 人工 --enable 后这里真的改判;读不到/未启用 = 纯词法,零影响
         if (lastKind === 'human') {
-          try { diffDecision = classifyDifficulty(adapter.lastHumanText(bodyObj.messages), { calibration: loadTierCalibration() }); } catch { diffDecision = null; }
+          try { diffDecision = classifyDifficulty(adapter.lastHumanText(routeMsgs), { calibration: loadTierCalibration() }); } catch { diffDecision = null; }
           // S2-F2(20261118):词法原始快照必须在 L2 融合/r3Lexical/臂改档**之前**取——l2Live 现恒开,
           // 事后读 diffDecision 会把融合救回后的档/置信记成词法档,污染 D4/D5 门禁对账。
           const lexSnapshot = diffDecision ? { tier: diffDecision.tier, confidence: Number(diffDecision.confidence) } : null;
@@ -1443,7 +1824,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
               if (l2fn) {
                 const doc = sessionL2.vectors || (sessionL2.vectors = l2Override?.vectors || loadVectors(DATA_DIR)); // S2-F2 测试注入缝
                 if (doc && doc.vectors) {
-                  const vec = await l2fn(adapter.lastHumanText(bodyObj.messages));
+                  const vec = await l2fn(adapter.lastHumanText(routeMsgs));
                   const knn = knnClassify(vec, doc);
                   l2KnnVote = knn; // 影子账消费(L2 降档救援):留原始票,别只活在本块作用域里
                   const rescue = l2TierRescue(diffDecision, knn, { minConf: ro.l2Live.minConf });
@@ -1477,7 +1858,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             && ro.decisionOn);
           const rRefArm2 = !!(diffDecision && diffDecision.tier === 'R2' && ro.decisionOn && ro.rRef.r3Rescue);
           if (rRefArm1 || rRefArm2) {
-            const consultText = String(adapter.lastHumanText(bodyObj.messages) || '');
+            const consultText = String(adapter.lastHumanText(routeMsgs) || '');
             if (consultText.length <= ro.rRef.maxChars) {
               // 前轮摘要已在人类轮公共处提取(prevHuman/prevAssistant):指代类 prompt("刚才的测试…")盲判是决策模型漏判主因
               // 2026-11-22:context 扩入上一条助手回复摘要,并在法官 400 字额度内为它留位;缓存键一并算入。
@@ -1532,7 +1913,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           // **只记不改档**(applied 恒 false):影子对账(rrefAudit)达标后才谈救回权。与 arm1/arm2 共用
           // pkey+模型身份缓存 6h(同轮零重复判定);判定失败/超时 = 影子行缺失,fail-open。
           if (d4Flags && ro.decisionOn) {
-            const consultText4 = String(adapter.lastHumanText(bodyObj.messages) || '');
+            const consultText4 = String(adapter.lastHumanText(routeMsgs) || '');
             if (consultText4.length <= ro.rRef.maxChars) {
               const cKey4 = promptHeadLog ? promptKey(promptHeadLog) : null;
               const cHash4 = contextHash(consultCtx);
@@ -1572,13 +1953,13 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         let eagerR3 = false; // P2 提前一拍(v2 2026-11-08):R2 难度第 1 次报错即上 R3,见下方工具轮块
         // 死循环检测(2026-11-05 A 项):同工具同参数连续调用 ≥4 次 = 模型在"空烧"(工具全成功但没用)。
         // 这类失败不产生 is_error ⇒ P2 等不到;直接当上梯证据(换强模型是最正当的破局理由)。
-        const loop = typeof adapter.countRepeatCalls === 'function' ? adapter.countRepeatCalls(bodyObj.messages) : { count: 0, name: null, key: null, sameOut: 0 };
+        const loop = typeof adapter.countRepeatCalls === 'function' ? adapter.countRepeatCalls(routeMsgs) : { count: 0, name: null, key: null, sameOut: 0 };
         // 判死循环(2026-11-06):尾连 ≥4;或尾连 ≥3 且同结果实锤 ≥2(提前一拍介入)
         loopStreak = loopFiredOf(loop) ? loop.count : 0;
         loopName = loop.count > 0 ? loop.name : null;
         loopRaw = loop.count || 0;
         if (lastKind === 'tool') {
-          const errs = adapter.countToolErrors(bodyObj.messages);
+          const errs = adapter.countToolErrors(routeMsgs);
           roundErrCount = errs;
           errStreak = errs > 0 ? ((phase0?.errStreak || 0) + 1) : 0;
           escalate = errStreak >= 2 || loopStreak > 0;
@@ -1586,12 +1967,12 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           // R1→R2 仍维持 2 连败不变。工具轮的 lastHumanText 恒可读(即本轮任务的人类 prompt)。
           // 服务档是否真在 R2 由 decideTarget 内验(档位语义只在决策层一处)。
           if (!escalate && ro.r3Lexical.enabled && ro.r3Lexical.eagerEscalate && errStreak >= 1 && loopStreak === 0) {
-            try { eagerR3 = classifyDifficulty(adapter.lastHumanText(bodyObj.messages))?.tier === 'R2'; } catch { eagerR3 = false; }
+            try { eagerR3 = classifyDifficulty(adapter.lastHumanText(routeMsgs))?.tier === 'R2'; } catch { eagerR3 = false; }
           }
         }
         roundErrStreak = errStreak;
         // 四档链(同一份快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序;chainsOverride=测试注入的档位链)
-        const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority, modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes });
+        const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority, modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes, providerPriority: ro.providerPriority, providerOrder, protocols: poolProtocols });
         retryCtx = { ro, tierChains, providerOrder }; // 留给运行时 429 同轮重选:重跑 resolveTier 档内滑/降档
         // 健康/库存快照每轮读一次:实弹决策与难度裸解析审计共用(此前审计块各自重读一遍,同参数重复计算)
         const health0 = readHealth(healthDataDir);
@@ -1604,8 +1985,11 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           phase: phase0, guard: switchGuard(configPath), contextBytes: size,
           errStreak, escalate, eagerR3, loopStreak,
           tierClassify: { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes },
+          // 入站协议(2026-11-24):fail-closed 请求按协议筛链;无损请求池子全协议(桥负责信封)
+          protocol: poolProtocols ? poolProtocols[0] : null,
+          brandPriority: ro.brandPriority,
           // 续接轮保留(2026-11-22 第一档):人类轮判定是否续接(短确认/短指代),阶段内沿用任务档
-          continuation: lastKind === 'human' ? isContinuationTurn(adapter.lastHumanText(bodyObj.messages)).continuation : false,
+          continuation: lastKind === 'human' ? isContinuationTurn(adapter.lastHumanText(routeMsgs)).continuation : false,
         });
         decision = d;
         // 门控通知(2026-11-05):拦截连击/疲劳放行落 data/usage/gate-notice.json,prompt-guard 据此注入压缩建议
@@ -1616,7 +2000,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         if (d.escalated === true) {
           try {
             logTierShadow({
-              dataDir: healthDataDir, prompt: adapter.lastHumanText(bodyObj.messages),
+              dataDir: healthDataDir, prompt: adapter.lastHumanText(routeMsgs),
               tier: null, tierConfidence: 0, tierReason: `p2-escalation:${d.reason}`,
               servedModel: d.model, decisionTier: d.tier || null, escalated: true, switched: d.switched === true,
               servedTier: tierOfModel(d.model, { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes }) || null,
@@ -1632,7 +2016,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         // 全程 try/catch:审计任何异常都不得影响转发。
         if (lastKind === 'human') {
           try {
-            const diff = diffDecision || classifyDifficulty(adapter.lastHumanText(bodyObj.messages), { calibration: loadTierCalibration() });
+            const diff = diffDecision || classifyDifficulty(adapter.lastHumanText(routeMsgs), { calibration: loadTierCalibration() });
             const tr = resolveTier(diff.tier, {
               cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
               inventory: inventory0, health: health0,
@@ -1648,7 +2032,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             // 短轮影子观察(2026-11-22 第一档,用户定档):确认句("好的/继续/对")记"继承上一档"会解析到哪
             // (inheritWouldTier/Model,R3/R4 均维持原档,不封顶 R2——与实弹续接闸同口径),用于和 tev1 arm1
             // 救回对账;新短指令("修一下")只打 shortTurn 标签。上一表现档取 state(此刻仍是上轮相位,下行才覆盖写)。
-            const shortSc = classifyShortTurn(adapter.lastHumanText(bodyObj.messages));
+            const shortSc = classifyShortTurn(adapter.lastHumanText(routeMsgs));
             let inheritWouldTier = null;
             let inheritWouldModel = null;
             if (shortSc.kind === 'ack') {
@@ -1671,7 +2055,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
               }) : null;
             logTierShadow({
-              dataDir: healthDataDir, prompt: adapter.lastHumanText(bodyObj.messages),
+              dataDir: healthDataDir, prompt: adapter.lastHumanText(routeMsgs),
               tier: diff.tier, tierConfidence: diff.confidence, tierReason: diff.reason,
               wouldTier: tr.tier || null, wouldModel: tr.modelId || null, wouldProvider: tr.providerId || null,
               downgraded: tr.downgraded === true, servedModel: d.model || requestedModel,
@@ -1739,17 +2123,54 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       const roSlide = retryCtx?.ro || { modelTiers: DEFAULT_MODEL_TIERS, lightSuffixes: DEFAULT_LIGHT_SUFFIXES };
       const slideTier = decision.tier || (targetModel ? tierOfModel(targetModel, { modelTiers: roSlide.modelTiers, lightSuffixes: roSlide.lightSuffixes }) : null);
       const canRetryRoute = rc.enabled && !!retryCtx && !!slideTier;
-      let curUpstream = pickUpstream({ providerId: decision.providerId, model: targetModel, upstreams });
+      let curUpstream = pickUpstream({ providerId: decision.providerId, model: targetModel, upstreams, protocols: poolProtocols });
       let curModel = targetModel;
       let curBody = bodyObj ?? {};
       let attempts = 0;
       let usage = null;
       let cool = null;
+      let bridgeTag = null; // 跨协议选型标记('anthropic->openai' 等;落账审计)
       const retryTrail = [];
       let curSlideTier = slideTier; // 渐进退避后的滑档起点(每次重解析后同步为实际落点,保证单调不回升)
       for (;;) {
         const allowRetry = canRetryRoute && attempts < rc.maxRetries;
-        usage = await forward(res, curUpstream, suffix, curBody, meta, adapter || anthropicAdapter, { allowRetry });
+        // 协议桥(2026-11-24 用户定:auto 池不限协议):上游协议与入站不符时转信封——
+        // 路径/鉴权头/请求体按上游协议;内容(系统/消息/工具/工具结果)逐字搬运。
+        // fail-closed 已在链层(S):含 thinking/is_error/cache_control/多模态的请求池子只留同协议。
+        let fwdSuffix = suffix;
+        let fwdBody = curBody;
+        let fwdAdapter = adapter || anthropicAdapter;
+        let fwdMeta = meta;
+        bridgeTag = null;
+        const upProtos = Array.isArray(curUpstream?.protocols) ? curUpstream.protocols : [];
+        if (adapter && upProtos.length && !upProtos.includes(adapter.name)) {
+          const target = ADAPTER_BY_NAME[upProtos[0]];
+          const br = target ? bridgeRequest(adapter, target, curBody) : { fail: `未知上游协议:${upProtos.join('/')}` };
+          if (br.fail) {
+            try { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: `协议桥拒绝:${br.fail}` } })); } catch { /* 已断开 */ }
+            usage = { status: 502 };
+            break;
+          }
+          bridgeTag = `${adapter.name}->${target.name}`;
+          fwdSuffix = target.pathSuffix;
+          fwdBody = br.body;
+          fwdAdapter = target;
+          fwdMeta = { stream: false }; // v1:跨协议强制上游非流式,整包转换后按需合成流
+        }
+        usage = await forward(res, curUpstream, fwdSuffix, fwdBody, fwdMeta, fwdAdapter, { allowRetry, holdBody: bridgeTag != null });
+        // 桥模式:上游整包已 hold,在此转换并写客户端(流式则合成最小 SSE)
+        if (bridgeTag && usage.fullBody != null && !usage.retry) {
+          let clientBody = null;
+          try { clientBody = bridgeResponse(adapter, fwdAdapter, JSON.parse(usage.fullBody)); } catch { clientBody = null; }
+          if (!clientBody) {
+            usage = { ...usage, malformed: true, cool: 'unknown' };
+            try { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'upstream returned malformed payload' } })); } catch { /* 已断开 */ }
+          } else if (bodyObj?.stream === true) {
+            try { res.writeHead(usage.status || 200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }); res.end(synthesizeStream(adapter, clientBody)); } catch { /* 已断开 */ }
+          } else {
+            try { res.writeHead(usage.status || 200, { 'content-type': 'application/json' }); res.end(JSON.stringify(clientBody)); } catch { /* 已断开 */ }
+          }
+        }
         // netError(上游连不上/DNS 失败)没有状态码可复算:采信 forward 标的 transient——
         // 复算得 null 会被当"客户端请求内容错"直接提交,同轮重选对网络故障形同虚设(2026-11-04 修复)。
         cool = usage.malformed ? 'unknown' : (usage.netError ? (usage.cool || 'transient') : shouldCoolDown(usage));
@@ -1779,7 +2200,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
           if (r && r.modelId) { nextModel = r.modelId; nextProvider = r.providerId; if (r.tier) curSlideTier = r.tier; }
         } catch { /* 重解析异常即无替代,走末次提交 */ }
         retryTrail.push({ attempt: attempts, failedProvider, failedModel: curModel, status: usage.status ?? null, cool: usage.cool || null, nextModel: nextModel || null, nextProvider: nextProvider || null });
-        const nextUpstream = nextModel ? pickUpstream({ providerId: nextProvider, model: nextModel, upstreams }) : null;
+        const nextUpstream = nextModel ? pickUpstream({ providerId: nextProvider, model: nextModel, upstreams, protocols: poolProtocols }) : null;
         // 无替代 / 解析出的还是刚失败的那个 / 上游无 baseUrl → 把已缓冲的错误提交给客户端,结束
         if (!nextModel || (nextModel === curModel && nextProvider === failedProvider) || !nextUpstream?.baseUrl) {
           commitBufferedError(res, usage);
@@ -1837,6 +2258,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         bodyBytes: size, cjkChars: countCjk(raw),
         cooled: cool || null, phaseTurns: state.get(convKey)?.humanTurns || 0,
         aborted: usage.aborted === true, // 客户端中断轮:上游已被拆除,本轮 outTok 只计到中断点
+        protocolBridge: bridgeTag, // 跨协议选型标记(null=同协议直通);2026-11-24
         durationMs: Date.now() - started,
       }, usageFile, configPath);
     });
@@ -1844,13 +2266,20 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
   return server;
 }
 
-function fallbackUpstream(upstreams) {
+function fallbackUpstream(upstreams, protocols = null) {
   const entries = Object.entries(upstreams.providers || {});
+  // 协议感知(2026-11-24):入站协议已知时,末笔兜底也只兜协议匹配的上游——
+  // 把 responses 报文发给 anthropic 网关必 404,不如本地 502 说清"无协议匹配的上游"。
+  if (protocols) {
+    for (const [providerId, p] of entries) if (p.enabled !== false && p.apiKey && providerAllowsProtocol(p, protocols)) return { providerId, ...p };
+    for (const [providerId, p] of entries) if (p.enabled !== false && providerAllowsProtocol(p, protocols)) return { providerId, ...p };
+    return { baseUrl: '', apiKey: '', protocols: [], models: [], why: `无协议匹配(${protocols.join('/')})的上游可用` };
+  }
   for (const [providerId, p] of entries) if (p.enabled !== false && p.apiKey) return { providerId, ...p };
   // S1-F3(20261118):末笔兜底原取 entries[0](不校验 enabled)——全池 disabled 时仍向禁用条目发请求(白付 401 往返)。
   // 改为:优先 enabled 条目(缺 key 也好过禁用条目,401 能暴露真实配置问题);全池 disabled → 空哨兵(不路由)。
   for (const [providerId, p] of entries) if (p.enabled !== false) return { providerId, ...p };
-  return { baseUrl: '', apiKey: '', anthropic: true, models: [] };
+  return { baseUrl: '', apiKey: '', protocols: [], models: [] };
 }
 
 // inventory 统一由 modelRoute.mjs 的 inventoryFromUpstreams 提供(查询端/改写端同一份口径)。
@@ -1938,7 +2367,7 @@ if (directRun) {
       process.on('exit', cleanup);
       process.on('SIGINT', () => { cleanup(); process.exit(0); });
       process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-      console.log(`[model-route-proxy] listening on http://127.0.0.1:${port}(按 turn 分类改写 model,双协议适配:anthropic/openai,SSE 透传)`);
+      console.log(`[model-route-proxy] listening on http://127.0.0.1:${port}(按 turn 分类改写 model,三协议适配:anthropic/openai/openai-responses,SSE 透传)`);
     });
   }
 }

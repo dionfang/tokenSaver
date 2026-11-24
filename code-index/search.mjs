@@ -8,6 +8,8 @@
  *   node search.mjs 懒入库 --mode bm25          # 显式纯词法(不依赖模型)
  *   node search.mjs 奖章图标绘制 --rerank       # 先混合检索取前14,再本地 reranker 精排
  *   node search.mjs 限流 --json                 # 机器可读输出(供 agent 消费)
+ *   node search.mjs --symbol evaluateReadGuard  # 符号直跳(2026-11-24):块 y 字段确定性匹配,不依赖模型,
+ *                                              # 同文件连续块并为定义完整区间,区间宽从块宽收到符号宽
  *
  * 降级链(自动,带警告):嵌入路径在 init.mjs --model-in 选定,运行时不互为后备。
  *   ollama 路径:Ollama 不可用 → bm25。local 路径:优先用常驻进程,不在时本进程加载,不要求 Ollama,拉起失败 → bm25。
@@ -34,7 +36,7 @@ import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale } from
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
-const VALUE_FLAGS = new Set(['--k', '--mode', '--rr-k', '--rr-model']);
+const VALUE_FLAGS = new Set(['--k', '--mode', '--rr-k', '--rr-model', '--symbol']);
 const queryArgs = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i].startsWith('--')) { if (VALUE_FLAGS.has(args[i])) i++; }
@@ -55,8 +57,9 @@ const MODE = getOpt('--mode', 'hybrid'); // hybrid | vec | bm25
 const RERANK = flags.includes('--rerank');
 const RRK = numOpt('--rr-k', 14, 1);
 const AS_JSON = flags.includes('--json');
+const SYMBOL = getOpt('--symbol', null);
 
-if (!query) { console.error('用法: node search.mjs <查询词> [--k 8] [--mode hybrid|vec|bm25] [--json]'); process.exit(1); }
+if (!query && !SYMBOL) { console.error('用法: node search.mjs <查询词> [--k 8] [--mode hybrid|vec|bm25] [--symbol <符号名>] [--json]'); process.exit(1); }
 
 const chunksPath = path.join(DATA_DIR, 'chunks.jsonl');
 if (!fs.existsSync(chunksPath)) {
@@ -64,6 +67,86 @@ if (!fs.existsSync(chunksPath)) {
   process.exit(1);
 }
 let chunks = fs.readFileSync(chunksPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+
+// ---------- 符号直跳(--symbol,2026-11-24):块 y 字段确定性匹配,不碰嵌入/精排/降级链 ----------
+// y = 块首行所在的顶层符号(build.mjs 从定义行起传播),块首落在符号体内时连续块并成完整定义区间;
+// 但定义行落在块中部时没有任何块的 y 携带它——用正文定义行正则兜底(与 build.mjs SYM_RES 同族)。
+// 组排序 = 精确(y 或 vue 后缀全等,3) > 正文定义行(2) > y 子串(1),同级按首见块序(扫描序)稳。
+if (SYMBOL) {
+  const name = String(SYMBOL).trim();
+  if (!name) { console.error('用法: node search.mjs --symbol <符号名> [--k 8] [--json]'); process.exit(1); }
+  const nl = name.toLowerCase();
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const wordRe = new RegExp(`\\b${esc(nl)}\\b`);
+  const rankOf = (y) => {
+    const s = String(y || '');
+    if (!s) return 0;
+    const tail = s.includes(':') ? s.slice(s.lastIndexOf(':') + 1) : s;
+    const tl = tail.toLowerCase();
+    if (tl === nl || s.toLowerCase() === nl) return 3;
+    if (wordRe.test(tl)) return 2;
+    if (tl.includes(nl)) return 1;
+    return 0;
+  };
+  // 正文定义行兜底:definition 形态(function/const/class/interface/type/enum/namespace/缩进方法)后跟本名
+  const escName = esc(name);
+  const DEF_RE = new RegExp(
+    `(?:function\\s+\\*?\\s*|(?:const|let|var)\\s+|(?:abstract\\s+)?class\\s+|(?:interface|type|enum)\\s+|namespace\\s+)${escName}\\b` +
+    `|^\\s{0,2}(?:async\\s+)?${escName}\\s*\\([^;{=]*\\)\\s*\\{`,
+    'm',
+  );
+  const byFile = new Map();
+  chunks.forEach((c, i) => {
+    const r = rankOf(c.y) || (DEF_RE.test(String(c.t || '')) ? 2 : 0);
+    if (!r) return;
+    const g = byFile.get(c.p);
+    if (!g) byFile.set(c.p, { p: c.p, s: c.s, e: c.e, rank: r, first: i, idxs: [i] });
+    else { g.s = Math.min(g.s, c.s); g.e = Math.max(g.e, c.e); g.rank = Math.max(g.rank, r); g.idxs.push(i); }
+  });
+  const groups = [...byFile.values()]
+    .sort((a, b) => b.rank - a.rank || a.first - b.first || a.p.localeCompare(b.p))
+    .slice(0, K);
+  if (!groups.length) {
+    if (AS_JSON) console.log(JSON.stringify({ mode: 'symbol', hits: [] }, null, 1));
+    else console.error(`[info] 符号 "${name}" 未命中(索引块的符号字段无匹配);可退回关键词检索: node search.mjs <关键词> --k 5`);
+    process.exit(0);
+  }
+  const kept = groups.flatMap(g => g.idxs);
+  // rank=2(正文定义兜底)时块的 y 是别的符号,展示查询名才不误导
+  const symLabel = (g) => (g.rank === 2 ? name : String(chunks[g.first].y || ''));
+  let toolOutput;
+  if (AS_JSON) {
+    toolOutput = JSON.stringify({ mode: 'symbol', hits: groups.map(g => ({
+      score: g.rank,
+      file: g.p,
+      lines: [g.s, g.e],
+      symbol: symLabel(g),
+    })) }, null, 1);
+  } else {
+    const label = { 3: 'exact', 2: 'word', 1: 'substr' };
+    const lines = [`# 符号: ${name}  (模式:symbol, 命中 ${groups.length} 处/${chunks.length} 块)`];
+    groups.forEach((g, r) => {
+      const y = symLabel(g);
+      lines.push('', `${r + 1}. [${label[g.rank]}] ${g.p}:${g.s}-${g.e}${y ? `  (${y})` : ''}`, `    ${snippet(chunks[g.first], name)}`);
+    });
+    toolOutput = lines.join('\n');
+  }
+  // 与关键词检索同通道入账:分母=命中块正文并集,分子=实际输出(Search 事件,源端盖章)
+  if (kept.length) {
+    const original = mergeHitBodies(chunks, kept);
+    try {
+      const { original: oTok, compressed: cTok } = await countInputTokensPair(original, toolOutput);
+      addInputSavings(oTok, cTok);
+      appendReadEvent({ at: Date.now(), session: sessionFromEnv(), kind: 'Search', file: `--symbol ${name}`.slice(0, 120), originalTokens: oTok, compressedTokens: cTok });
+    } catch (e) { console.error(`[warn] 输入 token 记账跳过(${e.message})`); }
+  }
+  if (AS_JSON) console.log(toolOutput);
+  else {
+    const { relay } = await assessModelStatus();
+    console.log(`${toolOutput}\n\n${relay}`);
+  }
+  process.exit(0);
+}
 
 // ---------- 语料选择(2026-11-11):签名过期 ≠ 不可检索 ----------
 // embeddings.bin 与 chunks.paired.jsonl 逐位置自洽(embed 写入时同批落盘),快照本身就是
@@ -388,9 +471,9 @@ async function rerankCandidates(query, pool, firstStage, chunks) {
 }
 
 // ---------- 输出 ----------
-function snippet(c) {
+function snippet(c, terms = query) {
   const body = c.t.split('\n').slice(1);
-  const lower = query.toLowerCase();
+  const lower = String(terms).toLowerCase();
   const hit = lower.split(/\s+/).filter(Boolean);
   let at = body.findIndex(ln => hit.some(h => ln.toLowerCase().includes(h)));
   if (at < 0) at = body.findIndex(ln => ln.trim() !== '');

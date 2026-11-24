@@ -126,7 +126,8 @@ export const DEFAULT_CONFIG = {
   jsonWhitelist: ['package.json', 'pages.json', 'manifest.json', 'tsconfig.json'],
   maxFileBytes: 800 * 1024,
   // Cursor 全量 Read 行数上限。超过 ×1.25 由 preToolUse 拦截;带 offset/limit 的区间读不受限。
-  readMaxLines: 500,
+  // 2026-11-24 下调 500→300:200-500 行中文件的全读改走语义区间(5 分钟重试/区间读兜底,摩擦面不变)。
+  readMaxLines: 300,
   chunk: { targetLines: 70, maxLines: 120, overlapLines: 10, minTail: 15 },
   // L2 样本库配额(2026-11-10 配置化;2026-11-14 起默认不限):
   //   capPerLabel=单类硬上限;totalCap=全库总预算。两者默认 0=不限。

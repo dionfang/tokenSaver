@@ -186,7 +186,7 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
-/** 预取总入口:返回 additionalContext 文本;null = 本次不注入。statePath 可注入以便测试密闭。 */
+/** 预取总入口:返回 additionalContext 文本;null = 本次不注入。同原话 10 分钟 sha 去重 + 同会话跨轮命中去重(2026-11-24)。statePath 可注入以便测试密闭。 */
 export function prefetchContext(payload, { chunksPath = path.join(DATA_DIR, 'chunks.jsonl'), configPath = path.join(DATA_DIR, 'code-index.config.json'), statePath = path.join(DATA_DIR, '.prefetch-last.json'), claimsPath = path.join(DATA_DIR, 'usage', 'prefetch-claims.jsonl') } = {}) {
   const cfg = readJson(configPath) || {};
   const pc = cfg.prefetch && typeof cfg.prefetch === 'object' ? cfg.prefetch : {};
@@ -209,22 +209,38 @@ export function prefetchContext(payload, { chunksPath = path.join(DATA_DIR, 'chu
     .filter(c => !chunkFileMissing(c, cfg.roots))
     .slice(0, k);
   if (!hits.length) return null;
-  try { fs.writeFileSync(statePath, JSON.stringify({ sha, at: Date.now() })); } catch { /* 记不上就不去重 */ }
   const merged = mergeHitRanges(hits);
+  const session = String(payload.sessionId || payload.session_id || payload.conversation_id || '');
+  // 跨轮命中去重(2026-11-24):续接轮换话但命中相同 → 只注入新增区间/压缩标记,省注入体积。
+  // 仅同会话去重("见上轮注入"的指针跨会话无意义);30 分钟窗口防上下文压缩后上文丢失;
+  // 重复占比 ≥0.6 才压(部分新增照常注入);prefetch.dedupHits=false 关闭。
+  const keyOf = (r) => `${r.p}:${r.s}-${r.e}`;
+  let emitted = merged;
+  if (pc.dedupHits !== false && prev && prev.session === session && Array.isArray(prev.hitList)
+    && prev.hitList.length && Date.now() - Number(prev.at || 0) < 30 * 60 * 1000) {
+    const prevKeys = new Set(prev.hitList.map(keyOf));
+    const repeats = merged.filter(r => prevKeys.has(keyOf(r)));
+    if (repeats.length && repeats.length / merged.length >= 0.6) emitted = merged.filter(r => !prevKeys.has(keyOf(r)));
+  }
+  try { fs.writeFileSync(statePath, JSON.stringify({ sha, at: Date.now(), session, hitList: merged })); } catch { /* 记不上就不去重 */ }
+  if (!emitted.length) {
+    return `[code-index] 索引命中与上轮相同(${merged.length} 处,区间见上轮注入;文件未变时仍有效,不必再检索)`;
+  }
   // 预取免读候选 claim(PU-002 A,2026-11-18):只登记不入账;同会话后续 read-guard 拦截同文件
   // 才转正(证实 agent 有整读意图而被免),转正时 guard 让位不双计,compressed=预取实际注入量。
-  // 未证实的 claim 7 天过期丢弃(归因强、量小,不虚高)。
+  // 未证实的 claim 7 天过期丢弃(归因强、量小,不虚高)。压缩轮只按实际注入的区间登记。
   try {
-    const session = String(payload.sessionId || payload.session_id || payload.conversation_id || '');
     if (session) {
       const byFile = new Map();
-      for (const c of merged) { const arr = byFile.get(c.p) || []; arr.push(c); byFile.set(c.p, arr); }
+      for (const c of emitted) { const arr = byFile.get(c.p) || []; arr.push(c); byFile.set(c.p, arr); }
       for (const [p, group] of byFile) {
         appendPrefetchClaim({ at: Date.now(), session, file: p, injectedTokens: Math.ceil(Buffer.byteLength(formatHits(group)) / 4) }, claimsPath);
       }
     }
   } catch { /* claim 登记失败不影响注入 */ }
-  return `[code-index] 与提问相关的索引命中(直接按行号区间读,不必再检索):\n${formatHits(merged)}`;
+  let out = `[code-index] 与提问相关的索引命中(直接按行号区间读,不必再检索):\n${formatHits(emitted)}`;
+  if (emitted.length < merged.length) out += `\n(另有 ${merged.length - emitted.length} 处与上轮重复,已省略——见上轮注入)`;
+  return out;
 }
 
 // ---------- 主流程 ----------
