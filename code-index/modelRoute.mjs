@@ -1330,6 +1330,8 @@ async function cli(argv) {
     } catch { /* 无账本 → 全零报表 */ }
     const total = rows.length;
     const convs = new Map();
+    // 缓存命中率分母=总输入(B1,2026-11-24):OpenAI/Responses 方言行 inTok 已含命中,须按 inputSplit 拆分后再加,不重复计
+    const { inputSplit } = await import('./costProfile.mjs'); // 查询端按需加载,不给路由模块加静态依赖边
     let switched = 0, escalated = 0, cacheRead = 0, inputSum = 0, cacheRows = 0;
     for (const r of rows) {
       if (r.switched === true) switched += 1;
@@ -1337,8 +1339,9 @@ async function cli(argv) {
       if (r.conv != null) convs.set(r.conv, (convs.get(r.conv) || 0) + 1);
       if (r.cacheReported === true) {
         cacheRows += 1;
-        cacheRead += Number(r.cacheRead) || 0;
-        inputSum += (Number(r.inTok) || 0) + (Number(r.cacheRead) || 0);
+        const s = inputSplit(r);
+        cacheRead += s.hit;
+        inputSum += s.miss + s.hit + s.cw;
       }
     }
     console.log(JSON.stringify({

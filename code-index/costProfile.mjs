@@ -340,6 +340,7 @@ const pct = (arr, q) => {
  * 几十万 K 不等——直接取 equiv 的 p50 会得到"冷 0.0004M < 热 0.047M"这种**尺寸混杂的假结论**。
  * 故按 contextM = (inTok+cacheRead+cacheWrite)/1e6 归一(perM = equivM / contextM),
  * 再与锚点 0.23/1.00 直接可比;contextM < minContextM 的请求固定开销占比过大,剔除不参与复核。
+ * 账本行若为 OpenAI/Responses 方言(inTokInclCache=true,inTok 已含缓存命中),经 inputSplit 拆分后与本式同口径(B1)。
  * tierOf 由调用方注入(modelRoute.tierOfModel),避免本模块依赖路由模块造成循环引用。
  */
 export function fitFromLedger({ rows = [], tierOf = null, minContextM = 0.05 } = {}) {
@@ -350,12 +351,13 @@ export function fitFromLedger({ rows = [], tierOf = null, minContextM = 0.05 } =
   for (const r of rows) {
     const inTok = Number(r.inTok), outTok = Number(r.outTok), cr = Number(r.cacheRead), cw = Number(r.cacheWrite);
     if (![inTok, outTok, cr, cw].every(Number.isFinite)) continue;
-    const contextM = (inTok + cr + cw) / 1e6;
+    const s = inputSplit(r); // B1:OpenAI/Responses 方言行 inTok 含命中段,先拆成 未命中/命中/缓存写 再算
+    const contextM = (s.miss + s.hit + s.cw) / 1e6;
     if (!(contextM > 0)) continue;
     if (contextM < minContextM) { droppedBySize += 1; continue; }
-    const cache = cr > 0 ? 'hot' : 'cold';
+    const cache = s.hit > 0 ? 'hot' : 'cold';
     const tier = (r.tier && TIERS.includes(r.tier)) ? r.tier : (tierOf ? tierOf(r.served || r.target || '') : null) || 'unknown';
-    const equivM = (inTok + cr * p.implicit.hitDiscount + cw * p.explicit.createDiscount) / 1e6;
+    const equivM = (s.miss + s.hit * p.implicit.hitDiscount + s.cw * p.explicit.createDiscount) / 1e6;
     used += 1;
     const key = `${tier}|${cache}${r.switched ? '|switch' : ''}`;
     const g = groups.get(key) || { key, tier, cache, switched: !!r.switched, vals: [], ctx: [] };
@@ -409,17 +411,35 @@ export function loadModelPrices({ dataDir = null, file = null } = {}) {
 }
 
 /**
+ * 账本行输入三段拆分(单源,B1 2026-11-24):同一笔流量两种方言的 inTok 含义相反——
+ *   OpenAI/Responses 方言:inTok=总输入(prompt_tokens/input_tokens),cacheRead 是它的**子集**;
+ *   Anthropic 方言:inTok=未命中输入(input_tokens),cacheRead/cacheWrite 是**另加**的量。
+ * 账本行以 inTokInclCache 标记前者(代理 openaiGrab 置位);旧行无标记按 Anthropic 语义
+ * (历史 OpenAI/Responses 方言行 cached_tokens 均为 0,两种语义等价)。
+ * 计价/上下文统计一律先拆分再算:未命中 miss × 输入价 + 命中 hit × 缓存读价 + 缓存写 cw × 缓存写价;
+ * 总输入 = miss + hit + cw。inTok 字段本身照上游原样保留,不改写。
+ */
+export function inputSplit(row = {}) {
+  const pos = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+  const total = pos(row.inTok);
+  const hit = pos(row.cacheRead);
+  return { miss: row.inTokInclCache === true ? Math.max(0, total - hit) : total, hit, cw: pos(row.cacheWrite) };
+}
+
+/**
  * 一行账本 → 该请求实际费与 R3 基准费(元)。四段计价:输入 + 缓存写(cacheWrite 键,缺省按 input 计)
  * + 缓存读 + 输出,价格按**难度档位**取
  * (费率表 tiers 段;档位=账本 tier 字段,sticky 轮缺 tier 时按模型名 tierOf 推档)。
  * 基准费率 = R3 = 1x(2026-11-06 用户定档):base 段按 R3 单价计,rate=实际费÷基准费即"综合倍率"。
+ * 输入段经 inputSplit 拆分(B1):OpenAI/Responses 方言行 inTok 含缓存命中,命中部分只按缓存读价计一次。
  * token 全缺/为 0 的行(失败请求)返回 null(不入分子分母);无表/无档 → null。
  */
 export function rowCost({ row = {}, priceTable = null, tierOf = null } = {}) {
   const tiers = priceTable?.tiers;
   if (!tiers) return null;
-  const inTok = Number(row.inTok), cr = Number(row.cacheRead), cw = Number(row.cacheWrite), out = Number(row.outTok);
-  const hasTokens = [inTok, cr, out].some((v) => Number.isFinite(v) && v > 0);
+  const s = inputSplit(row);
+  const out = Number(row.outTok);
+  const hasTokens = [s.miss, s.hit, out].some((v) => v > 0);
   if (!hasTokens) return null;
   const n = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
   // 计价轴(2026-11-06 修 37% 错配账):优先实弹服务档(servedTier 字段,代理 2026-11-06 起落账本)——
@@ -435,8 +455,8 @@ export function rowCost({ row = {}, priceTable = null, tierOf = null } = {}) {
   const m = 1e6;
   const cwP = price.cacheWrite ?? price.input;
   const cwB = baseTier.cacheWrite ?? baseTier.input;
-  const actual = (n(inTok) * price.input + n(cw) * cwP + n(cr) * price.cacheRead + n(out) * price.output) / m;
-  const base = (n(inTok) * baseTier.input + n(cw) * cwB + n(cr) * baseTier.cacheRead + n(out) * baseTier.output) / m;
+  const actual = (s.miss * price.input + s.cw * cwP + s.hit * price.cacheRead + n(out) * price.output) / m;
+  const base = (s.miss * baseTier.input + s.cw * cwB + s.hit * baseTier.cacheRead + n(out) * baseTier.output) / m;
   return { actual, base, tier };
 }
 
@@ -459,9 +479,10 @@ export function blendedRate({ rows = [], priceTable = null, tierOf = null } = {}
     reqs += 1;
     actual += c.actual;
     base += c.base;
+    const s = inputSplit(row);
     const t = byTier[c.tier] = byTier[c.tier] || { reqs: 0, tokens: 0 };
     t.reqs += 1;
-    t.tokens += (Number(row.inTok) || 0) + (Number(row.cacheRead) || 0) + (Number(row.outTok) || 0);
+    t.tokens += s.miss + s.hit + (Number(row.outTok) || 0); // 总输入(按方言拆分后同口径,B1)+ 输出
   }
   return {
     rate: base > 0 ? Number((actual / base).toFixed(3)) : null,

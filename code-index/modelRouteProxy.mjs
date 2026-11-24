@@ -15,8 +15,9 @@
  * 协议感知选上游(2026-11-24):上游端点形态由**入站请求路径**决定(baseUrl+suffix 原样转发,报文按入站协议发),
  * 而快照此前丢弃了客户端声明的协议字段(死字段 anthropic: 只是 URL 后缀启发式、生产代码从不读)——
  * 混用协议时会把 anthropic 报文发给只懂 OpenAI 的上游(供应商侧 404/400 硬失败,裸 4xx 不冷却不重选)。
- * 现快照逐供应商带 protocols(来源=客户端自定义条目的 API 格式字段:ZCode config.api.type / Qoder 条目 protocol;
- * []=未知→宽松不筛,兼容旧快照),派生链与入口兜底都按入站协议筛;**不做报文互译**(上游须与入站同协议)。
+ * 现快照逐供应商带 protocols(来源=客户端自定义条目的 API 格式字段:ZCode config.api.type / Qoder 条目 protocol)。
+ * auto 激活段只收明确同协议供应商([]=未知也排除),首个干净成功按入站协议建段锁;显式模型无损请求仍可桥接,
+ * 含有损内容时退回同协议。auto 永不转信封。
  *
  * 链条目钉死供应商(2026-11-24):派生链条目 = `modelId@providerId`,同名模型挂多家时**各家各自入链**
  * (次序 providerPriority→宿主UI拖动序→providerId),冷却/配额尽自然滑到下一家的同名模型。
@@ -182,6 +183,9 @@ export function coolTtlMs(kind) {
 // 且永不回收,理论上跨会话碰撞、且长跑进程里单调累积(H6)。
 const PHASE_IDLE_MS = 30 * 60 * 1000;
 const PHASE_MAX = 200;
+// auto 段锁只在显式模型请求/代理重启时主动结束;24h 无活动视为会话已废弃,避免长跑进程无限累积。
+const AUTO_LOCK_IDLE_MS = 24 * 60 * 60 * 1000;
+const AUTO_LOCK_MAX = 1000;
 
 // ---------- 协议适配层 ----------
 // 适配器契约(全部为纯函数/纯数据变换,不碰网络):
@@ -196,8 +200,11 @@ const PHASE_MAX = 200;
 //   grabUsage(sseData, acc)         流式:从一条解析后的 SSE data 对象提取用量/实际模型入 acc
 //   grabBodyUsage(bodyObj, acc)     非流式:从整包响应体提取用量/实际模型入 acc
 //   countToolErrors(messages)       证据升级(P2):最后一条 user 消息里 is_error 的 tool_result 数(本轮新到的报错)
-// acc 为归一化累积器 {inTok,outTok,cacheRead,cacheWrite,cacheReported,usageRaw,served},
-// 落账字段名与 proxy-usage.jsonl 消费端约定,不随协议变。
+// acc 为归一化累积器 {inTok,outTok,cacheRead,cacheWrite,inTokInclCache,cacheReported,usageRaw,served},
+// 落账字段名与 proxy-usage.jsonl 消费端约定,不随协议变。**inTok 的含义随上游方言**(B1,2026-11-24):
+// OpenAI/Responses 方言 inTok=总输入(含缓存命中,cacheRead 是它的子集,inTokInclCache=true);
+// Anthropic 方言 inTok=未命中输入(cacheRead/cacheWrite 是另加的量)。字段值一律照上游原样记、不改写;
+// 计价/统计端用 costProfile.inputSplit 按标记拆分,不得把 cacheRead 当成 inTok 之外的追加量。
 
 /** Anthropic Messages 协议适配器(ZCode 现网路径,行为与重构前逐字节一致)。 */
 /** 剥离宿主注入的 <system-reminder>…</system-reminder> 样板块:难度/L1 分类只应看用户真实提问,
@@ -566,6 +573,7 @@ function openaiGrab(u, acc) {
     || (u.input_tokens_details && typeof u.input_tokens_details === 'object' && 'cached_tokens' in u.input_tokens_details)
     || 'cache_read_input_tokens' in u || 'cache_creation_input_tokens' in u) acc.cacheReported = true;
   acc.inTok = num(u.prompt_tokens) ?? num(u.input_tokens) ?? acc.inTok;
+  acc.inTokInclCache = true; // OpenAI/Responses 语义:inTok=总输入,cacheRead 是其子集(B1;计价端 inputSplit 拆分)
   acc.outTok = num(u.completion_tokens) ?? num(u.output_tokens) ?? acc.outTok;
   acc.cacheRead = num(u.prompt_tokens_details?.cached_tokens) ?? num(u.input_tokens_details?.cached_tokens) ?? num(u.cache_read_input_tokens) ?? acc.cacheRead;
   acc.cacheWrite = num(u.cache_creation_input_tokens) ?? acc.cacheWrite;
@@ -648,7 +656,7 @@ export function pickProtocolAdapter(url) {
 
 const ADAPTER_BY_NAME = Object.fromEntries(PROTOCOL_ADAPTERS.map((a) => [a.name, a]));
 
-// ---------- 协议桥(2026-11-24 用户定:auto 池不限协议;跨协议选型在此转信封) ----------
+// ---------- 协议桥(仅显式模型;auto 连续激活段恒走严格同协议透传) ----------
 // 红线(用户定):**上下文输入/输出逐字保真** —— 系统提示、每轮消息、工具定义与参数、工具结果、
 // 模型输出 token 全部原样搬运;桥只换信封(路径/鉴权头/字段名/事件名),不改写内容。
 // fail-closed(用户定):thinking 块 / is_error 工具结果 / cache_control / 多模态块无法跨协议无损
@@ -907,6 +915,50 @@ export function lastHumanText(messages) { return anthropicAdapter.lastHumanText(
 /** 会话键:协议材料串 → hash 入 2^24 桶。 */
 export function convKeyOf(bodyObj, reqUrl = '', adapter = anthropicAdapter) {
   return Math.abs(hash(adapter.convKeyMaterial(bodyObj, reqUrl))) % 0xffffff;
+}
+
+/**
+ * auto 激活段键:跨协议端点识别同一会话,不含 req.url。
+ * 优先采用客户端显式会话 ID(请求体/元数据/常见头);没有时用 host+首条用户文本+系统提示回退。
+ * 回退是启发式键,两个会话若首轮材料完全相同会碰撞;此时宁可拒绝换协议,也不静默桥接。
+ */
+export function autoSegmentKeyOf(bodyObj, { host = '', adapter = anthropicAdapter, headers = {} } = {}) {
+  const h = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
+  // Qoder 自定义供应商使用无前缀的 session-id;ZCode 使用 x-session-id。
+  const headerId = ['session-id', 'x-session-id', 'x-conversation-id', 'x-qoder-session-id', 'x-zcode-session-id', 'x-code-index-session-id']
+    .map((k) => h[k]).find((v) => typeof v === 'string' && v.trim());
+  const id = [bodyObj?.session_id, bodyObj?.sessionId, bodyObj?.conversation_id, bodyObj?.conversationId,
+    bodyObj?.metadata?.session_id, bodyObj?.metadata?.sessionId, bodyObj?.metadata?.conversation_id, bodyObj?.metadata?.conversationId,
+    headerId].find((v) => typeof v === 'string' && v.trim());
+  if (id) return `auto:${Math.abs(hash(`${host}|id|${id.trim()}`)) % 0xffffff}`;
+  const msgs = typeof adapter?.messagesOf === 'function' ? adapter.messagesOf(bodyObj) || [] : [];
+  const first = msgs.find((m) => m && m.role === 'user');
+  const sys = adapter?.name === 'openai-responses' ? String(bodyObj?.instructions || '')
+    : (adapter?.name === 'anthropic' ? textOf(bodyObj?.system)
+      : textOf(msgs.find((m) => m && (m.role === 'system' || m.role === 'developer'))?.content));
+  return `auto:${Math.abs(hash(`${host}|fallback|${textOf(first?.content)}|${sys}`)) % 0xffffff}`;
+}
+
+/** auto 严格同协议池:只保留明确声明该协议的供应商;未知协议不兜底(显式模型仍走旧宽松口径)。 */
+export function upstreamsForAutoProtocol(upstreams, protocol) {
+  if (!protocol) return upstreams;
+  const providers = {};
+  for (const [id, p] of Object.entries(upstreams?.providers || {})) {
+    const list = Array.isArray(p?.protocols) ? p.protocols.map(String) : [];
+    if (list.includes(protocol)) providers[id] = p;
+  }
+  const ingress = (Array.isArray(upstreams?.ingress) ? upstreams.ingress : []).filter((id) => providers[id]);
+  return { ...(upstreams || {}), providers, ingress };
+}
+
+/** auto 段锁收尾:仅同一 generation 能修改;显式模型清锁后,旧在途 auto 成功不得复活锁。 */
+function settleAutoProtocolLock(locks, key, generation, success, now = Date.now()) {
+  const cur = locks.get(key);
+  if (!key || !cur || cur.generation !== generation) return false;
+  cur.pending = Math.max(0, Number(cur.pending || 0) - 1);
+  if (success) { cur.established = true; cur.at = now; }
+  else if (!cur.established && cur.pending === 0) locks.delete(key);
+  return cur.established === true;
 }
 
 /** 阶段表回收:空闲超限删除,超量按最旧淘汰。 */
@@ -1598,7 +1650,7 @@ export function forward(clientRes, upstream, suffix, bodyObj, reqMeta, adapter =
       let headSent = false;
       const held = [];
       const sendHead = () => { if (!headSent) { headSent = true; clientRes.writeHead(up.statusCode, headers); } };
-      const acc = { inTok: null, outTok: null, cacheRead: null, cacheWrite: null, cacheReported: null, usageRaw: null, served: null };
+      const acc = { inTok: null, outTok: null, cacheRead: null, cacheWrite: null, inTokInclCache: false, cacheReported: null, usageRaw: null, served: null };
       let buf = '';
       let sbuf = '';
       // 客户端中断(点停止/关窗/超时):上游还在逐 token 生成就是按量白付费——立即拆连接并留痕
@@ -1703,6 +1755,7 @@ function logProxyUsage(rec, usageFile = PROXY_USAGE_LOG, configPath = null) {
 export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE, basePath = '/apps/anthropic', chainsOverride = null, usageFile = PROXY_USAGE_LOG, healthDataDir = DATA_DIR, configPath = path.join(DATA_DIR, 'code-index.config.json'), l2Override = null } = {}) {
   // chainsOverride:测试注入的四档位链(生产恒走快照派生)
   const state = new Map(); // convKey → {model,baseRequested,humanTurns}:升档阶段驻留(#1/#5 阶段粘住)
+  const autoProtocolLocks = new Map(); // autoSegmentKey → {protocol,generation,pending,established,at};独立于阶段状态
   const sessionL2 = { embedFn: undefined, vectors: undefined }; // L2 融合票缓存(懒初始化:首次 L2 票时挂 embedFn/vectors;l2Live 恒开)
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -1726,21 +1779,60 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       if (!bodyObj && /(messages|responses)/.test(req.url)) { try { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'invalid JSON body' } })); } catch { /* 已断开 */ } return; } // S12-3:messages/responses 端点非 JSON 400(其余路径仍透传)
 
       const adapter = bodyObj ? pickProtocolAdapter(req.url) : null;
-      // 入站协议(2026-11-24):上游端点形态由入站路径决定,故选上游/派生链都要按入站协议筛;
-      // 非对话端点(adapter=null)不筛(透传)。
-      const inboundProtocols = adapter && adapter.name ? [adapter.name] : null;
-      // fail-closed 内容检测(2026-11-24 用户定):含不可跨协议无损映射内容的请求,池子退回同协议;
-      // 无损请求池子全协议(跨协议由桥转信封)。
-      const lossy = bodyObj ? scanLossy(bodyObj) : null;
-      const hasLossy = !!(lossy && (lossy.thinking || lossy.isError || lossy.cacheControl || lossy.multimodal));
-      const poolProtocols = hasLossy ? inboundProtocols : null;
-      const convKey = convKeyOf(bodyObj, req.url, adapter || anthropicAdapter);
-      prunePhases(state); // 空闲超限/超量的阶段先回收(H6)
       // 动态显示名规范化(2026-11-07):客户端条目名可为 "auto×0.189" 形态(综合费率后缀,由
       // refreshAutoModelName 写入用户级配置),入口统一剥后缀回纯 'auto' 再走全链——
       // 下游 isAuto 严格匹配/账本口径零改动保持连续;非 auto 系名字原样透传。
-      if (bodyObj && isAutoModelName(bodyObj.model)) bodyObj.model = normalizeAutoModel(bodyObj.model);
+      const isAutoRequest = !!(bodyObj && isAutoModelName(bodyObj.model));
+      if (isAutoRequest) bodyObj.model = normalizeAutoModel(bodyObj.model);
       const requestedModel = bodyObj?.model || ''; // 改写前先留存:账本要能对出"客户端要什么/实际谁服务"
+      // 入站协议(2026-11-24):上游端点形态由入站路径决定;非对话端点(adapter=null)不筛(透传)。
+      const inboundProtocols = adapter && adapter.name ? [adapter.name] : null;
+      const lossy = bodyObj ? scanLossy(bodyObj) : null;
+      const hasLossy = !!(lossy && (lossy.thinking || lossy.isError || lossy.cacheControl || lossy.multimodal));
+      // auto 永远同协议透传;只有显式模型保留无损请求跨协议桥接能力。
+      const poolProtocols = isAutoRequest ? inboundProtocols : (hasLossy ? inboundProtocols : null);
+      const routeUpstreams = isAutoRequest && adapter ? upstreamsForAutoProtocol(upstreams, adapter.name) : upstreams;
+      const convKey = convKeyOf(bodyObj, req.url, adapter || anthropicAdapter);
+      prunePhases(state); // 空闲超限/超量的阶段先回收(H6)
+      prunePhases(autoProtocolLocks, Date.now(), { idleMs: AUTO_LOCK_IDLE_MS, max: AUTO_LOCK_MAX });
+      let autoSegmentKey = null;
+      let autoLockGeneration = null;
+      if (adapter) {
+        const segmentKey = autoSegmentKeyOf(bodyObj, { host: reqHost, adapter, headers: req.headers });
+        if (isAutoRequest) {
+          autoSegmentKey = segmentKey;
+          const locked = autoProtocolLocks.get(segmentKey);
+          if (locked && locked.protocol !== adapter.name) {
+            const why = `auto 激活段协议已锁定为 ${locked.protocol},当前入站为 ${adapter.name};请先选择显式模型结束本段,再重新启用 auto`;
+            logProxyUsage({
+              ts: Date.now(), conv: convKey, path: req.url, host: reqHost,
+              requested: requestedModel, served: null, target: null, provider: null, resolvedProvider: null,
+              status: 409, reason: `auto-protocol-conflict:${why}`, switched: false, routeMode: 'tier',
+              autoProtocol: adapter.name, autoSegment: segmentKey, autoProtocolLocked: true, protocolBridge: null,
+              bodyBytes: size, durationMs: 0,
+            }, usageFile, configPath);
+            try { res.writeHead(409, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'auto_protocol_locked', message: why } })); } catch { /* 客户端已断开 */ }
+            return;
+          }
+          if (locked) {
+            autoLockGeneration = locked.generation;
+            locked.pending = (Number(locked.pending) || 0) + 1;
+            locked.at = Date.now();
+          } else {
+            // 首个成功请求才正式建锁;pending 占位只防止并发首轮跨协议各自成功。
+            autoLockGeneration = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+            autoProtocolLocks.set(segmentKey, { protocol: adapter.name, generation: autoLockGeneration, pending: 1, established: false, at: Date.now() });
+            // 重新定档(P3-2,2026-11-24 用户裁定「重新 auto 应重新定档」):新 auto 段首轮清掉本会话档位相位,
+            // 不继承显式模型段留下的 sticky/上梯钉。必须在"建锁"这支清,不能在显式清锁那支清——显式请求随后
+            // 自己的路由还会写回相位;只有新 auto 段开始(锁不存在)时清,才能让 auto 首轮重新难度定档。
+            // 连续 auto 段(锁已存在)不走这支,sticky/阶段粘住照常。全新会话此处相位本就为空,delete 为无操作。
+            state.delete(convKey);
+          }
+        } else {
+          // 显式模型阶段不属于 auto 段:立即清锁,旧在途 auto 请求凭 generation 失效,不能复活。
+          autoProtocolLocks.delete(segmentKey);
+        }
+      }
       let targetModel = requestedModel;
       let decision = { reason: 'passthrough' };
       let would = null;
@@ -1947,7 +2039,10 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         }
         // 证据升级(P2,逐级上梯):连续 2 个工具轮含报错 tool_result → 申请上梯;
         // 目标档=当前服务档+1(decideTarget 内定,封顶 R3),上梯成功后 errStreak 清零重新积累
-        const phase0 = state.get(convKey) || null;
+        const rawPhase0 = state.get(convKey) || null;
+        const phaseProvider0 = rawPhase0?.providerId ? routeUpstreams.providers?.[rawPhase0.providerId] : null;
+        // 旧阶段可能来自显式模型/已移除供应商;auto 只接受严格同协议池里仍可达的钉死模型。
+        const phase0 = isAutoRequest && rawPhase0?.model && (!phaseProvider0 || phaseProvider0.enabled === false || !phaseProvider0.apiKey || !(phaseProvider0.models || []).includes(rawPhase0.model)) ? null : rawPhase0;
         let errStreak = 0;
         let escalate = false;
         let eagerR3 = false; // P2 提前一拍(v2 2026-11-08):R2 难度第 1 次报错即上 R3,见下方工具轮块
@@ -1972,16 +2067,16 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         }
         roundErrStreak = errStreak;
         // 四档链(同一份快照按 tierOfModel 分桶,档内品牌优先序+档位序数排序;chainsOverride=测试注入的档位链)
-        const tierChains = chainsOverride || deriveTierChains(upstreams, { brandPriority: ro.brandPriority, modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes, providerPriority: ro.providerPriority, providerOrder, protocols: poolProtocols });
+        const tierChains = chainsOverride || deriveTierChains(routeUpstreams, { brandPriority: ro.brandPriority, modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes, providerPriority: ro.providerPriority, providerOrder, protocols: poolProtocols });
         retryCtx = { ro, tierChains, providerOrder }; // 留给运行时 429 同轮重选:重跑 resolveTier 档内滑/降档
         // 健康/库存快照每轮读一次:实弹决策与难度裸解析审计共用(此前审计块各自重读一遍,同参数重复计算)
         const health0 = readHealth(healthDataDir);
-        const inventory0 = inventoryFromUpstreams(upstreams);
+        const inventory0 = inventoryFromUpstreams(routeUpstreams);
         const d = decideTarget({
           requestedModel: bodyObj.model, lastKind, diff: diffDecision,
           tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases,
           inventory: inventory0,
-          health: health0, upstreams,
+          health: health0, upstreams: routeUpstreams,
           phase: phase0, guard: switchGuard(configPath), contextBytes: size,
           errStreak, escalate, eagerR3, loopStreak,
           tierClassify: { modelTiers: ro.modelTiers, lightSuffixes: ro.lightSuffixes },
@@ -2020,14 +2115,14 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             const tr = resolveTier(diff.tier, {
               cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
               inventory: inventory0, health: health0,
-              reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+              reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams: routeUpstreams }),
             });
             // 歧义轮(置信≤0.5 的 R1)影子 A/B:只记"改判 R2"会解析到哪,不改实弹——攒数据再定策略
             const ambiguousR1 = diff.tier === 'R1' && Number(diff.confidence) <= RREF_AMB_CONF; // S1-F2(2026-11-17):歧义窗阈值取单源
             const amb = ambiguousR1 ? resolveTier('R2', {
               cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
               inventory: inventory0, health: health0,
-              reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+              reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams: routeUpstreams }),
             }) : null;
             // 短轮影子观察(2026-11-22 第一档,用户定档):确认句("好的/继续/对")记"继承上一档"会解析到哪
             // (inheritWouldTier/Model,R3/R4 均维持原档,不封顶 R2——与实弹续接闸同口径),用于和 tev1 arm1
@@ -2041,7 +2136,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
                 const inr = resolveTier(inheritWouldTier, {
                   cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
                   inventory: inventory0, health: health0,
-                  reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+                  reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams: routeUpstreams }),
                 });
                 inheritWouldModel = inr ? (inr.modelId || null) : null;
               }
@@ -2052,7 +2147,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
             const l2Down = l2DownWouldTierOf(diff.tier, l2KnnVote) ? resolveTier('R1', {
                 cfg: { modelRouting: { chains: tierChains, providerPriority: ro.providerPriority, providerOrder, aliases: ro.aliases } },
                 inventory: inventory0, health: health0,
-                reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+                reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams: routeUpstreams }),
               }) : null;
             logTierShadow({
               dataDir: healthDataDir, prompt: adapter.lastHumanText(routeMsgs),
@@ -2097,13 +2192,16 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       // 此前它被当普通模型名透传,上游回 404、按 config 族计入健康档案 failCount,白付一次往返还污染冷却。
       if (bodyObj && bodyObj.model === AUTO_MODEL) {
         const why = `${reqHost} 宿主的 auto 档解析不出真实模型(路由清单为空或全部冷却)`;
+        settleAutoProtocolLock(autoProtocolLocks, autoSegmentKey, autoLockGeneration, false);
         logProxyUsage({
           ts: started, conv: convKey, path: req.url, host: reqHost,
           requested: requestedModel, served: null, target: null, provider: null, resolvedProvider: null,
-          ingress: ingressProviders(upstreams).join(',') || null,
+          ingress: ingressProviders(routeUpstreams).join(',') || null,
           status: 502, reason: `auto-unresolved:${why}`, switched: false, routeMode,
+          autoProtocol: isAutoRequest ? adapter?.name || null : null, autoSegment: autoSegmentKey,
+          autoProtocolLocked: !!(autoSegmentKey && autoProtocolLocks.get(autoSegmentKey)?.established), protocolBridge: null,
           bodyBytes: size, durationMs: Date.now() - started,
-        }, usageFile);
+        }, usageFile, configPath);
         try {
           res.writeHead(502, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: { type: 'proxy_error', message: `${why};请检查 data/routing/proxy-upstreams.json 与 data/model-health.json` } }));
@@ -2123,7 +2221,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       const roSlide = retryCtx?.ro || { modelTiers: DEFAULT_MODEL_TIERS, lightSuffixes: DEFAULT_LIGHT_SUFFIXES };
       const slideTier = decision.tier || (targetModel ? tierOfModel(targetModel, { modelTiers: roSlide.modelTiers, lightSuffixes: roSlide.lightSuffixes }) : null);
       const canRetryRoute = rc.enabled && !!retryCtx && !!slideTier;
-      let curUpstream = pickUpstream({ providerId: decision.providerId, model: targetModel, upstreams, protocols: poolProtocols });
+      let curUpstream = pickUpstream({ providerId: decision.providerId, model: targetModel, upstreams: routeUpstreams, protocols: poolProtocols });
       let curModel = targetModel;
       let curBody = bodyObj ?? {};
       let attempts = 0;
@@ -2134,7 +2232,7 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       let curSlideTier = slideTier; // 渐进退避后的滑档起点(每次重解析后同步为实际落点,保证单调不回升)
       for (;;) {
         const allowRetry = canRetryRoute && attempts < rc.maxRetries;
-        // 协议桥(2026-11-24 用户定:auto 池不限协议):上游协议与入站不符时转信封——
+        // 协议桥(仅显式模型保留):上游协议与入站不符时转信封——
         // 路径/鉴权头/请求体按上游协议;内容(系统/消息/工具/工具结果)逐字搬运。
         // fail-closed 已在链层(S):含 thinking/is_error/cache_control/多模态的请求池子只留同协议。
         let fwdSuffix = suffix;
@@ -2143,6 +2241,13 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         let fwdMeta = meta;
         bridgeTag = null;
         const upProtos = Array.isArray(curUpstream?.protocols) ? curUpstream.protocols : [];
+        if (isAutoRequest && adapter && !upProtos.includes(adapter.name)) {
+          // 防御性 fail-closed:即使测试链/未来调用漏筛,auto 也绝不跨协议或把未知协议当同协议。
+          const why = `auto 仅同协议透传,上游协议 ${upProtos.join('/') || '未知'} 与入站 ${adapter.name} 不符`;
+          try { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'proxy_error', message: why } })); } catch { /* 客户端已断开 */ }
+          usage = { status: 502, bodyHead: why };
+          break;
+        }
         if (adapter && upProtos.length && !upProtos.includes(adapter.name)) {
           const target = ADAPTER_BY_NAME[upProtos[0]];
           const br = target ? bridgeRequest(adapter, target, curBody) : { fail: `未知上游协议:${upProtos.join('/')}` };
@@ -2194,13 +2299,13 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         try {
           const r = resolveTier(curSlideTier, {
             cfg: { modelRouting: { chains: retryCtx.tierChains, providerPriority: retryCtx.ro.providerPriority, providerOrder: retryCtx.providerOrder, aliases: retryCtx.ro.aliases } },
-            inventory: inventoryFromUpstreams(upstreams), health: readHealth(healthDataDir),
-            reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams }),
+            inventory: inventoryFromUpstreams(routeUpstreams), health: readHealth(healthDataDir),
+            reachable: ({ providerId, model }) => isProxyReachable({ providerId, model, upstreams: routeUpstreams }),
           });
           if (r && r.modelId) { nextModel = r.modelId; nextProvider = r.providerId; if (r.tier) curSlideTier = r.tier; }
         } catch { /* 重解析异常即无替代,走末次提交 */ }
         retryTrail.push({ attempt: attempts, failedProvider, failedModel: curModel, status: usage.status ?? null, cool: usage.cool || null, nextModel: nextModel || null, nextProvider: nextProvider || null });
-        const nextUpstream = nextModel ? pickUpstream({ providerId: nextProvider, model: nextModel, upstreams, protocols: poolProtocols }) : null;
+        const nextUpstream = nextModel ? pickUpstream({ providerId: nextProvider, model: nextModel, upstreams: routeUpstreams, protocols: poolProtocols }) : null;
         // 无替代 / 解析出的还是刚失败的那个 / 上游无 baseUrl → 把已缓冲的错误提交给客户端,结束
         if (!nextModel || (nextModel === curModel && nextProvider === failedProvider) || !nextUpstream?.baseUrl) {
           commitBufferedError(res, usage);
@@ -2226,18 +2331,23 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
       // 恢复中的模型不被历史失败放大冷却;失败透传/客户端错/netError 不清(无记录时 clearHealth 不写盘,热路径零开销)。
       // S12-A1(2026-11-11 夜审):清零前复算错误族——2xx 错误信封(api_error 类)刚在末次补记写入的冷却
       // 会被这里的 2xx 清零立即抹掉(P5 实证 cool=[]),信封体不算干净成功。
-      if (!usage?.retry && !usage?.netError && Number(usage?.status) >= 200 && Number(usage?.status) < 300 && curUpstream?.providerId && curModel
-          && !shouldCoolDown({ status: usage.status, bodyHead: usage.bodyHead || '' })) {
+      const cleanSuccess = !usage?.retry && !usage?.netError && Number(usage?.status) >= 200 && Number(usage?.status) < 300 && curUpstream?.providerId && curModel
+          && !shouldCoolDown({ status: usage.status, bodyHead: usage.bodyHead || '' });
+      if (cleanSuccess) {
         clearHealth({ dataDir: healthDataDir, modelKey: `${curUpstream.providerId}/${curModel}` });
       }
+      const autoProtocolLocked = isAutoRequest && adapter
+        ? settleAutoProtocolLock(autoProtocolLocks, autoSegmentKey, autoLockGeneration, cleanSuccess && !bridgeTag)
+        : false;
       logProxyUsage({
         ts: started, conv: convKey, path: req.url, host: reqHost,
         requested: requestedModel, served: usage.served || curModel,
         target: targetModel || requestedModel || null, // 决策改写目标(快照配置名,如 GLM-5.3-Flash;served 是网关回报的规范名,两者形态不同)
         provider: curUpstream?.providerId || null, // 实际拿到请求的供应商(审计"钉住没钉住";重试后为末次服务者)
         resolvedProvider: decision.providerId || null, // 档位链解析钉住的供应商(sticky 轮无解析=null;与 provider=实际服务者对照,此前读不存在的 resolvedProviderId 恒 null)
-        ingress: ingressProviders(upstreams).join(',') || null, // 入口供应商(客户端请求必经的账户)
+        ingress: ingressProviders(routeUpstreams).join(',') || null, // 入口供应商(auto 仅列严格同协议池)
         inTok: usage.inTok, outTok: usage.outTok, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite,
+        inTokInclCache: usage.inTokInclCache === true, // inTok 是否已含缓存命中(OpenAI/Responses 方言=true;计价端 inputSplit 据此拆分,B1)
         cacheReported: usage.cacheReported === true, // 上游是否回报缓存段(false=网关不报,不能据此判冷读)
         usageRaw: usage.usageRaw ? JSON.stringify(usage.usageRaw).slice(0, 400) : null,
         switched: decision.switched, reason: decision.reason,
@@ -2258,7 +2368,9 @@ export function createProxyServer({ port = 8117, upstreamsFile = UPSTREAMS_FILE,
         bodyBytes: size, cjkChars: countCjk(raw),
         cooled: cool || null, phaseTurns: state.get(convKey)?.humanTurns || 0,
         aborted: usage.aborted === true, // 客户端中断轮:上游已被拆除,本轮 outTok 只计到中断点
-        protocolBridge: bridgeTag, // 跨协议选型标记(null=同协议直通);2026-11-24
+        protocolBridge: bridgeTag, // auto 恒 null(同协议直通);显式模型仍可跨协议桥接
+        autoProtocol: isAutoRequest ? adapter?.name || null : null,
+        autoSegment: autoSegmentKey, autoProtocolLocked, // 连续 auto 段锁审计;显式模型请求不建锁
         durationMs: Date.now() - started,
       }, usageFile, configPath);
     });

@@ -190,6 +190,28 @@ export function migrateKnownAnnotations(cfgOld, annFile = KNOWN_ANNOTATIONS_PATH
   return { migrated: added, removedKey: true, total: Object.keys(cur).length };
 }
 
+/** 播种默认路由价格表(P2,2026-11-24):data/routing/model-prices.json 是 gitignored 本地资产、不随包,
+ *  全新安装(尤其复制部署不带 data/)缺它 → loadModelPrices 返回 null → auto 综合费率行与 rowCost/blendedRate
+ *  成本统计静默缺失(路由定档本身不受影响)。仅在缺失时写一份默认 tiers 代表价(R3=1x 基准),
+ *  已有则绝不覆盖(用户实际资费优先)。幂等;返回 {seeded, file, note?}。 */
+export function seedDefaultModelPrices({ dataDir = DATA_DIR } = {}) {
+  const file = path.join(dataDir, 'routing', 'model-prices.json');
+  if (fs.existsSync(file)) return { seeded: false, file, note: '已有价格表,不覆盖' };
+  const table = {
+    $说明: 'auto 综合费率表(init 播种的默认代表价,非实际资费):按四个难度档位计价,单位元/百万 tokens。请按所接供应商的实际资费编辑本文件,即时生效。每档 input/cacheRead/output 三段单价 + cacheWrite(缺省按 input 计)。轮的档位由代理定档决定。',
+    priceTableVersion: 2,
+    tiers: {
+      R1: { input: 2, cacheRead: 0.04, output: 8, cacheWrite: 2 },
+      R2: { input: 9, cacheRead: 0.3, output: 27, cacheWrite: 9 },
+      R3: { input: 20, cacheRead: 2, output: 100, cacheWrite: 20 },
+      R4: { input: 28.6, cacheRead: 2.86, output: 143, cacheWrite: 28.6 },
+    },
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(table, null, 2) + '\n');
+  return { seeded: true, file };
+}
+
 function posixAbs(p) {
   return path.resolve(p).split(path.sep).join('/');
 }
@@ -600,6 +622,7 @@ if (!configExisted || modelInArg) {
     // 2026-11-18 用户裁决(方案 A 客户端化,CLI 同口径):gpu 路径代写用户级 OLLAMA_MAX_LOADED_MODELS=5
     // 抬高并发驻留上限,防聊天模型挤入 LRU 逐走调用最稀疏的嵌入模型(keep_alive 24h 救不了 LRU)。
     // 幂等:已同值跳过;reg add 失败不阻断(提示手工);对已运行 Ollama 需重启生效(env 启动时读)。
+    // 卸载(uninit)保留此环境变量不回退——良性 Ollama 驻留调优、可能用户自设(见 uninit“不动”清单,P3 2026-11-24)。
     try {
       const KEY = 'OLLAMA_MAX_LOADED_MODELS', WANT = '5';
       if (process.platform === 'win32') {
@@ -1355,6 +1378,9 @@ if (!fs.existsSync(codeMapPath)) {
   fs.writeFileSync(codeMapPath, `# CODE_MAP —— 项目代码知识地图(由 agent 在深挖中持续维护)\n\n> 用法:先读本文获得全局背景 → node search.mjs 检索定位 → 按行区间精读。\n> 建议内容:项目架构图、核心链路、关键文件职责、已知问题速查。\n\n(模板生成于 ${new Date().toISOString().slice(0, 10)};请按项目实际逐步充实,knownAnnotations 同步沉淀)\n`);
   ok(`已生成 CODE_MAP 模板:${codeMapPath}(请逐步充实)`);
 }
+// 默认路由价格表(P2,2026-11-24):缺失才播种、已有不覆盖;auto 综合费率行与成本统计依赖它
+const mpSeed = seedDefaultModelPrices();
+if (mpSeed.seeded) ok(`已播种默认路由价格表:${mpSeed.file}(代表价,请按实际资费调整)`);
 log(`提示:项目资产都在 ${DATA_DIR} 目录下——配置 code-index.config.json、知识地图 CODE_MAP.md、索引 chunks.jsonl/index.json/vectors/(向量)。Ollama/local 模型权重不随本目录复制。`);
 // 结果框(2026-11-07 用户要求):顶部大字安装结果 + v2Dir 重要提示。
 // ZCode 数据存储路径可在其设置里修改,迁移是复制不是移动——旧 ~/.zcode/v2 文件仍在但不再更新,

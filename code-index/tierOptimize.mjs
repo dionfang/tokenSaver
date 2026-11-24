@@ -31,7 +31,7 @@ import { DATA_DIR } from './config.mjs';
 import { atomicWriteFileSync } from './proc.mjs';
 import { classifyDifficulty, TIER_LEXICON, termPresent, loadTierCalibration } from './tierClassify.mjs';
 import { reconcile, evidenceOf, tierIntervalOf } from './tierTruth.mjs';
-import { resolveCostProfile, policyCost, intervalPolicyCost, fitFromLedger, DEFAULT_COST_PROFILE } from './costProfile.mjs';
+import { resolveCostProfile, policyCost, intervalPolicyCost, fitFromLedger, DEFAULT_COST_PROFILE, inputSplit } from './costProfile.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FILES = {
@@ -760,13 +760,14 @@ export async function maybePromoteTier({ dataDir = DATA_DIR, lastRun = null, opt
   } catch (e) { return { state: 'failed', reason: String(e && e.message ? e.message : e) }; }
 }
 
-/** 账本行 → 每请求归一成本(M R1 等效,按上下文规模归一防尺寸混杂):等价输入价 × 档位倍率。 */
+/** 账本行 → 每请求归一成本(M R1 等效,按上下文规模归一防尺寸混杂):等价输入价 × 档位倍率。
+ *  输入段经 inputSplit 拆分(B1,2026-11-24):OpenAI/Responses 方言行 inTok 已含缓存命中,不再与 cacheRead 重复相加。 */
 function normalizedRowCost(r, profile, tierOf) {
-  const inTok = Number(r.inTok); const cr = Number(r.cacheRead); const cw = Number(r.cacheWrite);
-  if (![inTok, cr, cw].every(Number.isFinite)) return null;
-  const contextM = (inTok + cr + cw) / 1e6;
+  if (![r.inTok, r.cacheRead, r.cacheWrite].every((v) => Number.isFinite(Number(v)))) return null;
+  const s = inputSplit(r);
+  const contextM = (s.miss + s.hit + s.cw) / 1e6;
   if (!(contextM > 0.02)) return null;
-  const base = (inTok + cr * profile.implicit.hitDiscount + cw * profile.explicit.createDiscount) / contextM;
+  const base = (s.miss + s.hit * profile.implicit.hitDiscount + s.cw * profile.explicit.createDiscount) / contextM;
   let tier = TIERS.includes(r.tier) ? r.tier : null;
   if (!tier && tierOf) tier = tierOf(r.served || r.requested || '') || null;
   const mult = tier ? (profile.tierMultiplier[tier] ?? 1) : 1;

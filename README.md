@@ -9,7 +9,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 
 **模块一:省耗记账(Token Ledger)**——为代码库建语义检索索引,Agent 定位代码只读需要的区间;过长的整文件读取会被守卫改写为语义最相关区间,选不出才拒绝;每轮节约按 token 精确入账,会话状态句实时展示今日与累计。**Cursor、ZCode、Qoder 三端通用**。
 
-**模块二:动态模型路由(AutoTier)**——本地代理即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(R1-R4,以 R3=1x 为基准),贵模型只在必要时使用;自进化闭环持续降本。**仅 ZCode 与 Qoder 支持,且只对以自定义模型接入的供应商生效——接入协议不限(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses 均可),跨协议选型由代理转信封,上下文输入/输出逐字保真**。
+**模块二:动态模型路由(AutoTier)**——本地代理即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(R1-R4,以 R3=1x 为基准),贵模型只在必要时使用;自进化闭环持续降本。**仅 ZCode 与 Qoder 支持,且只对以自定义模型接入的供应商生效——供应商清单允许混合协议(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses),但连续 `auto` 激活段只同协议透传;显式模型请求保留跨协议桥接能力**。
 
 适合在本地代码库上用 Agent 开发。默认推荐**桌面客户端(托盘守护程序)**安装,无需命令行;纯命令行只是不装守护程序时的备选。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
 
@@ -30,6 +30,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 - 会话选 `auto` 虚拟模型即启用;每轮按难度定档 R1-R4,R1 为 sticky 基准,宽限/阶段粘住/切换税门控压低换档频率;短确认/短指令等续接轮沿用阶段档不拆阶段。
 - 定档链:词法底档(品牌三档表 + 轻量后缀降档)→ 本地判定模型双臂救回(R1 升 R2、R2 升 R3);R4 唯一入口=显式点名旗舰模型。费率以 R3=1x 为基准(R1≈0.05x / R2≈0.5x / R4≈3.6x),长期实测综合费率 ≈0.15x。
 - 上游 429/配额墙同轮滑链或降档;门控连续拦截满 3 次疲劳放行。
+- 协议边界:连续 `auto` 激活段只选协议标签明确匹配入站的供应商,不转信封;首个干净成功的 auto 请求按入站协议建锁,续接/重试/升档均留在锁内。同段改入口协议返回 409 且不打上游;显式模型请求立即结束 auto 段并清锁,之后重新启用 auto 按当时入站协议建锁并重新定档(不继承显式段留下的模型)。未知协议供应商不进 auto 池。
 - 自进化闭环:真实流量自动生长黄金集,每 6h 学习信号权重与门槛,折外过门控自动晋升,成本恶化自动回滚。
 - 生效条件与配置字段见「配置」的 modelRouting 段。
 
@@ -169,7 +170,7 @@ node init.mjs [--roots "<路径1>[,<路径2>...]"] [--set-roots "<路径1>[,<路
 | `tierOptimize` | 自进化闭环 `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`:enabled=true 后每 6h 学习权重与门槛 |
 | `blendNotice` | auto 综合费率行注入开关(默认 true);关=只停注入,记账照常 |
 
-生效范围:仅 ZCode/Qoder 两端;auto 只调度以**自定义模型**接入的供应商(接入协议不限,三种均可);模型分档按名字自动判定,两表都在 `modelTiers` / `lightSuffixes`,可改配置重排全链。
+生效范围:仅 ZCode/Qoder 两端;auto 只调度以**自定义模型**接入的供应商,清单可混合 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses,但连续 auto 激活段只同协议透传:首个干净成功锁定入站协议,续接/重试/升档不可跨越,改协议返回 409 不打上游,显式模型请求清锁。未知协议供应商不进 auto;显式模型请求保留跨协议桥接(有损内容 fail-closed)。模型分档按名字自动判定,两表都在 `modelTiers` / `lightSuffixes`,可改配置重排全链。
 
 ### 仓库模块
 
@@ -191,7 +192,7 @@ TokenSaver is a local agent productivity tool with two core feature modules.
 
 **Module 1: Token Ledger (省耗记账)** — builds a semantic search index over the codebase so the agent reads only the spans it needs; over-long full-file reads are rewritten to the closest semantic range, denied only when nothing fits; every turn's savings are accounted in tokens and shown live in the session status line. **Works on all three clients: Cursor, ZCode, and Qoder.**
 
-**Module 2: Dynamic Model Routing (AutoTier)** — the local proxy doubles as a custom-model endpoint and the client gains a virtual model tier `auto`; sessions that select it are dispatched across four difficulty tiers (R1-R4, with R3 = 1x as base), so expensive models run only when needed; a self-evolution loop keeps reducing cost. **ZCode and Qoder only, and only for providers wired in as custom models — the access protocol is unrestricted (Anthropic Messages / OpenAI Chat Completions / OpenAI Responses all work); cross-protocol picks get their envelope converted by the proxy with context input and output carried over verbatim.**
+**Module 2: Dynamic Model Routing (AutoTier)** — the local proxy doubles as a custom-model endpoint and the client gains a virtual model tier `auto`; sessions that select it are dispatched across four difficulty tiers (R1-R4, with R3 = 1x as base), so expensive models run only when needed; a self-evolution loop keeps reducing cost. **ZCode and Qoder only, and only for providers wired in as custom models — the provider inventory may mix protocols (Anthropic Messages / OpenAI Chat Completions / OpenAI Responses), but a continuous `auto` activation segment is same-protocol pass-through only; explicit-model requests retain cross-protocol bridging.**
 
 Built for agent-based development on local repositories. The **desktop client (tray guardian)** is the recommended install — no command line needed; the pure CLI is the fallback for when you prefer not to install the guardian. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
@@ -212,6 +213,7 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 - Selecting the `auto` virtual model enables it; each turn is tiered R1-R4, with R1 as the sticky base and grace / phase stickiness / a switch-tax gate damping tier changes. Short continuation turns keep the current phase tier instead of splitting a new phase.
 - Tiering chain: a lexical base tier (brand three-grade table + lightweight-suffix demotion) is rescued by the always-local judge model in two arms (R1 → R2, R2 → R3); R4 is never reached by auto-escalation — the only entry is explicitly naming a flagship model. Rates use R3 = 1x as base (R1≈0.05x / R2≈0.5x / R4≈3.6x), with the long-run blended rate measured at ≈0.15x.
 - Upstream 429 / quota walls trigger a same-turn chain slide or downgrade; the gate releases by fatigue after 3 consecutive blocks.
+- Protocol boundary: a continuous `auto` activation segment uses only providers explicitly tagged with the inbound protocol and never rewrites envelopes. The first clean auto success locks that segment to its inbound protocol; continuations, retries and upgrades stay inside it. An inbound-protocol change within the segment returns 409 without contacting an upstream. An explicit-model request ends the segment and clears the lock; re-enabling auto establishes a new lock from the then-current inbound protocol and re-grades from scratch (it does not inherit the explicit segment's model). Unknown-protocol providers are excluded from auto.
 - Self-evolution loop: real traffic grows the golden set automatically; every 6h weights and thresholds are learned, out-of-fold gate passing auto-promotes, and cost regressions auto-roll back.
 - Scope and config keys: see the `modelRouting` subsection under "Configuration" below.
 
@@ -351,7 +353,7 @@ The `modelRouting` section is scaffolded by init (`enabled` defaults to `true`),
 | `tierOptimize` | Self-evolution loop `{enabled, minIntervalMs, folds, minN, priorN, grow, fitCost, dry, allowBoost}`: with enabled=true, every 6h weights and thresholds are learned |
 | `blendNotice` | Injection switch for the auto blended-rate line (default true); off = stops the line, accounting continues |
 
-Scope: only ZCode/Qoder take part; auto dispatches only providers wired in as **custom models** (the access protocol is unrestricted — all three wire formats work); model tiering is derived from the name, and both tables live in `modelTiers` / `lightSuffixes` and re-derive the whole chain from config.
+Scope: only ZCode/Qoder take part; auto dispatches only providers wired in as **custom models**. The inventory may mix Anthropic Messages, OpenAI Chat Completions and OpenAI Responses, but a continuous auto activation segment is same-protocol and pass-through only: its first clean success locks the inbound protocol, continuations/retries/upgrades cannot cross it, a protocol change returns 409 without an upstream call, and an explicit-model request clears the lock. Unknown-protocol providers are excluded from auto; explicit-model requests retain cross-protocol envelope bridging with lossy-content fail-closed. Model tiering is derived from the name, and both tables live in `modelTiers` / `lightSuffixes` and re-derive the whole chain from config.
 
 ### Repository layout
 

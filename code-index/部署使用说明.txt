@@ -16,7 +16,7 @@ TokenSaver 部署使用说明
        ollama pull tev1:0.8b(决策判定)
 3. 动态模型路由(可选功能)仅 ZCode 与 Qoder 两个客户端支持;模型须以**自定义模型**
    接入(2026-11-24 起**不限接入协议**:Anthropic Messages / OpenAI Chat Completions /
-   OpenAI Responses 三种均可,跨协议选型由代理转信封,见三、配置说明)。
+   OpenAI Responses 三种均可;auto 激活段只同协议透传,跨协议桥接仅对显式模型保留,见三、配置说明)。
 
 ======================================================================
 二、安装介绍
@@ -94,18 +94,26 @@ TokenSaver 部署使用说明
        routing-log 三件事,不影响 auto 路由本身;人工改 false 原样保留)。
 
   接入要求与协议口径(2026-11-24):
-    唯一硬要求 = 以**自定义模型**接入;**接入协议不限**。自定义条目的 API 格式字段
+    唯一硬要求 = 以**自定义模型**接入;供应商清单允许混合协议。自定义条目的 API 格式字段
     = 协议标签真源——
       ZCode:api.type(anthropic-messages / openai-chat-completions / openai-responses);
       Qoder:条目 protocol(anthropic / openai)。
-    代理支持三种报文形态:Anthropic Messages / OpenAI Chat Completions / OpenAI Responses;
-    **auto 池不限协议**(2026-11-24 用户定):三种协议的供应商都进档位链,按品牌/档位正常排序。
-    跨协议选型时由代理**转信封**:路径/鉴权头/字段名/事件名按上游声明的协议;
-    **上下文输入/输出逐字保真**(系统提示/每轮消息/工具定义与参数/工具结果/模型输出不改一字)。
-    fail-closed:含 thinking 块 / is_error 工具结果 / cache_control / 多模态块的请求**不跨协议选型**
-    (池子退回同协议),绝不静默丢。
-    跨协议 + 客户端要流式:上游强制非流式,整包转换后合成 SSE(文本逐字,无增量打字机)。
-    标签未声明/未知 → 按全协议入池,但仍以入站协议寻址上游(能力和声明一致才通)。
+    代理支持三种报文形态:Anthropic Messages / OpenAI Chat Completions / OpenAI Responses。
+    **auto 连续激活段只允许同协议透传**(2026-11-24 用户定):只收协议标签明确包含
+    入站协议的供应商,按品牌/档位正常排序;不转信封,上下文原样转发。首个干净成功的
+    auto 请求以入站 adapter.name 正式建锁,auto 续接/工具轮/失败重试/证据升档均留在
+    锁协议内;首轮选中模型不是锁真源。首次失败不建锁;显式模型请求立即结束当前 auto
+    段并清锁,之后重新启用 auto 按当时入站协议建锁(不是整个会话终身锁),且首轮重新难度
+    定档,不继承显式段留下的模型钉。
+    同段内入口协议变化 → 本地 409(auto_protocol_locked),不打上游。锁仅在代理重启、
+    显式模型请求或连续 24h 无活动时回收,进程内最多 1000 条,超量淘汰最旧。
+    标签未声明/未知 → **不进 auto 池**。会话 ID 优先取请求体 session_id/metadata 或会话头
+    (ZCode 用 x-session-id、Qoder 用无前缀 session-id);无稳定会话 ID 时才按 host+首条用户
+    文本+系统提示归一回退,首轮材料完全相同的并发会话可能共用段锁。
+    **显式模型保留跨协议桥接**:无损请求可转信封(路径/鉴权头/字段名/事件名按上游
+    声明协议),系统提示/每轮消息/工具定义与参数/工具结果/模型输出不改一字。含 thinking
+    块 / is_error 工具结果 / cache_control / 多模态块的请求不跨协议选型(退回同协议),
+    绝不静默丢;跨协议+客户端流式时上游强制非流式,整包转换后合成 SSE。
 
   路由链粒度(2026-11-24):四档链的条目是 `模型@供应商`(钉死供应商)——
     同一模型挂多家时各家各自入链,次序按 providerPriority → 宿主 UI 拖动序(providerOrder);
@@ -209,9 +217,10 @@ TokenSaver deployment guide
        ollama pull sam860/qwen3-reranker:0.6b-F16
        ollama pull tev1:0.8b (decision judge)
 3. Dynamic model routing (optional) supports ZCode and Qoder only; models must be
-   wired in as **custom models** (since 2026-11-24 the protocol is unrestricted:
+   wired in as **custom models** (since 2026-11-24 the wiring protocol is unrestricted:
    Anthropic Messages / OpenAI Chat Completions / OpenAI Responses all work;
-   cross-protocol picks get their envelope converted by the proxy — see 3. Configuration).
+   cross-protocol envelope bridging is retained for explicit-model requests, while a
+   continuous auto segment is same-protocol pass-through only — see 3. Configuration).
 
 ======================================================================
 2. Installation
@@ -299,27 +308,37 @@ existing config is never overwritten):
         routing itself is unaffected; a manual false is preserved).
 
   Wiring requirement and protocol semantics (2026-11-24):
-    The only hard requirement is wiring in as a **custom model** — the access
-    protocol is unrestricted. The custom entry's API-format field is the protocol
-    label source of truth —
+    The only hard requirement is wiring in as a **custom model**; the provider inventory may
+    mix protocols. The custom entry's API-format field is the protocol label source of truth —
       ZCode: api.type (anthropic-messages / openai-chat-completions / openai-responses);
       Qoder: entry protocol (anthropic / openai).
-    The proxy supports three wire formats: Anthropic Messages, OpenAI Chat Completions
-    and OpenAI Responses. **The auto pool is protocol-agnostic** (2026-11-24 ruling):
-    providers of all three protocols enter the tier chain and are ordered by brand/tier
-    as usual.
-    On a cross-protocol pick the proxy rewrites the **envelope** (path / auth headers /
-    field names / event names) to the upstream's declared protocol while keeping the
-    **context input and output byte-faithful** (system prompt, every message, tool
-    definitions and arguments, tool results, model output are carried over verbatim).
-    fail-closed: requests containing thinking blocks / is_error tool results /
-    cache_control / multimodal blocks are **not** routed across protocols (the pool
-    falls back to the same protocol); nothing is silently dropped.
-    Cross-protocol + a streaming client: the upstream is forced non-stream and the
-    converted body is re-emitted as a synthesized SSE (verbatim text, no incremental
-    typing effect).
-    An undeclared/unknown label enters the pool for all protocols but the upstream is
-    still addressed in the inbound protocol (only a matching capability works).
+    The proxy supports three wire formats: Anthropic Messages, OpenAI Chat Completions and
+    OpenAI Responses. **A continuous auto activation segment is same-protocol and
+    pass-through only** (2026-11-24 ruling): only providers explicitly tagged with the inbound
+    protocol enter its tier chain, ordered by brand/tier as usual; no envelope is rewritten and
+    context is forwarded verbatim. The first clean auto success formally locks the segment to
+    the inbound adapter.name; auto continuations, tool turns, failure retries and evidence
+    upgrades stay inside that protocol. The first selected model is not the lock's source of
+    truth. A first failure does not establish a lock. An explicit-model request immediately
+    ends the current auto segment and clears its lock; re-enabling auto can establish a new
+    lock from the then-current inbound protocol (not a lifetime session lock), and its first
+    turn re-grades from scratch rather than inheriting the explicit segment's pinned model.
+    An inbound-protocol change within the segment returns a local 409
+    (auto_protocol_locked) without contacting an upstream. Locks are reclaimed on proxy restart,
+    an explicit-model request, or 24h without activity; the in-process map holds at most 1,000
+    entries and evicts the oldest on overflow.
+    An undeclared/unknown label is **excluded from the auto pool**. The session ID is taken
+    first from the body session_id/metadata or a session header (ZCode uses x-session-id,
+    Qoder the unprefixed session-id); only without a stable session ID do host + first user
+    text + system prompt provide a normalization fallback; concurrent sessions with identical
+    first-turn material may share a segment lock.
+    **Explicit-model requests retain cross-protocol envelope bridging**: lossless requests may
+    be converted (path / auth headers / field names / event names follow the upstream's
+    declared protocol), while system prompt, every message, tool definitions and arguments,
+    tool results and model output remain verbatim. Requests with thinking blocks / is_error
+    tool results / cache_control / multimodal blocks cannot select across protocols (the pool
+    falls back to the same protocol); nothing is silently dropped. Cross-protocol + a streaming
+    client forces a non-streaming upstream, converts the body and synthesizes SSE.
 
   Chain granularity (2026-11-24): tier-chain entries are `model@provider` (provider
     pinned) — when one model spans several providers, every one of them enters the

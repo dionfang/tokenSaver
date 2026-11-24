@@ -37,6 +37,7 @@ import { atomicWriteFileSync } from './proc.mjs';
 import { promptKey } from './buildExemplars.mjs';
 import { WRITE_TOOLS } from './calibrateSignals.mjs';
 import { tierOfModel, tierClassifyOptions } from './modelRoute.mjs';
+import { inputSplit } from './costProfile.mjs'; // B1:账本行输入拆分单源(OpenAI/Responses 方言 inTok 含缓存命中)
 
 const require = createRequire(import.meta.url);
 const HOME = process.env.USERPROFILE || require('node:os').homedir();
@@ -246,7 +247,8 @@ export function segmentStats(seg, tierOpts) {
   let tokens = 0; let estTokens = 0;
   for (const r of seg.rows) {
     if (r.inTok !== null && r.inTok !== undefined || r.outTok !== null && r.outTok !== undefined) {
-      tokens += num(r.inTok) + num(r.outTok);
+      // tokens = 未命中输入 + 输出(Anthropic 方言行历来如此);OpenAI/Responses 方言行 inTok 含命中,拆分后同口径(B1)
+      tokens += inputSplit(r).miss + num(r.outTok);
       estTokens += num(r.estTokens);
     } else {
       estTokens += num(r.estTokens);

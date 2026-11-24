@@ -15,7 +15,8 @@
  *   5) 清理运行时痕迹(data/.prefetch-last.json)
  *
  * 不动:data/(索引、节约账、read-guard 记录)、code-index/ 本体、CODE_MAP.md、.gitignore、
- *       用户自己的 skills 与其他工具的钩子。重新部署:node init.mjs
+ *       用户自己的 skills 与其他工具的钩子、用户级环境变量 OLLAMA_MAX_LOADED_MODELS
+ *       (init 设=5,良性 Ollama 驻留调优、可能用户自设,保留不回退)。重新部署:node init.mjs
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -320,6 +321,7 @@ function main() {
 
   say('============ 卸载完成 ============');
   say('未动:data/(索引、节约账、read-guard 记录)、code-index/ 本体、CODE_MAP.md、.gitignore、用户自己的 skills 与其他工具的钩子');
+  say('保留:用户级环境变量 OLLAMA_MAX_LOADED_MODELS(init 设=5,良性 Ollama 驻留调优、可能用户自设,不回退)');
   say('需要彻底清数据请手动删除 data/;重新部署:node init.mjs');
 }
 
