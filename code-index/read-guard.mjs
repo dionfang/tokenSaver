@@ -106,12 +106,19 @@ async function takePrefetchClaimSafe(session, file, now) {
 }
 
 async function recordBlockedBytes(bytes) {
-  const tokens = tokensFromBlockedBytes(bytes);
+  // 超上下文封顶(2026-11-26):单次拦截节约 = min(bytes/4, 上下文上限)——
+  // 超限文件即使放行也会被上游 context-length 拒绝,全量 bytes/4 记账高估(实弹:13.2MB dist 记 3.3M)。
+  const tokens = cappedBlockedTokens(bytes);
   if (tokens <= 0) return;
   try {
     const { addInputSavings } = await import('./modelStatus.mjs');
     addInputSavings(tokens, 0);
   } catch { /* 记账失败仍拒绝 */ }
+}
+
+/** bytes/4 折算 + 上下文上限封顶(2026-11-26)。Read deny 无 claim 与 Bash(32KB 封顶后折算 8K,远低于上限)共用。 */
+export function cappedBlockedTokens(bytes) {
+  return Math.min(tokensFromBlockedBytes(bytes), resolveContextCapTokens());
 }
 
 /** 拦截留痕经 modelStatus.appendReadEvent 落 events.jsonl;动态导入避免顶层循环依赖。 */
@@ -380,6 +387,17 @@ export function resolveReadMaxLines() {
     if (Number.isFinite(n) && n > 0) return n;
   } catch { /* 缺文件或坏 JSON:用默认,不走 loadConfig(它会 process.exit) */ }
   return DEFAULT_CONFIG.readMaxLines;
+}
+
+/** 拦截记账的上下文上限封顶(tokens,2026-11-26):超上下文大文件全量 Read 放行也会被上游拒绝,
+ *  按 min(bytes/4, 本值) 记账。与 resolveReadMaxLines 同模式:config 顶层键 > 内置默认(无 env/CLI)。 */
+export function resolveContextCapTokens() {
+  try {
+    const j = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const n = Number(j.contextCapTokens);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch { /* 缺文件或坏 JSON:用默认 */ }
+  return DEFAULT_CONFIG.contextCapTokens;
 }
 
 /**
@@ -691,10 +709,10 @@ export async function runReadGuard({ stdinText } = {}) {
           const compressed = claim ? (Number(claim.injectedTokens) || 0) : Math.ceil(rangeBytes / 4);
           try {
             const { addInputSavings } = await import('./modelStatus.mjs');
-            addInputSavings(tokensFromBlockedBytes(st.size), compressed);
+            addInputSavings(cappedBlockedTokens(st.size), compressed);
           } catch { /* 记账失败仍改写 */ }
           await trackEvent(claim
-            ? { at: now, session: convId, kind: 'Prefetch', file, bytes: st.size, originalTokens: tokensFromBlockedBytes(st.size), compressedTokens: compressed }
+            ? { at: now, session: convId, kind: 'Prefetch', file, bytes: st.size, originalTokens: cappedBlockedTokens(st.size), compressedTokens: compressed }
             : { at: now, session: convId, kind: 'Rewrite', file, bytes: st.size, rangeBytes, s, e: Math.min(range.e, lines) });
           markHookRewrite(convId, file, now);
           // 改写也登记一次拦截:5 分钟内重发同一文件即放行全文(与 deny 同口径的逃生舱)
@@ -725,7 +743,7 @@ export async function runReadGuard({ stdinText } = {}) {
     // 以 claim 的注入量为 compressed 入账一次,guard 自身不再重复计;无 claim 走原口径。
     const claim = await takePrefetchClaimSafe(convId, file, now);
     if (claim) {
-      const tok = tokensFromBlockedBytes(st.size);
+      const tok = cappedBlockedTokens(st.size);
       try {
         const { addInputSavings } = await import('./modelStatus.mjs');
         addInputSavings(tok, Number(claim.injectedTokens) || 0);

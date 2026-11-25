@@ -5,11 +5,13 @@
 
 ### 项目简介
 
-TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
+TokenSaver 是跑在本机的 Agent 提效工具,有三大核心功能模块。
 
 **模块一:省耗记账(Token Ledger)**——为代码库建语义检索索引,Agent 定位代码只读需要的区间;过长的整文件读取会被守卫改写为语义最相关区间,选不出才拒绝;每轮节约按 token 精确入账,会话状态句实时展示今日与累计。**Cursor、ZCode、Qoder 三端通用**。
 
 **模块二:动态模型路由(AutoTier)**——本地代理即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(R1-R4,以 R3=1x 为基准),贵模型只在必要时使用;自进化闭环持续降本。**仅 ZCode 与 Qoder 支持,且只对以自定义模型接入的供应商生效——供应商清单允许混合协议(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses),但连续 `auto` 激活段只同协议透传;显式模型请求保留跨协议桥接能力**。
+
+**模块三:跨会话记忆(Memorix)**——内置记忆层让 Agent 跨会话、跨工具记住项目知识:会话开始/用户输入自动注入相关记忆,工具调用/会话结束自动捕获沉淀;嵌入复用本仓模型零新增下载,切换运行模式自动同步记忆嵌入配置;记忆数据存本机 SQLite 归用户所有,卸载不删。**Cursor、ZCode、Qoder 三端 MCP 接入**。
 
 适合在本地代码库上用 Agent 开发。默认推荐**桌面客户端(托盘守护程序)**安装,无需命令行;纯命令行只是不装守护程序时的备选。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
 
@@ -22,7 +24,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 - 混合检索:BM25 词法 + 向量余弦;需要更准再加 `--rerank`;嵌入拉起失败自动降为纯 BM25。嵌入默认 local(transformers.js),可选 `--model-in ollama`;判定模型本地运行、零远程调用。
 - 读取守卫:整文件 Read 超过 `readMaxLines`(默认 300)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制)直接放行。
 - 索引保鲜:git 仓库按 HEAD 判断过期;非 git 目录默认 24 小时重建。
-- 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次;状态句实时展示今日/累计。Cursor 端无 usage 数据源,只计入口一次、不计会话放大。
+- 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次;状态句实时展示今日/累计。Cursor 端无 usage 数据源,只计入口一次、不计会话放大。超上下文大文件的拦截节约按模型上下文上限封顶(`contextCapTokens`,默认 100 万 tokens):超限文件即使放行也会被上游拒绝,单事件节约至多记一个上限值。
 - 模型清理:切换模型后开会话自动卸掉本工具拉起的驻留模型(自己 pull 的不碰);宿主关闭后统一卸载,不留驻留尾巴。手动清:`node cleanup.mjs --all`。
 
 #### 动态模型路由(要点)
@@ -33,6 +35,13 @@ TokenSaver 是跑在本机的 Agent 提效工具,有两大核心功能模块。
 - 协议边界:连续 `auto` 激活段只选协议标签明确匹配入站的供应商,不转信封;首个干净成功的 auto 请求按入站协议建锁,续接/重试/升档均留在锁内。同段改入口协议返回 409 且不打上游;显式模型请求立即结束 auto 段并清锁,之后重新启用 auto 按当时入站协议建锁并重新定档(不继承显式段留下的模型)。未知协议供应商不进 auto 池。
 - 自进化闭环:真实流量自动生长黄金集,每 6h 学习信号权重与门槛,折外过门控自动晋升,成本恶化自动回滚。
 - 生效条件与配置字段见「配置」的 modelRouting 段。
+
+#### 跨工具会话记忆(要点)
+
+- 内置 Memorix 记忆层(替代 OpenViking):本地安装进 code-index/vendor/memorix 隔离区(不占全局 npm,客户端模式随安装包内置);ZCode/Qoder/Cursor 三端 MCP 接入,编辑器内即用记忆工具;会话开始/用户输入自动注入相关记忆,工具调用/会话结束自动捕获沉淀,跨会话、跨工具共享。
+- 嵌入复用本仓模型,零新增下载:CPU 模式指本地常驻端点(jina 768d),GPU 模式指 Ollama(qwen3-embedding 1024d);切换运行模式时预热自动同步记忆嵌入配置(仅重写工具生成段,用户自定义不覆盖),并结束持有旧配置的常驻记忆 MCP 进程——宿主随即按注册条目重拉,无需手动重启。记忆数据本体存 SQLite 与嵌入模型无关,切换不丢数据;维度不同的向量索引分表共存,切回即恢复。
+- 记忆嵌入端点每次采集真探活:端点连不上记忆灯判红(维度缓存假绿防线);端点暂不可达时记忆写入照常、检索降级词法,恢复后自动回血。
+- 数据归用户:`~/.memorix/`(SQLite);卸载工具只摘钩子/MCP/配置,数据保留可手动删。历史知识可用 `node tools/memorix-import-docs.mjs` 一次性导入(幂等台账去重)。
 
 ### 环境
 
@@ -188,11 +197,13 @@ MIT。
 
 ### Overview
 
-TokenSaver is a local agent productivity tool with two core feature modules.
+TokenSaver is a local agent productivity tool with three core feature modules.
 
 **Module 1: Token Ledger (省耗记账)** — builds a semantic search index over the codebase so the agent reads only the spans it needs; over-long full-file reads are rewritten to the closest semantic range, denied only when nothing fits; every turn's savings are accounted in tokens and shown live in the session status line. **Works on all three clients: Cursor, ZCode, and Qoder.**
 
 **Module 2: Dynamic Model Routing (AutoTier)** — the local proxy doubles as a custom-model endpoint and the client gains a virtual model tier `auto`; sessions that select it are dispatched across four difficulty tiers (R1-R4, with R3 = 1x as base), so expensive models run only when needed; a self-evolution loop keeps reducing cost. **ZCode and Qoder only, and only for providers wired in as custom models — the provider inventory may mix protocols (Anthropic Messages / OpenAI Chat Completions / OpenAI Responses), but a continuous `auto` activation segment is same-protocol pass-through only; explicit-model requests retain cross-protocol bridging.**
+
+**Module 3: Cross-session Memory (Memorix)** — a built-in memory layer lets the agent remember project knowledge across sessions and across tools: relevant memories are auto-injected at session start / user prompts, and new ones auto-captured on tool calls / session end; embedding reuses this repo's models with zero extra downloads and syncs automatically on mode switches; memory data lives in local SQLite owned by the user and survives uninstall. **MCP wiring on all three clients: Cursor, ZCode, and Qoder.**
 
 Built for agent-based development on local repositories. The **desktop client (tray guardian)** is the recommended install — no command line needed; the pure CLI is the fallback for when you prefer not to install the guardian. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
@@ -205,7 +216,7 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 - Hybrid search: BM25 lexical + vector cosine; add `--rerank` for tighter ranking; falls back to BM25-only if the embedding model fails to start. Embedding defaults to local (transformers.js), optionally `--model-in ollama`; the decision model runs locally with zero remote calls.
 - Read guard: a full-file Read past 1.25 × `readMaxLines` (default 300) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. Only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries) passes through untouched.
 - Index freshness: git repositories go stale by HEAD; non-git directories rebuild every 24 hours by default.
-- Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point; the status line shows today/cumulative live. Cursor has no usage feed and is booked entry-once only, without session amplification.
+- Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point; the status line shows today/cumulative live. Cursor has no usage feed and is booked entry-once only, without session amplification. Interception savings for beyond-context files are capped at the model context limit (`contextCapTokens`, default 1,000,000 tokens): an oversized file would be rejected by the upstream even if allowed through, so a single event books at most one cap's worth.
 - Model cleanup: starting a session after a model switch unloads the leftovers this tool pulled up (chat models you pulled yourself are never touched); after the host closes, everything is unloaded with no resident tail. Manual cleanup: `node cleanup.mjs --all`.
 
 #### Dynamic model routing (key points)
@@ -216,6 +227,13 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 - Protocol boundary: a continuous `auto` activation segment uses only providers explicitly tagged with the inbound protocol and never rewrites envelopes. The first clean auto success locks that segment to its inbound protocol; continuations, retries and upgrades stay inside it. An inbound-protocol change within the segment returns 409 without contacting an upstream. An explicit-model request ends the segment and clears the lock; re-enabling auto establishes a new lock from the then-current inbound protocol and re-grades from scratch (it does not inherit the explicit segment's model). Unknown-protocol providers are excluded from auto.
 - Self-evolution loop: real traffic grows the golden set automatically; every 6h weights and thresholds are learned, out-of-fold gate passing auto-promotes, and cost regressions auto-roll back.
 - Scope and config keys: see the `modelRouting` subsection under "Configuration" below.
+
+#### Cross-tool session memory (key points)
+
+- Built-in Memorix memory layer (replacing OpenViking): installed locally into the isolated code-index/vendor/memorix directory (no global npm footprint; the client install bundles it inside the package); MCP wiring on ZCode/Qoder/Cursor puts memory tools inside the editor; session start / user prompts auto-inject relevant memories, tool calls / session end auto-capture new ones — shared across sessions and across tools.
+- Embedding reuses this repo's models, zero extra downloads: CPU mode points at the local resident endpoint (jina 768d), GPU mode at Ollama (qwen3-embedding 1024d); warm-up syncs the memory embedding config on every mode switch (only tool-generated sections are rewritten; user customizations are never overwritten) and ends resident memory-MCP processes that still hold the old config — the host then re-pulls them from their registered entry, so no manual restart is needed. Memory records live in SQLite independently of the embedding model, so switching loses no data; vector indexes of different dimensions coexist in separate tables and resume on switch-back.
+- The memory embedding endpoint is genuinely probed on every status collection: an unreachable endpoint turns the memory lamp red (guard against dims-cache false green); while the endpoint is down, memory writes continue and retrieval degrades to lexical search, recovering automatically once it is back.
+- Data belongs to the user: `~/.memorix/` (SQLite); uninstalling the tool only removes hooks/MCP/config and keeps the data (delete manually if desired). Historical knowledge can be imported once via `node tools/memorix-import-docs.mjs` (idempotent ledger dedup).
 
 ### Requirements
 

@@ -7,6 +7,20 @@
 
 ### 新增
 
+**记账口径:超上下文拦截节约封顶(contextCapTokens)**
+- 超上下文大文件(如 13MB dist 产物)的全量 Read 即使放行也会被上游 context-length 拒绝,按 bytes/4 全额记账高估(实弹:单文件记 3.3M tokens、×2 迭代=9.9M 虚账);单事件节约改为 min(bytes/4, 上下文上限)——入口一次(Read deny/改写/Prefetch 转正/Bash)与 computeAccumulation 的迭代放大、void 退款同源封顶,防退款大于入账
+- 新增配置键 `contextCapTokens`(code-index.config.json,默认 1000000),Read 守卫与模型状态句同一取值链;历史账不重写,仅向前生效
+
+**跨会话记忆(Memorix 内置,替代 OpenViking)**
+- 安装包内置裁剪版 Memorix(跨会话记忆层):构建前 stage-memorix 裁剪(--omit=optional 去 lancedb/better-sqlite3,Node 内置 node:sqlite 兜底),随包分发约 +179MB;CLI 安装模式 init.mjs 本地安装 memorix 进 code-index/vendor/memorix 隔离区(不占全局 npm;独立 package.json 使主项目 npm install 不剪、--omit=optional 只裁 vendor 树不伤主树 sharp;MCP/钩子/微 CLI/导入脚本解析本地优先,存量全局安装兼容;卸载只删本地包不碰全局环境;MCP 条目入口失效自动刷新指向本地)并按嵌入路径写配置
+- 嵌入复用本仓模型,零新增下载:GPU 模式指 Ollama OpenAI 兼容层(qwen3-embedding 1024d),CPU 模式指本地常驻新增的 OpenAI 方言端点(jina 768d,与代码索引同一管线)
+- 嵌入配置跟随运行模式切换:预热收尾自动把 Memorix 嵌入端点同步到当前模式(此前切 GPU 档后配置仍指已停的 CPU 端点,语义检索全降级词法);仅重写工具生成的受管配置段,用户自定义不覆盖,记忆数据不受影响
+- 切档后记忆 MCP 自动重载:同步真改写时结束「持有旧配置」的常驻 memorix serve 进程(上游无配置热重载,provider 缓存无失效入口),宿主按注册条目重拉,无需手动重开会话;只动指向旧安装路径/旧配置的进程,用户自装实例不碰
+- 三端 MCP 接入(ZCode/Qoder/Cursor):编辑器内即用 memorix 记忆工具;init 注册/uninit 摘除对称
+- 托盘面板新增「跨会话记忆状态」模块(嵌入/数据后端/图谱新鲜/维护/冲突五状态灯 + 记忆量数字);「三端钩子配置」升级为「工具接入状态」(每工具一行:工具名 + 钩子/记忆MCP/动态路由auto 三灯 + 独立修复按钮,灯文案悬停可见);新增「计划接入工具(开发中)」区,列出 Memorix 支持的其余 12 个 agent(Windsurf/Claude Code/Codex/Copilot/Antigravity/Gemini CLI/OpenClaw/Hermes/OMP/Kiro/OpenCode/Trae,灰灯+修复禁用);修复记忆五子灯与记忆MCP/动态路由auto 灯不显示(灯 id 前缀不一致致渲染中断+记忆灯误读原始对象);面板窗高 640→960 容纳全部控件(不滚动裁定不变)
+- OpenViking 退役:跨会话记忆由 Memorix 接管,历史数据归档保留可恢复
+- 审查修复四项:①记忆嵌入灯加端点真探活(维度缓存可让 doctor 假报 ready,端点连不上强制红,不再假绿);②记忆钩子按宿主分形状输出(Cursor 原生只认顶层 additionalContext,此前统一 hookSpecificOutput 包会被 Cursor 丢弃);③历史导入脚本改直 spawn CLI JS 入口(原 shell:true 会把正文里的引号/换行/& 交 cmd 拆参);④裁剪打包删权重后再 stat 同路径的崩溃点修复
+
 **动态模型路由(自进化)**
 - R3 硬真值种子通道:tier-evidence 的 p2-escalated→R3 行按 R3 类入样本池(≥R3_SEED_MIN=8 门槛,不足静默)——为 l2TierRescue 的 R2→R3 救援分支供电(此前库内 R3 类恒 0,分支结构性不可达);预测不回灌红线不破(deriveTierTruth 无 prompt 形参)
 - 争议池二轮仲裁:contested-pool(原零消费方)接决策模型带外重投一票,与已记 l1/l2/behavior 票合议——quorum(≥2 源)达成即签入黄金集并移出争议池,1B 行为否决照旧;30 天重问间隔

@@ -128,6 +128,10 @@ export const DEFAULT_CONFIG = {
   // Cursor 全量 Read 行数上限。超过 ×1.25 由 preToolUse 拦截;带 offset/limit 的区间读不受限。
   // 2026-11-24 下调 500→300:200-500 行中文件的全读改走语义区间(5 分钟重试/区间读兜底,摩擦面不变)。
   readMaxLines: 300,
+  // 拦截记账的上下文上限封顶(tokens,2026-11-26):超上下文大文件(如 13MB dist 产物)即使放行
+  // 也会被上游 context-length 拒绝,全量 bytes/4 记账高估。单事件节约 = min(bytes/4, 本上限)。
+  // 覆盖入口一次与 computeAccumulation 放大/退款同源封顶;data/code-index.config.json 顶层键可覆盖。
+  contextCapTokens: 1000000,
   chunk: { targetLines: 70, maxLines: 120, overlapLines: 10, minTail: 15 },
   // L2 样本库配额(2026-11-10 配置化;2026-11-14 起默认不限):
   //   capPerLabel=单类硬上限;totalCap=全库总预算。两者默认 0=不限。

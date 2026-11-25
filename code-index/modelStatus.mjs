@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { DATA_DIR, loadConfig, decisionLocalWanted } from './config.mjs';
+import { DATA_DIR, DEFAULT_CONFIG, loadConfig, decisionLocalWanted } from './config.mjs';
 import { ollamaProcessesRunning, resolveBase } from './ollamaGuard.mjs';
 import { localOnnxCached } from './localRerank.mjs';
 import { activeBackend, vectorPaths, readVectorMeta, vectorSignatureStale, pairedSnapshotUsable } from './vectorStore.mjs';
@@ -812,14 +812,31 @@ export function countIterationsFor(session, rows, sinceMs, sinceKey, agentUsageP
   return countRowsAfter(filtered, sinceMs, sinceKey);
 }
 
+/** 上下文上限封顶取值(2026-11-26):opts.contextCapTokens 显式注入(测试用) >
+ *  data JSON contextCapTokens > DEFAULT_CONFIG.contextCapTokens。非正数按默认。 */
+export function contextCapOf(opts = {}) {
+  const n = Number(opts?.contextCapTokens);
+  if (Number.isFinite(n) && n > 0) return n;
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8'));
+    const m = Number(j.contextCapTokens);
+    if (Number.isFinite(m) && m > 0) return m;
+  } catch { /* 缺文件或坏 JSON:用默认 */ }
+  return DEFAULT_CONFIG.contextCapTokens;
+}
+
 /**
  * 纯计算:每个事件还差多少 iteration 没入账,以及应追加多少。
  * 单次节约:Read/Bash = bytes/4;Search = 命中块原文 tokens − 结果 tokens。
  * 无主(未认领)/voided(重发放行)不计;voided 需退回此前已入账的金额。
  * 事件可跨日:传入全部事件即可(会话累计不因午夜重置)。
+ * 单事件节约封顶(2026-11-26):至多一个上下文上限(opts.contextCapTokens 或 data JSON
+ * contextCapTokens,缺省 DEFAULT_CONFIG.contextCapTokens=1M)——超上下文文件全量 Read 放行
+ * 也会被上游 context-length 拒绝,bytes/4 全额记账高估。放大与退款同源封顶。
  */
 export function computeAccumulation(events, watermarks = {}, opts = {}) {
   const { dbPath = ZCODE_DB_PATH, agentUsagePath = AGENT_USAGE_PATH } = opts;
+  const contextCap = contextCapOf(opts);
   const voided = new Set();
   for (const ev of events) {
     if (ev.void) voided.add(`${ev.session}|${ev.file}|${ev.at}`);
@@ -849,11 +866,16 @@ export function computeAccumulation(events, watermarks = {}, opts = {}) {
   for (const ev of events) {
     if (ev.void || ev.kind === 'SearchClaim') continue;
     const key = eventKey(ev);
-    const tokens = (ev.kind === 'Search' || ev.kind === 'Prefetch')
-      ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
-      : ev.kind === 'Rewrite'
-        ? Math.max(0, Math.ceil((Number(ev.bytes) - Number(ev.rangeBytes || 0)) / 4))
-        : Math.ceil(Number(ev.bytes) / 4);
+    const tokens = Math.min(
+      (ev.kind === 'Search' || ev.kind === 'Prefetch')
+        ? Math.max(0, Math.round(Number(ev.originalTokens) || 0) - Math.round(Number(ev.compressedTokens) || 0))
+        : ev.kind === 'Rewrite'
+          ? Math.max(0, Math.ceil((Number(ev.bytes) - Number(ev.rangeBytes || 0)) / 4))
+          : Math.ceil(Number(ev.bytes) / 4),
+      // 超上下文封顶(2026-11-26):单事件节约至多一个上下文上限——超限文件全量进上下文会被上游
+      // context-length 拒绝,bytes/4 全额记账高估。放大 delta 与退款 entry 同源封顶,防退款大于入账。
+      contextCap,
+    );
     const wm = watermarks[key] || null;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -1099,6 +1121,7 @@ function likelyReason(p, emb, rr) {
   if (p.backend === 'local') return `当前索引是 ${p.indexModel},与配置的 ollama 嵌入路径不一致`;
   if (p.indexModel !== emb) return `索引模型 ${p.indexModel} 与配置的嵌入模型不一致`;
   if (p.signatureStale && p.snapshotOk === false) return '向量与嵌入快照不一致,检索已降级 bm25';
+  if (p.psLoadingWindow) return '模型冷加载中(探针让行,稍后自动确认)'; // 2026-11-25:比"无法确认"可读,更不误读成掉线
   if (p.embedRunning == null || p.rerankRunning == null) return '无法确认模型是否已拉起';
   if (!p.embedRunning && !p.rerankRunning) return `嵌入模型 ${emb} 与精排模型 ${rr} 都未拉起`;
   if (!p.embedRunning) return `嵌入模型 ${emb} 未拉起`;
@@ -1190,6 +1213,7 @@ export async function assessModelStatus({ sessionId = null, phase = null } = {})
   let decisionRunning = null;
   let decisionOk = null;
   let residentReady = false;
+  let psLoadingWindow = false; // 2026-11-25:ollama 分支置位(探针撞冷加载窗口);local 分支恒 false
   if (modelIn === 'local') {
     const health = await residentHealth();
     residentReady = !!(health?.embedOk && health?.rerankOk);
@@ -1201,6 +1225,11 @@ export async function assessModelStatus({ sessionId = null, phase = null } = {})
     const decisionWanted = decisionLocalWanted();
     try { maybeWarmReranker({ health: { modelIn, embedOk: health?.embedOk === true, rerankOk: health?.rerankOk === true, decisionWanted, decisionOk: decisionWanted ? (health?.decisionOk == null ? undefined : health.decisionOk === true) : undefined, localDecisionReady: decisionWanted ? localOnnxCached(models.localDecision) : undefined }, minIntervalMs: warmMinIntervalMs }); } catch { /* 拉起失败不影响状态句 */ }
   } else {
+    // 2026-11-25 修复(加载窗口容错):/api/ps 2s 竞速探针在模型冷加载窗口会被 sched 锁阻塞必超时,
+    // 旧代码把 psRes.ok=false 直接跳过自愈两闸 → 下轮重试撞同一窗口;且 tags/version 活着=服务在,
+    // 加载窗口里"ps 拿不到"不等于"模型掉了"。改为:tags 活着而 ps 超时 → 视为 loading(不算 down),
+    // 跳过本轮 warm 补拉与 heal(加载窗口判定已把 heal 挡住,双保险),状态句 embedRunning/rerankRunning
+    // 维持上次缓存(读取方已按可得字段降级),不误报"未拉起"。
     const [tagsRes, versionUp, psRes] = await Promise.all([
       getJson(`${base}/api/tags`, 2000).then(j => ({ ok: true, j })).catch(() => ({ ok: false })),
       getJson(`${base}/api/version`, 2000).then(() => true).catch(() => false),
@@ -1208,6 +1237,8 @@ export async function assessModelStatus({ sessionId = null, phase = null } = {})
     ]);
     if (tagsRes.ok || versionUp) ollama = 'up';
     else if (ollamaProcessesRunning()) ollama = 'process-only';
+    const psLoading = (tagsRes.ok || versionUp) && !psRes.ok; // 服务活而 ps 探针超时=极可能正冷加载
+    psLoadingWindow = psLoading;
     if (tagsRes.ok) {
       const names = installedSet(tagsRes.j);
       embedInstalled = modelListed(names, models.embedding);
@@ -1227,6 +1258,9 @@ export async function assessModelStatus({ sessionId = null, phase = null } = {})
       try { maybeWarmReranker({ health: decisionLocalWanted() ? { modelIn, ollama, rerankInstalled, rerankRunning, decisionInstalled, decisionRunning } : { modelIn, ollama, rerankInstalled, rerankRunning }, minIntervalMs: warmMinIntervalMs }); } catch { /* 拉起失败不影响状态句 */ }
       // Ollama runner 异常自愈(2026-11-17 用户定案,默认开):llm server error 连判两轮 + 过冷却 ⇒ 重启 serve 回拉
       try { ollamaRunnerSelfHeal({ running, models, decisionWanted: decisionLocalWanted() }); } catch { /* 自愈失败不影响状态句 */ }
+    } else if (psLoadingWindow) {
+      // 加载窗口:本轮不补拉不 heal(加载完成前补拉只会再撞窗口);embedRunning 等维持 null=未知,
+      // 状态句读方已按"无法确认"降级,不会误报未拉起
     }
   }
 
@@ -1262,6 +1296,7 @@ export async function assessModelStatus({ sessionId = null, phase = null } = {})
     decisionInstalled,
     decisionRunning,
     decisionModelLabel: null, // v4:远程链已删,恒 null(状态句决策模型名走本地后端名)
+    psLoadingWindow, // 2026-11-25:探针撞冷加载窗口(sched 锁阻塞)——状态句说"加载中"而非"无法确认/未拉起"
   };
   writeHealthCache(health);
   return renderStatusWith(health, sessionId, { phase });
@@ -1390,20 +1425,41 @@ export function ollamaLogTs(line) {
   return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).getTime();
 }
 
-/** 近 windowMs 内 "llm server error" 行数(无时间戳的 error 行保守计 1)。 */
+/** 近 windowMs 内 "llm server error" 行数(无时间戳的 error 行保守计 1)。
+ *  2026-11-25 修复:紧邻行是「client connection closed / Load failed … context canceled」的 error
+ *  不计数——那是调用方短超时主动断开造成的加载中止(自愈探针自己也会造这种),不是 runner 故障,
+ *  误计会让 heal 在冷加载窗口把整只 Ollama 杀掉重启(自咬循环,实测 2026-11-25 日志 2392 条 error
+ *  绝大多数属此类)。纯函数供单测。 */
 export function ollamaLogErrCount(text, now = Date.now(), windowMs = 5 * 60 * 1000) {
+  const lines = String(text || '').split(/\r?\n/);
   let n = 0;
-  for (const line of String(text || '').split(/\r?\n/)) {
-    if (!line.includes('llm server error')) continue;
-    const ts = ollamaLogTs(line);
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes('llm server error')) continue;
+    // 紧邻下文(≤2 行内)出现客户端断开特征 → 客户端中止,非 runner 故障,不计
+    const follow = lines.slice(i + 1, i + 3).join('\n');
+    if (/client connection closed|Load failed.*context canceled/.test(follow)) continue;
+    const ts = ollamaLogTs(lines[i]);
     if (ts == null || now - ts <= windowMs) n += 1;
   }
   return n;
 }
 
-/** runner 异常判定(纯函数):有期望模型缺驻留 且 日志近期 err ≥ minErr。 */
+/** 日志尾是否处于「模型加载窗口」(纯函数,供单测):近 loadWindowMs 内有 loading/waiting 起始行。
+ *  加载窗口内 /api/ps 会被 sched 锁阻塞、短探针必超时,error 行多为加载等待——heal 此刻既不该判
+ *  unhealthy 也不该 restart(2026-11-25 修复:冷加载窗口杀 Ollama=自咬循环的放大器)。 */
+export function ollamaLoadingWindow(logText, now = Date.now(), windowMs = 90 * 1000) {
+  const lines = String(logText || '').split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0 && (now - (ollamaLogTs(lines[i]) ?? now)) <= windowMs; i--) {
+    if (/loading model via llama-server|starting llama-server|waiting for llama-server/.test(lines[i])) return true;
+  }
+  return false;
+}
+
+/** runner 异常判定(纯函数):有期望模型缺驻留 且 日志近期 err ≥ minErr。
+ *  2026-11-25 修复:加载窗口内一律不判 unhealthy(缺驻留=正在加载,不是掉了)。 */
 export function ollamaRunnerUnhealthy({ missingModels = [], logText = '', now = Date.now(), errWindowMs = 5 * 60 * 1000, minErr = 2 } = {}) {
   if (!missingModels.length) return { unhealthy: false, reason: '驻留齐全', errCount: 0, missing: [] };
+  if (ollamaLoadingWindow(logText, now)) return { unhealthy: false, reason: '加载窗口(冷加载中不判异常)', errCount: 0, missing: missingModels };
   const errCount = ollamaLogErrCount(logText, now, errWindowMs);
   const unhealthy = errCount >= minErr;
   return { unhealthy, errCount, missing: missingModels, reason: unhealthy ? `runner 异常(近期 llm server error ×${errCount})` : '仅空闲卸载(无 runner 异常)' };
