@@ -515,6 +515,119 @@ export function agentUsageSessionRows(agentUsagePath, session, sinceMs) {
   return out;
 }
 
+// ---------- 批量数据源(2026-11-26 性能修复) ----------
+// 病根:applySessionAccumulation 读全历史事件(day=null),computeAccumulation 对每个 session
+// 各调一次数据源。真实规模实测 176 会话 → 144 次重开 635MB 的 db.sqlite,每次因计划选错
+// (query_source 单列索引 → 全表扫 + 临时 B-tree 排序)耗 22ms,合计 3.1s;UUID 会话再各整读
+// 一遍 2MB agent-usage.jsonl。整轮结算 3.5s,直接把 prompt-guard 顶到 10s 预算.
+// 修法:同一数据源一次开库/一次读文件,内存按 session 分组。实测 116 会话 40ms(降 98%)。
+
+/** 强制走 session 索引的提示:仅当该索引确实存在时加(测试夹具的极简表没有索引)。 */
+const SESSION_INDEX = 'model_usage_session_turn_idx';
+const SQL_IN_CHUNK = 900; // SQLite 默认 999 个绑定参数上限,留余量分段
+
+function hasSessionIndex(db) {
+  try { return !!db.prepare('SELECT 1 AS ok FROM sqlite_master WHERE type=? AND name=?').get('index', SESSION_INDEX); } catch { return false; }
+}
+
+/** ZCode 批量数据源:一次开库拉多个会话边界后的行,内存按 session 分组。
+ *  返回 Map<session, [{at,key}]>;库不可用/查询失败 → null(全部按"数据源不可用"处理)。
+ *  不在 Map 里的会话 = 库里无该会话记录(调用方按空数组处理,与逐会话版语义一致)。
+ *  sinceMs 取各会话边界的最小值:多拉的行会被 countRowsAfter 按各自边界过滤,无副作用。 */
+export function dbSessionsRows(dbPath, sessions, sinceMs) {
+  const DatabaseSync = getSqlite();
+  const list = [...new Set((sessions || []).filter(Boolean))];
+  if (!DatabaseSync || !fs.existsSync(dbPath) || !list.length) return list.length ? null : new Map();
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const hint = hasSessionIndex(db) ? ` INDEXED BY ${SESSION_INDEX}` : '';
+      const out = new Map();
+      for (let i = 0; i < list.length; i += SQL_IN_CHUNK) {
+        const chunk = list.slice(i, i + SQL_IN_CHUNK);
+        const ph = chunk.map(() => '?').join(',');
+        const rows = db.prepare(
+          `SELECT session_id AS sid, started_at AS at, logical_request_id AS key FROM model_usage${hint}
+           WHERE session_id IN (${ph}) AND query_source = 'main_turn' AND status = 'completed' AND started_at >= ?
+           ORDER BY started_at ASC`,
+        ).all(...chunk, sinceMs);
+        for (const r of rows) {
+          const sid = String(r.sid || '');
+          if (!sid) continue;
+          let arr = out.get(sid);
+          if (!arr) out.set(sid, (arr = []));
+          arr.push({ at: Number(r.at) || 0, key: String(r.key || '') });
+        }
+      }
+      return out;
+    } finally { db.close(); }
+  } catch { return null; }
+}
+
+/**
+ * ZCode 批量压缩边界(2026-11-26,与 dbSessionsRows 同一次开库思路):
+ * 返回 Map<session, sortedTimes[]>;null=库不可用(调用方视为"无边界"降级,不封顶)。
+ * 时间列依次尝试 COALESCE(completed_at, started_at) → started_at(夹具/旧库无 completed_at)。
+ */
+export function dbCompactionTimesBatch(dbPath, sessions) {
+  const DatabaseSync = getSqlite();
+  const list = [...new Set((sessions || []).filter(Boolean))];
+  if (!DatabaseSync || !fs.existsSync(dbPath) || !list.length) return new Map();
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      for (const col of ['COALESCE(completed_at, started_at)', 'started_at']) {
+        try {
+          const out = new Map();
+          for (let i = 0; i < list.length; i += SQL_IN_CHUNK) {
+            const chunk = list.slice(i, i + SQL_IN_CHUNK);
+            const ph = chunk.map(() => '?').join(',');
+            const rows = db.prepare(
+              `SELECT session_id AS sid, ${col} AS t FROM model_usage
+               WHERE session_id IN (${ph}) AND query_source = 'compact' AND status = 'completed'
+               ORDER BY ${col} ASC`,
+            ).all(...chunk);
+            for (const r of rows) {
+              const sid = String(r.sid || '');
+              const t = Number(r.t) || 0;
+              if (!sid || t <= 0) continue;
+              let arr = out.get(sid);
+              if (!arr) out.set(sid, (arr = []));
+              arr.push(t);
+            }
+          }
+          for (const arr of out.values()) arr.sort((a, b) => a - b);
+          return out;
+        } catch { /* 该列不存在:换下一个 */ }
+      }
+      return new Map();
+    } finally { db.close(); }
+  } catch { return new Map(); }
+}
+
+/** Cursor/Qoder 批量数据源:文件读一次,按 conversationId 分组(原逐会话版每次整读 2MB 文件)。 */
+export function agentUsageSessionsRows(agentUsagePath, sessions, sinceMs) {
+  const want = new Set((sessions || []).filter(Boolean));
+  if (!want.size) return new Map();
+  let lines;
+  try { lines = fs.readFileSync(agentUsagePath, 'utf8').split('\n'); } catch { return null; }
+  const out = new Map();
+  for (let idx = 0; idx < lines.length; idx++) {
+    if (!lines[idx].trim()) continue;
+    let j;
+    try { j = JSON.parse(lines[idx]); } catch { continue; }
+    if (!want.has(j.conversationId)) continue;
+    const ts = Number(j.ts);
+    if (!Number.isFinite(ts) || ts < sinceMs) continue; // 同毫秒保留,交给 countRowsAfter 按行号续接
+    let arr = out.get(j.conversationId);
+    if (!arr) out.set(j.conversationId, (arr = []));
+    arr.push({ at: ts, key: String(idx) });
+  }
+  return out;
+}
+
 /** 边界之后计数:at 更大,或同毫秒而 key 更大(同毫秒多 iteration 时稳定续接)。 */
 export function countRowsAfter(rows, sinceMs, sinceKey = '') {
   let count = 0;
@@ -750,6 +863,17 @@ export function readCompactionTimes(agentUsagePath, session) {
   } catch { return []; }
 }
 
+/**
+ * ZCode 压缩边界(2026-11-26):db 的 query_source='compact' AND status='completed' 行。
+ * 与 Qoder 的 qoder-compaction.json 同语义——压缩后基线重置(实测边界前均 input≈960K、
+ * 边界后 40-76K),事件之后只数到第一次压缩前的请求,否则同一笔节约被压缩前/后重复乘。
+ * 单会话便捷版(内部委托批量版,时间列降级语义同 dbCompactionTimesBatch)。
+ */
+export function dbCompactionTimes(dbPath, sessionId) {
+  const m = dbCompactionTimesBatch(dbPath, [sessionId]);
+  return (m && m.get(String(sessionId))) || [];
+}
+
 /** Cursor/Qoder 兜底:agent-usage.jsonl(data/usage,append-only,持久)按 conversationId
  *  数边界后记录。Cursor=turn 粒度(afterAgentResponse),Qoder=逐请求;续接键为文件行号。
  *  Qoder 若在边界后压缩过,只数到事件后第一次压缩前(压缩清掉已省下的上下文)。
@@ -800,15 +924,19 @@ export function sessionIterationRows(session, sinceMs, { dbPath = ZCODE_DB_PATH,
   return dbSessionRows(dbPath, session, sinceMs);
 }
 
-/** 单事件边界后的 iteration 数(内部用:一次拉取 + 各自边界计数)。 */
-export function countIterationsFor(session, rows, sinceMs, sinceKey, agentUsagePath) {
+/** 单事件边界后的 iteration 数(内部用:一次拉取 + 各自边界计数)。
+ *  压缩封顶(2026-11-26):事件之后只数到第一次压缩前——压缩把已省下的上下文一并清掉,
+ *  之后的请求不再携带这段内容,继续乘就是重复计。两个数据源各自取边界:
+ *  UUID 会话(Qoder/Cursor)→ agent-usage 旁的 qoder-compaction.json;
+ *  sess_ 会话(ZCode)→ db 的 compact 行。compactTimes 可由调用方预取(避免每事件查一遍库)。 */
+export function countIterationsFor(session, rows, sinceMs, sinceKey, agentUsagePath, compactTimes = null) {
   if (!rows) return null;
-  const filtered = isUuidSession(session) && agentUsagePath
-    ? (() => {
-      const stopAt = readCompactionTimes(agentUsagePath, session).find((t) => t > sinceMs);
-      return stopAt == null ? rows : rows.filter((r) => r.at < stopAt);
-    })()
-    : rows;
+  const times = compactTimes
+    || (isUuidSession(session) && agentUsagePath
+      ? readCompactionTimes(agentUsagePath, session)
+      : []);
+  const stopAt = times.find((t) => t > sinceMs);
+  const filtered = stopAt == null ? rows : rows.filter((r) => r.at < stopAt);
   return countRowsAfter(filtered, sinceMs, sinceKey);
 }
 
@@ -857,11 +985,35 @@ export function computeAccumulation(events, watermarks = {}, opts = {}) {
     const cur = bounds.get(ev.session);
     if (cur == null || b < cur) bounds.set(ev.session, b);
   }
+  // 批量拉取(2026-11-26):db 一次开库 / agent-usage 一次读文件,内存按 session 分组。
+  // 原逐会话版在每个 session 上各开一次 635MB 库,176 会话合计 3.5s。
+  // 语义保持:null=该数据源整体不可用 → 全部会话按 rolloutMissing 处理(与逐会话版一致);
+  //           Map 内查不到该会话 = 数据源可用但无该会话记录 → 空数组(计数 0,入口一次仍留痕)。
   const rowsBySession = new Map();
+  const uuidSessions = [];
+  const dbSessions = [];
+  let uuidMin = Infinity;
+  let dbMin = Infinity;
   for (const [session, minMs] of bounds) {
-    const rows = sessionIterationRows(session, minMs, { dbPath, agentUsagePath });
-    if (rows) rowsBySession.set(session, rows);
+    if (isUuidSession(session)) { uuidSessions.push(session); if (minMs < uuidMin) uuidMin = minMs; }
+    else { dbSessions.push(session); if (minMs < dbMin) dbMin = minMs; }
   }
+  if (dbSessions.length) {
+    const grouped = dbSessionsRows(dbPath, dbSessions, dbMin);
+    if (grouped === null) { for (const s of dbSessions) rowsBySession.set(s, null); }
+    else for (const s of dbSessions) rowsBySession.set(s, grouped.get(s) || []);
+  }
+  if (uuidSessions.length) {
+    const grouped = agentUsageSessionsRows(agentUsagePath, uuidSessions, uuidMin);
+    if (grouped === null) { for (const s of uuidSessions) rowsBySession.set(s, null); }
+    else for (const s of uuidSessions) rowsBySession.set(s, grouped.get(s) || []);
+  }
+  // 压缩边界预取(2026-11-26):ZCode 走 db 的 compact 行,一次性批量取(与行批量拉取同一次开库思路);
+  // Qoder/Cursor 走 qoder-compaction.json(逐会话读小文件,无成本)。事件之后只放大到第一次压缩前。
+  const dbCompaction = dbSessions.length ? dbCompactionTimesBatch(dbPath, dbSessions) : new Map();
+  const compactionOf = (session) => (isUuidSession(session) && agentUsagePath
+    ? readCompactionTimes(agentUsagePath, session)
+    : (dbCompaction?.get(session) || []));
 
   for (const ev of events) {
     if (ev.void || ev.kind === 'SearchClaim') continue;
@@ -894,7 +1046,7 @@ export function computeAccumulation(events, watermarks = {}, opts = {}) {
     const sinceMs = wm && Number.isFinite(wm.lastAt) ? wm.lastAt : Number(ev.at);
     const sinceKey = wm ? String(wm.lastKey || '') : '';
     const rows = rowsBySession.get(ev.session);
-    const res = countIterationsFor(ev.session, rows, sinceMs, sinceKey, agentUsagePath);
+    const res = countIterationsFor(ev.session, rows, sinceMs, sinceKey, agentUsagePath, compactionOf(ev.session));
     if (!res) {
       detail.push({ key, kind: ev.kind, file: ev.file, tokens, newIterations: 0, delta: 0, accumulated: wm?.accumulated || 0, rolloutMissing: true, source: null });
       continue;

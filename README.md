@@ -24,7 +24,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有三大核心功能模块。
 - 混合检索:BM25 词法 + 向量余弦;需要更准再加 `--rerank`;嵌入拉起失败自动降为纯 BM25。嵌入默认 local(transformers.js),可选 `--model-in ollama`;判定模型本地运行、零远程调用。
 - 读取守卫:整文件 Read 超过 `readMaxLines`(默认 300)的 1.25 倍即改写为语义区间,选不出才拒绝并给出替代方案;Grep 无 `head_limit` 补 100;同一目标 5 分钟内重试一次放行。只对 `exts` 白名单内的文本类型拦截与记账,白名单外(图片/二进制)直接放行。
 - 索引保鲜:git 仓库按 HEAD 判断过期;非 git 目录默认 24 小时重建。
-- 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次;状态句实时展示今日/累计。Cursor 端无 usage 数据源,只计入口一次、不计会话放大。超上下文大文件的拦截节约按模型上下文上限封顶(`contextCapTokens`,默认 100 万 tokens):超限文件即使放行也会被上游拒绝,单事件节约至多记一个上限值。
+- 入账:节约量按 qwen tokenizer 精确计数,只记拦截入口一次;状态句实时展示今日/累计。Cursor 端无 usage 数据源,只计入口一次、不计会话放大。超上下文大文件的拦截节约按模型上下文上限封顶(`contextCapTokens`,默认 100 万 tokens):超限文件即使放行也会被上游拒绝,单事件节约至多记一个上限值。会话放大只数到事件后**第一次上下文压缩前**(压缩把已省下的内容清掉、基线重置,之后不再乘);ZCode 取 db 的 compact 行、Qoder/Cursor 取压缩边界文件,两者同口径。
 - 模型清理:切换模型后开会话自动卸掉本工具拉起的驻留模型(自己 pull 的不碰);宿主关闭后统一卸载,不留驻留尾巴。手动清:`node cleanup.mjs --all`。
 
 #### 动态模型路由(要点)
@@ -216,7 +216,7 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 - Hybrid search: BM25 lexical + vector cosine; add `--rerank` for tighter ranking; falls back to BM25-only if the embedding model fails to start. Embedding defaults to local (transformers.js), optionally `--model-in ollama`; the decision model runs locally with zero remote calls.
 - Read guard: a full-file Read past 1.25 × `readMaxLines` (default 300) is rewritten to a semantic range, denied only when no range fits, with alternatives offered; Grep without `head_limit` is capped at 100; one retry of the same target within five minutes is allowed. Only file types inside the `exts` whitelist are intercepted and accounted; anything outside (images/binaries) passes through untouched.
 - Index freshness: git repositories go stale by HEAD; non-git directories rebuild every 24 hours by default.
-- Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point; the status line shows today/cumulative live. Cursor has no usage feed and is booked entry-once only, without session amplification. Interception savings for beyond-context files are capped at the model context limit (`contextCapTokens`, default 1,000,000 tokens): an oversized file would be rejected by the upstream even if allowed through, so a single event books at most one cap's worth.
+- Accounting: savings are counted precisely with the qwen tokenizer, recorded once at the interception point; the status line shows today/cumulative live. Cursor has no usage feed and is booked entry-once only, without session amplification. Interception savings for beyond-context files are capped at the model context limit (`contextCapTokens`, default 1,000,000 tokens): an oversized file would be rejected by the upstream even if allowed through, so a single event books at most one cap's worth. Session amplification stops at the **first context compaction after the event** (compaction drops the already-saved content and resets the baseline, so it is no longer multiplied): ZCode reads the db's compact rows, Qoder/Cursor read the compaction boundary file — same rule for both.
 - Model cleanup: starting a session after a model switch unloads the leftovers this tool pulled up (chat models you pulled yourself are never touched); after the host closes, everything is unloaded with no resident tail. Manual cleanup: `node cleanup.mjs --all`.
 
 #### Dynamic model routing (key points)

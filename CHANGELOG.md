@@ -11,6 +11,11 @@
 - 超上下文大文件(如 13MB dist 产物)的全量 Read 即使放行也会被上游 context-length 拒绝,按 bytes/4 全额记账高估(实弹:单文件记 3.3M tokens、×2 迭代=9.9M 虚账);单事件节约改为 min(bytes/4, 上下文上限)——入口一次(Read deny/改写/Prefetch 转正/Bash)与 computeAccumulation 的迭代放大、void 退款同源封顶,防退款大于入账
 - 新增配置键 `contextCapTokens`(code-index.config.json,默认 1000000),Read 守卫与模型状态句同一取值链;历史账不重写,仅向前生效
 
+**记账口径:会话放大停止在上下文压缩边界(ZCode 补齐)**
+- 压缩后基线重置(实测边界前均 input≈960K、边界后 40–76K),压缩前省下的内容已不在场;此前只有 Qoder/Cursor 封顶(ZCODE 的 `sess_` 前缀会话绕过该分支),账本跨压缩重复乘:命中压缩的 3 个会话多计 97.56M(占总计 936M 的 10.4%)
+- 补齐 ZCode 侧:读 db 的 `query_source='compact' AND status='completed'` 行作边界(`completed_at` 优先,夹具/旧库无该列则回退 `started_at`),`computeAccumulation` 批量预取后与 Qoder 的 `qoder-compaction.json` 同一封顶规则;事件后只放大到第一次压缩前
+- 降级安全:库不可用/无压缩记录 → 全量放大(=修复前行为),不凭空造账;历史已入账不回填(水位纪律),仅向前生效
+
 **跨会话记忆(Memorix 内置,替代 OpenViking)**
 - 安装包内置裁剪版 Memorix(跨会话记忆层):构建前 stage-memorix 裁剪(--omit=optional 去 lancedb/better-sqlite3,Node 内置 node:sqlite 兜底),随包分发约 +179MB;CLI 安装模式 init.mjs 本地安装 memorix 进 code-index/vendor/memorix 隔离区(不占全局 npm;独立 package.json 使主项目 npm install 不剪、--omit=optional 只裁 vendor 树不伤主树 sharp;MCP/钩子/微 CLI/导入脚本解析本地优先,存量全局安装兼容;卸载只删本地包不碰全局环境;MCP 条目入口失效自动刷新指向本地)并按嵌入路径写配置
 - 嵌入复用本仓模型,零新增下载:GPU 模式指 Ollama OpenAI 兼容层(qwen3-embedding 1024d),CPU 模式指本地常驻新增的 OpenAI 方言端点(jina 768d,与代码索引同一管线)
