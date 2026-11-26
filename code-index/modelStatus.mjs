@@ -1352,8 +1352,11 @@ export function renderModelStatus(p) {
 export async function assessModelStatus({ sessionId = null, phase = null } = {}) {
   const cfg = loadConfig();
   const models = cfg.models;
-  // 自愈补拉节流(2026-11-14 用户定案:用户级可配;2026-11-16 默认回退改 60000 与 config.mjs 同步双点):最小 1000ms 防 0/负值风暴
-  const warmMinIntervalMs = Math.max(1000, Math.floor(Number(cfg.warmMinIntervalMs) || 60000));
+  // 自愈补拉节流(2026-11-14 用户定案:用户级可配)。默认值单源=DEFAULT_CONFIG.warmMinIntervalMs,
+  // 此处不再写第二颗字面量(原「|| 60000」已删,2026-11-26 用户令:去掉重复兜底,避免默认值双点)。
+  // 最小 1000ms 防 0/负值风暴;坏值(非有限数)回落默认——否则 NaN 会让 rerankerWarmDue 恒判"该补",补拉风暴。
+  const warmMinRaw = Math.floor(Number(cfg.warmMinIntervalMs));
+  const warmMinIntervalMs = Math.max(1000, Number.isFinite(warmMinRaw) && warmMinRaw > 0 ? warmMinRaw : DEFAULT_CONFIG.warmMinIntervalMs);
   const modelIn = activeBackend();
   const base = resolveBase();
   let ollama = 'down';

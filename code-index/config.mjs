@@ -161,8 +161,8 @@ export const DEFAULT_CONFIG = {
   embedCpuThreads: Math.max(2, Math.min(4, Math.floor(os.cpus().length / 4))),
   // 自愈补拉节流(2026-11-14 用户定案:可配置;2026-11-16 默认改 60000):模型被驱逐/缺位后,两次补拉之间的最小间隔。
   //   默认 60000=1 分钟(精排掉线滞后窗口实测 10min 太宽,用户裁决收紧);调大=更省电但滞后久。
-  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。⚠ 消费侧兜底 modelStatus.mjs 的 warmMinInterval
-  //   兜底行(搜「|| 60000」,行号随编辑漂移以符号为准)须同改(默认双点)。
+  //   data/code-index.config.json 顶层键可覆盖,最小 1000ms。本键是**默认值唯一真源**——
+  //   消费侧 modelStatus.mjs 直接回落 DEFAULT_CONFIG.warmMinIntervalMs(2026-11-26 删掉原「|| 60000」重复字面量)。
   warmMinIntervalMs: 60000,
   // Ollama runner 异常自愈(2026-11-17 用户定案,默认开):检测 server.log 近 5 分钟
   //   ≥2 条 "llm server error" 且期望模型未驻留(连载 2 轮健康评估计数)⇒ spawn 重启
