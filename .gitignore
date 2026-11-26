@@ -1,6 +1,8 @@
 node_modules/
 data/
 hf-cache/
+# memorix vendor 隔离区(2026-11-25 本地化:安装产物,init 自动重建,不入库)
+code-index/vendor/
 *.tgz
 .zcode/
 .cursor/
@@ -43,3 +45,8 @@ tray/release3/
 tray/release-decision/
 tray/build/weights/
 tray/release-offline/
+# tray 客户端整体不入库(2026-11-26 用户定:开源面只留 CLI,托盘走安装包分发;原发行产物条目被本条覆盖)
+/tray/
+
+# B1(2026-11-25):Memorix 裁剪 staging 产物(stage-memorix.mjs 生成,~179MB,不入库)
+tray/build/memorix-staged/
