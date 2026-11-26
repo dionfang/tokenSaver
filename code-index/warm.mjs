@@ -19,6 +19,7 @@ import { ensureLocalResident, stopLocalResident } from './localResident.mjs';
 import { registerWarmed } from './warmedRegistry.mjs';
 import { embedBusy } from './embedGate.mjs'; // S4-F3(2026-11-11 夜审):busy 判定单源化
 import { pidAlive } from './proc.mjs';
+import { syncMemorixEmbedding, killStaleMemorixServe, resolveMemorixCliForInit } from './init.mjs'; // 切档同步 Memorix 嵌入端点 + 结束旧 serve 进程(init 有 directRun 守卫,import 无副作用)
 
 const cfg = loadConfig();
 const MODELS_CFG = cfg.models;
@@ -113,6 +114,19 @@ if (backend === 'local') {
     registerWarmed({ backend: 'ollama', embedding: MODELS_CFG.embedding, reranker: MODELS_CFG.reranker, decision: decisionWanted ? MODELS_CFG.decision : null });
   }
 }
+
+// Memorix 嵌入配置跟随运行模式(2026-11-25):ollama 档 8118 常驻已停,不同步则 Memorix 语义检索全降级词法。
+// 幂等:受管模板段才重写,用户自定义不动;已同步 no-op 不打日志。
+// 配置真改写时同步结束「指向旧安装路径」的 memorix serve 长驻进程(上游无配置热重载,实测 vendor dist:
+// resetProvider 零调用点 + toml 缓存无失效入口),宿主 MCP 客户端随 stdio 断开重连并按注册条目重拉 → 新入口生效。
+try {
+  const mx = syncMemorixEmbedding({ modelIn: cfg.modelIn });
+  if (mx.synced) {
+    console.error(`[ok] Memorix 嵌入配置${mx.note}(${mx.file})`);
+    const cli = resolveMemorixCliForInit({});
+    killStaleMemorixServe({ newEntry: cli?.args?.[0] || '', cfgChangedAt: mx.changedAt || Date.now(), onInfo: console.error });
+  }
+} catch { /* fail-open,不阻预热 */ }
 
 console.error(`[done] 预热完成,耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 // 嵌入或精排没拉起 → 失败退出。状态句以 modelStatus 的现场判定为准,不单凭这个退出码。

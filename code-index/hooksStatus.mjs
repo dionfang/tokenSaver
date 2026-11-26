@@ -15,16 +15,17 @@ import { isOurZcodeHook, isCodeIndexHookRef, qoderUserDir, USER_FORWARDER_FILES 
 /** init.mjs 各端装配的预期事件清单(判定=写入镜像;改动 rewrite*UserHooks 时同步此表)。 */
 const EXPECTED_EVENTS = {
   zcode: ['SessionStart', 'PostToolUse', 'PostToolUseFailure', 'UserPromptSubmit', 'PreToolUse', 'Stop'],
-  cursor: ['sessionStart', 'beforeSubmitPrompt', 'preToolUse', 'beforeShellExecution', 'postToolUse', 'postToolUseFailure', 'afterAgentResponse'],
+  cursor: ['sessionStart', 'beforeSubmitPrompt', 'preToolUse', 'beforeShellExecution', 'postToolUse', 'postToolUseFailure', 'afterAgentResponse', 'afterFileEdit', 'afterMCPExecution'],
   qoder: ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PostToolUseFailure', 'PreToolUse', 'Stop'],
 };
 
-/** 每个事件至少要有这么多条本模块钩子(与 init rewrite* 写入条数一致)。
- *  只要求「有一条」会把少挂一组(如 PostToolUse 只剩 read-nudge)判成绿。 */
+/** 每个事件至少要有这么多条本模块钩子(与 init rewrite* 写入条数一致,含路A memorix 记忆钩子)。
+ *  只要求「有一条」会把少挂一组(如 PostToolUse 只剩 read-nudge)判成绿。
+ *  路A(2026-11-25):memorix-hook 追加挂载后各事件 +1(SessionStart/UserPromptSubmit/PostToolUse/Stop 等)。 */
 const MIN_OURS = {
-  zcode: { SessionStart: 1, PostToolUse: 2, PostToolUseFailure: 1, UserPromptSubmit: 2, PreToolUse: 1, Stop: 1 },
-  cursor: { sessionStart: 1, beforeSubmitPrompt: 1, preToolUse: 2, beforeShellExecution: 1, postToolUse: 2, postToolUseFailure: 1, afterAgentResponse: 1 },
-  qoder: { SessionStart: 3, UserPromptSubmit: 2, PostToolUse: 2, PostToolUseFailure: 1, PreToolUse: 1, Stop: 1 },
+  zcode: { SessionStart: 2, PostToolUse: 3, PostToolUseFailure: 1, UserPromptSubmit: 3, PreToolUse: 1, Stop: 2 },
+  cursor: { sessionStart: 2, beforeSubmitPrompt: 2, preToolUse: 2, beforeShellExecution: 2, postToolUse: 2, postToolUseFailure: 1, afterAgentResponse: 2, afterFileEdit: 1, afterMCPExecution: 1 },
+  qoder: { SessionStart: 4, UserPromptSubmit: 3, PostToolUse: 3, PostToolUseFailure: 1, PreToolUse: 1, Stop: 2 },
 };
 
 const readJson = (file) => {
@@ -54,8 +55,14 @@ export function scriptRefsIn(cmd) {
 
 const lamp = (host, configPath, cfgRes, detail) => {
   if (cfgRes.missing) return { host, state: 'absent', form: null, missingEvents: [], brokenRefs: [], forwardersMissing: [], configPath };
-  const { missingEvents = [], brokenRefs = [], forwardersMissing = [], form = null } = detail;
-  const state = (missingEvents.length || brokenRefs.length || forwardersMissing.length || cfgRes.broken) ? 'red' : 'green';
+  const { missingEvents = [], brokenRefs = [], forwardersMissing = [], form = null, totalEvents = 0, fullyMissing = 0 } = detail;
+  // 三态(2026-11-25 用户裁定):完整=绿 / 部分缺失=黄 / 完全未装(所有事件零钩子)或配置损坏=红。
+  // 部分缺失=有 missingEvents 但非全部事件都零钩子(基础钩子在、memorix 缺等);完全未装=全部事件零钩子。
+  let state;
+  if (cfgRes.broken) state = 'red';
+  else if (!missingEvents.length && !brokenRefs.length && !forwardersMissing.length) state = 'green';
+  else if (totalEvents > 0 && fullyMissing >= totalEvents) state = 'red'; // 完全未装任何钩子
+  else state = 'yellow'; // 部分缺失
   return { host, state, form, missingEvents, brokenRefs, forwardersMissing, configPath, ...(cfgRes.broken ? { note: `JSON 解析失败:${cfgRes.broken}` } : {}) };
 };
 
@@ -66,10 +73,12 @@ function assessZcode(home) {
   const events = cfgRes.cfg?.hooks?.events && typeof cfgRes.cfg.hooks.events === 'object' ? cfgRes.cfg.hooks.events : {};
   const missingEvents = [], brokenRefs = [];
   let form = 'node';
+  let fullyMissing = 0;
   for (const ev of EXPECTED_EVENTS.zcode) {
     const groups = Array.isArray(events[ev]) ? events[ev] : [];
     const ours = groups.flatMap((g) => (Array.isArray(g?.hooks) ? g.hooks : [])).filter(isOurZcodeHook);
     const need = MIN_OURS.zcode[ev] ?? 1;
+    if (ours.length === 0) fullyMissing++;
     if (ours.length < need) { missingEvents.push(ev); continue; }
     for (const h of ours) {
       form = h.command === 'node' ? form : 'relay'; // relay 形:command=中继 exe,脚本在 args[0];node 形:直启
@@ -78,7 +87,7 @@ function assessZcode(home) {
       }
     }
   }
-  return lamp('zcode', configPath, cfgRes, { missingEvents, brokenRefs, form });
+  return lamp('zcode', configPath, cfgRes, { missingEvents, brokenRefs, form, totalEvents: EXPECTED_EVENTS.zcode.length, fullyMissing });
 }
 
 /** Cursor/Qoder 共用:判 ours=isCodeIndexHookRef(command)。Cursor 单层(hooks.<event>=[hook]),
@@ -87,17 +96,19 @@ function assessForwarderHost({ host, configPath, cfgRes, hooksRoot, expected, fo
   if (cfgRes.missing || cfgRes.broken) return lamp(host, configPath, cfgRes, {});
   const hooks = cfgRes.cfg?.hooks && typeof cfgRes.cfg.hooks === 'object' ? cfgRes.cfg.hooks : {};
   const missingEvents = [], brokenRefs = [], forwardersMissing = [];
+  let fullyMissing = 0;
   for (const ev of expected) {
     const entries = Array.isArray(hooks[ev]) ? hooks[ev] : [];
     const ours = entries
       .flatMap((e) => (Array.isArray(e?.hooks) ? e.hooks : [e]))
       .filter((h) => isCodeIndexHookRef(h?.command));
     const need = MIN_OURS[host]?.[ev] ?? 1;
+    if (ours.length === 0) fullyMissing++;
     if (ours.length < need) { missingEvents.push(ev); continue; }
     for (const h of ours) for (const ref of scriptRefsIn(h.command)) if (!fs.existsSync(ref)) brokenRefs.push(ref);
   }
   for (const f of forwarders) if (!fs.existsSync(path.join(hooksRoot, f))) forwardersMissing.push(f);
-  return lamp(host, configPath, cfgRes, { missingEvents, brokenRefs, forwardersMissing, form: 'node' });
+  return lamp(host, configPath, cfgRes, { missingEvents, brokenRefs, forwardersMissing, form: 'node', totalEvents: expected.length, fullyMissing });
 }
 
 const assessCursor = (home) => assessForwarderHost({

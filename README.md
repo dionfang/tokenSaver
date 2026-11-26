@@ -11,7 +11,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有三大核心功能模块。
 
 **模块二:动态模型路由(AutoTier)**——本地代理即自定义模型端点,客户端多出一个虚拟模型档位 `auto`;选中它的会话由代理按 prompt 难度四档定档(R1-R4,以 R3=1x 为基准),贵模型只在必要时使用;自进化闭环持续降本。**仅 ZCode 与 Qoder 支持,且只对以自定义模型接入的供应商生效——供应商清单允许混合协议(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses),但连续 `auto` 激活段只同协议透传;显式模型请求保留跨协议桥接能力**。
 
-**模块三:跨会话记忆(Memorix)**——内置记忆层让 Agent 跨会话、跨工具记住项目知识:会话开始/用户输入自动注入相关记忆,工具调用/会话结束自动捕获沉淀;嵌入复用本仓模型零新增下载,切换运行模式自动同步记忆嵌入配置;记忆数据存本机 SQLite 归用户所有,卸载不删。**Cursor、ZCode、Qoder 三端 MCP 接入**。
+**模块三:跨会话记忆(Memorix)**——内置记忆层让 Agent 跨会话、跨工具记住项目知识:会话开始默认 full 档直接注入整份记忆简报(所有项目生效,确保跨会话记忆到场),续接/压缩恢复时用户输入再注前情;工具调用/会话结束自动捕获沉淀(只读/检索类噪声前置过滤不落库);嵌入复用本仓模型零新增下载,切换运行模式自动同步记忆嵌入配置;记忆数据存本机 SQLite 归用户所有,卸载不删。**Cursor、ZCode、Qoder 三端 MCP 接入**。注入是否真到达模型可用 `node tools/checkCursorMemorix.mjs` 读 Cursor 钩子日志分三层(接线/执行/产出)判定,不靠询问模型。
 
 适合在本地代码库上用 Agent 开发。默认推荐**桌面客户端(托盘守护程序)**安装,无需命令行;纯命令行只是不装守护程序时的备选。一个 TokenSaver 可以用 `--roots` 索引多个目录。代码、分块和向量写在本机 `data/`,不进入 git。
 
@@ -38,7 +38,7 @@ TokenSaver 是跑在本机的 Agent 提效工具,有三大核心功能模块。
 
 #### 跨工具会话记忆(要点)
 
-- 内置 Memorix 记忆层(替代 OpenViking):本地安装进 code-index/vendor/memorix 隔离区(不占全局 npm,客户端模式随安装包内置);ZCode/Qoder/Cursor 三端 MCP 接入,编辑器内即用记忆工具;会话开始/用户输入自动注入相关记忆,工具调用/会话结束自动捕获沉淀,跨会话、跨工具共享。
+- 内置 Memorix 记忆层(替代 OpenViking):本地安装进 code-index/vendor/memorix 隔离区(不占全局 npm,客户端模式随安装包内置);ZCode/Qoder/Cursor 三端 MCP 接入,编辑器内即用记忆工具;会话开始默认 full 档注入整份记忆简报(所有项目;改 ~/.memorix/config.toml 的 inject 或项目根 memorix.toml 可换 minimal/silent),续接/压缩恢复时用户输入再注前情;工具调用/会话结束自动捕获沉淀(只读/检索类噪声前置过滤),跨会话、跨工具共享。
 - 嵌入复用本仓模型,零新增下载:CPU 模式指本地常驻端点(jina 768d),GPU 模式指 Ollama(qwen3-embedding 1024d);切换运行模式时预热自动同步记忆嵌入配置(仅重写工具生成段,用户自定义不覆盖),并结束持有旧配置的常驻记忆 MCP 进程——宿主随即按注册条目重拉,无需手动重启。记忆数据本体存 SQLite 与嵌入模型无关,切换不丢数据;维度不同的向量索引分表共存,切回即恢复。
 - 记忆嵌入端点每次采集真探活:端点连不上记忆灯判红(维度缓存假绿防线);端点暂不可达时记忆写入照常、检索降级词法,恢复后自动回血。
 - 数据归用户:`~/.memorix/`(SQLite);卸载工具只摘钩子/MCP/配置,数据保留可手动删。历史知识可用 `node tools/memorix-import-docs.mjs` 一次性导入(幂等台账去重)。
@@ -203,7 +203,7 @@ TokenSaver is a local agent productivity tool with three core feature modules.
 
 **Module 2: Dynamic Model Routing (AutoTier)** — the local proxy doubles as a custom-model endpoint and the client gains a virtual model tier `auto`; sessions that select it are dispatched across four difficulty tiers (R1-R4, with R3 = 1x as base), so expensive models run only when needed; a self-evolution loop keeps reducing cost. **ZCode and Qoder only, and only for providers wired in as custom models — the provider inventory may mix protocols (Anthropic Messages / OpenAI Chat Completions / OpenAI Responses), but a continuous `auto` activation segment is same-protocol pass-through only; explicit-model requests retain cross-protocol bridging.**
 
-**Module 3: Cross-session Memory (Memorix)** — a built-in memory layer lets the agent remember project knowledge across sessions and across tools: relevant memories are auto-injected at session start / user prompts, and new ones auto-captured on tool calls / session end; embedding reuses this repo's models with zero extra downloads and syncs automatically on mode switches; memory data lives in local SQLite owned by the user and survives uninstall. **MCP wiring on all three clients: Cursor, ZCode, and Qoder.**
+**Module 3: Cross-session Memory (Memorix)** — a built-in memory layer lets the agent remember project knowledge across sessions and across tools: session start defaults to the full injection tier, pushing a complete memory brief into context for every project so cross-session memory actually lands; continuation / post-compaction prompts inject prior-work context on demand; tool calls / session end auto-capture new memories (read-only / search noise is pre-filtered and never stored); embedding reuses this repo's models with zero extra downloads and syncs automatically on mode switches; memory data lives in local SQLite owned by the user and survives uninstall. **MCP wiring on all three clients: Cursor, ZCode, and Qoder.** Whether an injection actually reaches the model can be verified with `node tools/checkCursorMemorix.mjs`, which reads Cursor's own hook log and judges it in three layers (wiring / execution / payload) instead of asking the model.
 
 Built for agent-based development on local repositories. The **desktop client (tray guardian)** is the recommended install — no command line needed; the pure CLI is the fallback for when you prefer not to install the guardian. One TokenSaver can index several directories with `--roots`. Chunks and vectors stay in a local `data/` directory and are not committed to git.
 
@@ -230,7 +230,7 @@ Configuration has two layers: model deployment parameters in `code-index/config.
 
 #### Cross-tool session memory (key points)
 
-- Built-in Memorix memory layer (replacing OpenViking): installed locally into the isolated code-index/vendor/memorix directory (no global npm footprint; the client install bundles it inside the package); MCP wiring on ZCode/Qoder/Cursor puts memory tools inside the editor; session start / user prompts auto-inject relevant memories, tool calls / session end auto-capture new ones — shared across sessions and across tools.
+- Built-in Memorix memory layer (replacing OpenViking): installed locally into the isolated code-index/vendor/memorix directory (no global npm footprint; the client install bundles it inside the package); MCP wiring on ZCode/Qoder/Cursor puts memory tools inside the editor; session start defaults to the full tier and injects a complete memory brief for every project (switch via `inject` in ~/.memorix/config.toml or a project-root memorix.toml: minimal/silent), continuation / post-compaction prompts inject prior-work context on demand; tool calls / session end auto-capture new ones (read-only / search noise pre-filtered) — shared across sessions and across tools.
 - Embedding reuses this repo's models, zero extra downloads: CPU mode points at the local resident endpoint (jina 768d), GPU mode at Ollama (qwen3-embedding 1024d); warm-up syncs the memory embedding config on every mode switch (only tool-generated sections are rewritten; user customizations are never overwritten) and ends resident memory-MCP processes that still hold the old config — the host then re-pulls them from their registered entry, so no manual restart is needed. Memory records live in SQLite independently of the embedding model, so switching loses no data; vector indexes of different dimensions coexist in separate tables and resume on switch-back.
 - The memory embedding endpoint is genuinely probed on every status collection: an unreachable endpoint turns the memory lamp red (guard against dims-cache false green); while the endpoint is down, memory writes continue and retrieval degrades to lexical search, recovering automatically once it is back.
 - Data belongs to the user: `~/.memorix/` (SQLite); uninstalling the tool only removes hooks/MCP/config and keeps the data (delete manually if desired). Historical knowledge can be imported once via `node tools/memorix-import-docs.mjs` (idempotent ledger dedup).

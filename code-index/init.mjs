@@ -55,7 +55,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_CONFIG, DATA_DIR, PACKED_INSTALL, findGitRoot, KNOWN_ANNOTATIONS_PATH, loadKnownAnnotations, MAX_PHASE_TURNS, SWITCH_GUARD_MAX_CONTEXT_TOKENS, resolveLayout } from './config.mjs';
 import { localOnnxCached } from './localRerank.mjs';
-import { spawnLogged } from './proc.mjs';
+import { spawnLogged, atomicWriteFileSync, findNodeScriptProcesses } from './proc.mjs';
 
 const here = fs.realpathSync.native(path.dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
@@ -81,9 +81,21 @@ export function detectAgent(env = process.env) {
 /** --hooks 优先;否则检测到哪个装哪个;都没有则三套都装。 */
 export function resolveHookTargets(hooksArg, env = process.env) {
   if (hooksArg === 'all') return [...HOOK_TOOLS];
+  if (hooksArg === 'detected') return detectInstalledAgents(); // 2026-11-25 用户裁定:只接电脑已装的 agent
   if (hooksArg) return [hooksArg];
   const d = detectAgent(env);
   return d ? [d] : [...HOOK_TOOLS];
+}
+
+/** 按配置目录存在性探测电脑已安装的 agent 工具(2026-11-25 用户裁定:向导只接检测到的)。
+ *  不同于 detectAgent(运行时 env 探测当前宿主):此函数看 ~/.zcode、~/.cursor、~/.qoder-cn/~/.qoder 目录。
+ *  返回检测到的工具数组(可能为空=一个都没装);纯函数,home 可注入供单测。 */
+export function detectInstalledAgents(home = os.homedir()) {
+  const out = [];
+  if (fs.existsSync(path.join(home, '.zcode'))) out.push('zcode');
+  if (fs.existsSync(path.join(home, '.cursor'))) out.push('cursor');
+  if (fs.existsSync(path.join(home, '.qoder-cn')) || fs.existsSync(path.join(home, '.qoder'))) out.push('qoder');
+  return out;
 }
 
 /** 解析 init 参数。错误时返回 { error },不写配置。同一参数出现多次时后者生效。 */
@@ -136,8 +148,8 @@ export function parseInitArgs(argv) {
     } else if (name === '--model-in') out.modelIn = value;
     else {
       const v = String(value).trim().toLowerCase();
-      if (v !== 'all' && !HOOK_TOOLS.includes(v)) {
-        return { error: `--hooks 只能是 all|cursor|zcode|qoder,收到 ${value}` };
+      if (v !== 'all' && v !== 'detected' && !HOOK_TOOLS.includes(v)) {
+        return { error: `--hooks 只能是 all|detected|cursor|zcode|qoder,收到 ${value}` };
       }
       out.hooks = v;
     }
@@ -210,6 +222,428 @@ export function seedDefaultModelPrices({ dataDir = DATA_DIR } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(table, null, 2) + '\n');
   return { seeded: true, file };
+}
+
+// ---------- Memorix 跨会话记忆集成(2026-11-25 用户拍板:默认开,替代 OpenViking) ----------
+
+/** Memorix 要求 Node ≥22.18(实测 22.19 可用);旧 Node 跳过安装不阻主流程。纯函数。 */
+export function memorixNodeOk(nodeVersion) {
+  const m = /^v(\d+)\.(\d+)\.(\d+)/.exec(String(nodeVersion || ''));
+  if (!m) return false;
+  const [major, minor] = [Number(m[1]), Number(m[2])];
+  return major > 22 || (major === 22 && minor >= 18);
+}
+
+/** 按 modelIn 生成 Memorix 嵌入 TOML(阶段A,2026-11-25):GPU=Ollama OpenAI 兼容层(须带 /v1,
+ *  memorix 1.10.x 直拼 ${base_url}/embeddings);CPU=本地常驻 8118 的 OpenAI 方言 shim(同 pipe)。
+ *  两种接法均已实弹验证(api-qwen3 1024d / api-jina 768d)。纯函数。 */
+export function memorixEmbeddingToml(modelIn) {
+  if (modelIn === 'local') {
+    return ['[embedding]',
+      'provider = "api"',
+      'model = "jina-embeddings-v2-base-zh"',
+      'base_url = "http://127.0.0.1:8118"',
+      'api_key = "none"',
+      'dimensions = 768',
+      '',
+      '[memory]',
+      'inject = "full"',
+      'formation = "active"',
+      ''].join('\n');
+  }
+  return ['[embedding]',
+    'provider = "api"',
+    'model = "qwen3-embedding:0.6b"',
+    'base_url = "http://127.0.0.1:11434/v1"',
+    'api_key = "none"',
+    'dimensions = 1024',
+    '',
+    '[memory]',
+    'inject = "full"',
+    'formation = "active"',
+    ''].join('\n');
+}
+
+/** 写 ~/.memorix/config.toml(已存在则只在缺失 [embedding] 段时补;用户改过则不动)。返回 {written, file, note}。 */
+export function ensureMemorixConfig({ home = os.homedir(), modelIn = 'local' } = {}) {
+  const file = path.join(home, '.memorix', 'config.toml');
+  const embeddingToml = memorixEmbeddingToml(modelIn);
+  try {
+    if (fs.existsSync(file)) {
+      const prev = fs.readFileSync(file, 'utf8');
+      if (/\[embedding\]/.test(prev)) return { written: false, file, note: '已有 config.toml(含 [embedding]),不覆盖' };
+      fs.writeFileSync(file, prev.trimEnd() + '\n\n' + embeddingToml);
+      return { written: true, file, note: '已有 config.toml,已补 [embedding] 段' };
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, embeddingToml);
+    return { written: true, file, note: '新建' };
+  } catch (e) { return { written: false, file, note: `写失败:${e.message}` }; }
+}
+
+/** 切档同步 Memorix 嵌入配置(2026-11-25):现 [embedding] 段恰等于两套受管模板之一才按 modelIn 重写,
+ *  用户自定义段不动(SOP N11);保留 [memory]/[agent] 等其余段落。warm.mjs 每次预热收尾调用,幂等。
+ *  无文件/缺段委托 ensureMemorixConfig(播种口径不变)。返回 {synced, file, note}。fail-open。 */
+export function syncMemorixEmbedding({ home = os.homedir(), modelIn = 'local' } = {}) {
+  const file = path.join(home, '.memorix', 'config.toml');
+  try {
+    if (!fs.existsSync(file)) {
+      const r = ensureMemorixConfig({ home, modelIn });
+      return { synced: r.written, file, note: r.note };
+    }
+    const prev = fs.readFileSync(file, 'utf8');
+    const lines = prev.split('\n');
+    const start = lines.findIndex((l) => l.trim() === '[embedding]');
+    if (start < 0) {
+      const r = ensureMemorixConfig({ home, modelIn });
+      return { synced: r.written, file, note: r.note };
+    }
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (/^\s*\[/.test(lines[i])) { end = i; break; }
+    }
+    const norm = (ls) => ls.map((l) => l.trim()).filter(Boolean).join('\n');
+    const cur = norm(lines.slice(start, end));
+    const tplSection = (m) => {
+      const t = memorixEmbeddingToml(m).split('\n');
+      const s = t.indexOf('[embedding]');
+      const e = t.findIndex((l, i) => i > s && l.startsWith('['));
+      return norm(t.slice(s, e < 0 ? t.length : e));
+    };
+    const managed = ['local', 'ollama'].some((m) => cur === tplSection(m));
+    if (!managed) return { synced: false, file, note: '用户自定义 [embedding],不覆盖' };
+    const target = tplSection(modelIn);
+    if (cur === target) return { synced: false, file, note: '已同步' };
+    const targetLines = memorixEmbeddingToml(modelIn).split('\n');
+    const ts = targetLines.indexOf('[embedding]');
+    const te = targetLines.findIndex((l, i) => i > ts && l.startsWith('['));
+    const next = [...lines.slice(0, start), ...targetLines.slice(ts, te < 0 ? targetLines.length : te), ...lines.slice(end)].join('\n');
+    fs.writeFileSync(file, next);
+    return { synced: true, file, note: `已同步 ${modelIn}`, changedAt: Date.now() };
+  } catch (e) { return { synced: false, file, note: `同步失败:${e.message}` }; }
+}
+
+/** 存量机 inject 升档同步(2026-11-26 用户拍板:所有 agent 工具默认 full 保跨会话记忆生效)。
+ *  ensureMemorixConfig 见 [embedding] 即不覆盖、syncMemorixEmbedding 只碰 [embedding]——存量机的
+ *  inject="minimal" 播种值没人改,这里补上:仅把恰为旧播种默认 "minimal" 的行升为 "full";
+ *  用户显式改过的其他值(silent/自定义)不动(N11 同口径)。幂等;无文件/无该行 no-op。
+ *  返回 {synced, file, note}。fail-open。 */
+export function syncMemorixInject({ home = os.homedir() } = {}) {
+  const file = path.join(home, '.memorix', 'config.toml');
+  try {
+    if (!fs.existsSync(file)) return { synced: false, file, note: '无 config.toml,不处理' };
+    const prev = fs.readFileSync(file, 'utf8');
+    if (!/^\s*inject\s*=\s*"minimal"\s*$/m.test(prev)) return { synced: false, file, note: '非 minimal 播种值,不动' };
+    fs.writeFileSync(file, prev.replace(/^(\s*inject\s*=\s*)"minimal"(\s*)$/m, '$1"full"$2'));
+    return { synced: true, file, note: 'inject minimal→full(存量播种值升档)', changedAt: Date.now() };
+  } catch (e) { return { synced: false, file, note: `同步失败:${e.message}` }; }
+}
+
+/** 判定某 memorix serve 进程是否「持有旧嵌入配置」(纯函数,供单测)。
+ *  口径(用户拍板 2026-11-25):切档只改 ~/.memorix/config.toml 的嵌入端点,memorix 二进制路径不变,
+ *  所以判据不是「路径不同」而是「进程启动早于配置改写时刻」——它读到的就是旧配置。
+ *  边界:①只认 serve 长驻(hook/status 等短命进程不杀);②命令行含 memorix 但入口不可辨 → 不碰;
+ *  ③启动时间不可辨 → 不碰(宁不杀,不可误伤);④与新入口路径不同的一律杀(本地化迁移:旧全局路径的 serve 必须换)。
+ *  入参 cmd=归一化命令行;startedAt=进程启动时间戳(ms,可空);cfgChangedAt=配置改写时刻(ms);newEntry=新入口。 */
+export function memorixServeIsStale(cmd, startedAt, cfgChangedAt, newEntry = '') {
+  const norm = String(cmd || '').split(/[\\/]/).join('/');
+  if (!/memorix/i.test(norm)) return false;
+  if (!/\bserve\b/.test(norm)) return false; // 只认 serve 长驻
+  const js = norm.match(/[^\s"']*memorix[^\s"']*\.js/i);
+  if (!js) return false; // 入口不可辨 → 不碰(N11 不误伤用户自装)
+  const target = String(newEntry || '').split(/[\\/]/).join('/');
+  if (target && js[0] !== target) return true; // 指向旧安装路径 → 换
+  if (!Number.isFinite(startedAt) || !Number.isFinite(cfgChangedAt)) return false; // 启动时间不可辨 → 不碰
+  return startedAt < cfgChangedAt; // 早于配置改写 = 持有旧配置
+}
+
+/** 切档后结束持有旧嵌入配置的 memorix serve 长驻进程(2026-11-25 用户拍板:自动重启 MCP)。
+ *  背景:memorix 无配置热重载(resetProvider 零调用点 / toml 缓存无失效入口,实测 vendor dist),
+ *  改写 ~/.memorix/config.toml 后已在跑的 serve 进程仍持旧 provider → 记忆语义检索停留在旧端点。
+ *  宿主(ZCode/Qoder/Cursor)的 MCP 客户端在 stdio 断开后重连并按注册条目重拉 → 新入口/新配置生效。
+ *  只杀「持有旧配置」或「指向旧安装路径」的进程;用户自装且配置未变的实例不动。fail-open。 */
+export function killStaleMemorixServe({ newEntry = '', cfgChangedAt = 0, platform = process.platform, onInfo = console.error } = {}) {
+  const scanned = [];
+  const killed = [];
+  try {
+    const procs = findNodeScriptProcesses({ scriptNames: ['memorix'], moduleDir: '', platform, withStartedAt: true });
+    for (const p of procs) {
+      if (!memorixServeIsStale(p.cmd, p.startedAt, cfgChangedAt, newEntry)) continue;
+      scanned.push(p.pid);
+      try { process.kill(p.pid); killed.push(p.pid); onInfo(`  [ok] 已结束旧 Memorix MCP 进程 ${p.pid}(嵌入配置已变更,宿主将按注册条目重拉)`); }
+      catch { /* 已退出 */ }
+    }
+  } catch { /* 枚举失败 fail-open */ }
+  return { scanned, killed };
+}
+
+/** 安装/校验本地 memorix(2026-11-25 用户拍板:CLI 模式不占全局 npm,与客户端随包同构):
+ *  装进 code-index/vendor/memorix/(独立 package.json 隔离区)。
+ *  ⚠️ 不能装进 code-index/node_modules 本体(2026-11-25 实弹两坑):①在主目录跑
+ *  `npm i memorix --omit=optional` 会按 memorix 视角重算整棵树,裁掉主项目 sharp 的 win32 平台可选件
+ *  (transformersLoader 崩);②--no-save 装的包会被下一次主项目 `npm install` 当 extraneous 剪掉。
+ *  vendor 子目录有自己的 package.json(memorix 登记为 dependency),主项目 npm 不认识也不会碰它。
+ *  --omit=optional 只作用于 vendor 树(裁 @lancedb 326MB/better-sqlite3,api 路径零依赖,916MB→~250MB)。
+ *  版本钉 MEMORIX_PINNED_VERSION 与 tray/build/memorix-staged 同源。失败一律不阻主流程(fail-open)。
+ *  moduleDir 注入供单测(不真 npm)。 */
+import { patchMemorixCursorContinuation } from './memorixCursorPatch.mjs';
+import { CURSOR_MEMORIX_EVENTS, cursorMemorixTimeoutSec } from './memorix-cursor-hook.mjs';
+export const MEMORIX_PINNED_VERSION = '1.10.4';
+export function memorixVendorDir(moduleDir = here) { return path.join(moduleDir, 'vendor', 'memorix'); }
+export function memorixLocalEntry(moduleDir = here) { return path.join(memorixVendorDir(moduleDir), 'node_modules', 'memorix', 'dist', 'cli', 'index.js'); }
+export function installMemorixLocal({ onInfo = console.error, npmRegistry = null, timeoutMs = 10 * 60 * 1000, moduleDir = here } = {}) {
+  if (!memorixNodeOk(process.version)) {
+    onInfo(`  [note] Node ${process.version} < 22.18,Memorix(跨会话记忆)跳过安装(不影响索引/路由)`);
+    return { installed: false, reason: 'node-too-old' };
+  }
+  const entry = memorixLocalEntry(moduleDir);
+  if (fs.existsSync(entry)) {
+    const patched = patchMemorixCursorContinuation(entry);
+    if (!patched.ok) onInfo(`  [warn] memorix cursor 通道补丁未打上(${patched.reason})`);
+    else if (patched.changed) onInfo('  [ok] memorix cursor 通道补丁已打上(续接简报+编辑正文+回复准入)');
+    onInfo('  [ok] memorix 已本地安装(校验过)');
+    return { installed: true, already: true, entry };
+  }
+  const vendor = memorixVendorDir(moduleDir);
+  try {
+    fs.mkdirSync(vendor, { recursive: true });
+    fs.writeFileSync(path.join(vendor, 'package.json'), JSON.stringify({ name: 'memorix-vendor', private: true, version: '0.0.0', dependencies: { memorix: MEMORIX_PINNED_VERSION } }, null, 2) + '\n');
+  } catch (e) { return { installed: false, reason: `vendor 目录写失败:${e.message}` }; }
+  const args = ['install', '--omit=optional', '--no-audit', '--no-fund'];
+  if (npmRegistry) args.push(`--registry=${npmRegistry}`);
+  const r = spawnSync('npm', args, { cwd: vendor, windowsHide: true, encoding: 'utf8', timeout: timeoutMs, shell: true });
+  if (r.status === 0 && fs.existsSync(entry)) {
+    const patched = patchMemorixCursorContinuation(entry);
+    if (!patched.ok) onInfo(`  [warn] memorix cursor 通道补丁未打上(${patched.reason})`);
+    onInfo(`  [ok] memorix 已本地安装 v${MEMORIX_PINNED_VERSION}(vendor 隔离区,--omit=optional 裁剪,不占全局 npm)`);
+    return { installed: true, entry };
+  }
+  onInfo(`  [warn] memorix 本地安装失败(不阻主流程;可手动在 code-index/vendor/memorix 执行 npm i --omit=optional):${String(r.stderr || '').slice(0, 120)}`);
+  return { installed: false, reason: 'npm-failed' };
+}
+
+/** 从 memorix CLI 的 stdout 提取 JSON(防御层,B1 2026-11-25 实测闭环)。
+ *  实测:memorix --json 模式日志走 stderr、stdout 纯 JSON(status/doctor/recent 三命令首字符皆 {、零 [memorix])。
+ *  故 spawn 只取 stdout 即可直接 parse;本函数是稳健兜底——万一上游某版本往 stdout 掺 [memorix] 日志/
+ *  ExperimentalWarning,取首个 { 或 [ 起的子串试解析,失败再逐行扫描找完整 JSON 块。纯函数,供单测与 B2 微 CLI 消费。
+ *  返回解析后的对象;无合法 JSON 返回 null(fail-open,调用方按 absent 处理)。 */
+export function extractMemorixJson(stdout) {
+  const s = String(stdout || '');
+  if (!s.trim()) return null;
+  // 快路径:整段就是 JSON(实测常态)
+  try { return JSON.parse(s); } catch { /* 掺了前缀/后缀,走提取 */ }
+  // 找 JSON 起点:逐行取 trim 后以 { 或 [ 开头的行(不能全局 search 字符——
+  // [memorix] 日志的 [ 会被误当数组起点)。memorix 输出皆对象,优先 {。
+  const lines = s.split('\n');
+  let startIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.startsWith('{')) { startIdx = i; break; } // 对象起点直接认(memorix 输出皆对象)
+    // [ 开头须后跟 JSON 数组合法首字符,排除 [memorix] 这类日志([m 字母不算)
+    if (t.startsWith('[') && /^[\s]*\[["\{\[\d\-tfn]/.test(t)) { startIdx = i; break; }
+  }
+  if (startIdx < 0) return null;
+  const body = lines.slice(startIdx).join('\n');
+  try { return JSON.parse(body); } catch { /* 末尾可能有噪声,截到最后一个 } 或 ] */ }
+  for (const close of ['}', ']']) {
+    const end = body.lastIndexOf(close);
+    if (end > 0) {
+      try { return JSON.parse(body.slice(0, end + 1)); } catch { /* 继续 */ }
+    }
+  }
+  return null;
+}
+
+/** 注册 Memorix MCP 到 ZCode(B2,2026-11-25):写 ~/.zcode/cli/config.json 的 mcp.servers.memorix
+ *  (照 OpenViking 范式 {command,args,env})。command=node 运行时,args=[memorix CLI, serve, --mode, micro]。
+ *  已存在则不覆盖(用户改过则动);memorix 未安装/CLI 探不到则跳过(fail-open)。返回 {registered, note}。 */
+export function ensureMemorixMcp({ home = os.homedir(), cli = null } = {}) {
+  const file = path.join(home, '.zcode', 'cli', 'config.json');
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return { registered: false, note: '无 ZCode config.json(宿主未装)' }; }
+  const resolved = cli || resolveMemorixCliForInit();
+  const existing = cfg?.mcp?.servers?.memorix;
+  if (existing && !memorixMcpEntryStale(existing, resolved)) return { registered: true, note: '已注册,不覆盖' };
+  if (!resolved) return { registered: false, note: 'memorix CLI 未探到,跳过 MCP 注册' };
+  cfg.mcp = cfg.mcp || {};
+  cfg.mcp.servers = cfg.mcp.servers || {};
+  cfg.mcp.servers.memorix = memorixMcpServerEntry(resolved);
+  try {
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+    return { registered: true, note: existing ? '入口漂移已刷新 mcp.servers.memorix' : '已注册 mcp.servers.memorix' };
+  } catch (e) { return { registered: false, note: `写失败:${e.message}` }; }
+}
+
+/** 装机态 packed memorix CLI(纯路径核对,20261125 修复 0.2.26 测试机记忆 MCP 灯灰):
+ *  布局 resources/node_modules/{code-index,memorix} 同级,入口=模块目录/../memorix/dist/cli/index.js。
+ *  不 import memorixStatus.resolveMemorixCli——它反向 import 本文件 extractMemorixJson,顶层会成环。
+ *  command=node 绝对路径+JS 入口(N102 口径)。探不到返回 null。moduleDir 注入供单测。 */
+export function resolvePackedMemorixCli({ moduleDir = here } = {}) {
+  const entry = path.join(moduleDir, '..', 'memorix', 'dist', 'cli', 'index.js');
+  return fs.existsSync(entry) ? { command: process.execPath, args: [entry], source: 'packed' } : null;
+}
+
+/** init 侧探 memorix CLI(避免循环 import 内联轻量版)。本地 node_modules 优先(2026-11-25 本地化),
+ *  PATH 兜底(存量全局安装兼容)。PATH 探到后必须解析出真实 JS 入口:
+ *  `node memorix` 按路径解析会 Cannot find module(2026-11-25 实证),裸 .cmd shim 又依赖宿主 shell。
+ *  Windows:npm 全局 shim 与 node_modules 同目录;POSIX:bin 符号链接 realpath 直指 CLI JS。
+ *  解析不出才回退命令名(交宿主 shell 解析)。返回 {command,args,source} 或 null。 */
+export function resolveMemorixCliForInit({ moduleDir = here } = {}) {
+  const local = memorixLocalEntry(moduleDir);
+  if (fs.existsSync(local)) return { command: process.execPath, args: [local], source: 'local' };
+  const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['memorix'], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  if (probe.status !== 0 || !String(probe.stdout || '').trim()) return null;
+  const shim = String(probe.stdout).split('\n')[0].trim();
+  const candidates = [path.join(path.dirname(shim), 'node_modules', 'memorix', 'dist', 'cli', 'index.js')];
+  try { candidates.push(fs.realpathSync(shim)); } catch { /* 非符号链接 */ }
+  for (const c of candidates) {
+    if (/\.js$/i.test(c) && fs.existsSync(c)) return { command: process.execPath, args: [c], source: 'path' };
+  }
+  return { command: 'memorix', args: [], source: 'path-shim' };
+}
+
+/** MCP 条目入口漂移判定(2026-11-25 本地化迁移):已注册条目的 JS 入口(args 首个 .js)与当前解析不一致
+ *  且旧入口文件已不在(全局卸载/换布局)→ 须刷新;旧入口仍在(用户自装/自定义)→ 不动(N11)。
+ *  返回 true=应刷新。纯函数供单测。 */
+export function memorixMcpEntryStale(entry, resolved, existsSync = fs.existsSync) {
+  if (!entry || !resolved) return false;
+  const oldJs = Array.isArray(entry.args) ? entry.args.find((a) => typeof a === 'string' && /\.js$/i.test(a)) : null;
+  const newJs = resolved.args.find((a) => typeof a === 'string' && /\.js$/i.test(a));
+  if (!oldJs || !newJs) return false;
+  return path.resolve(oldJs) !== path.resolve(newJs) && !existsSync(oldJs);
+}
+
+/** 三宿主共用的 Memorix MCP stdio 条目。command/args 前缀由 CLI 解析决定,这里只追加 serve。 */
+function memorixMcpServerEntry(resolved) {
+  return {
+    command: resolved.command,
+    args: [...resolved.args, 'serve', '--mode', 'micro'],
+    env: {},
+  };
+}
+
+/** 摘除 Memorix MCP 注册(B2 对称清理,uninit 消费):删 mcp.servers.memorix,其余 mcp.servers 不动。 */
+export function removeMemorixMcp({ home = os.homedir() } = {}) {
+  const file = path.join(home, '.zcode', 'cli', 'config.json');
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return { removed: false }; }
+  if (!cfg?.mcp?.servers?.memorix) return { removed: false };
+  delete cfg.mcp.servers.memorix;
+  try { fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n'); return { removed: true }; }
+  catch { return { removed: false }; }
+}
+
+/** 注册 Memorix MCP 到 Qoder(B2 补全,2026-11-25):写用户级 settings.json 的 mcpServers.memorix
+ *  (官方自定义连接器形态 {command,args,env};目录口径同 qoderUserDir:CN ~/.qoder-cn 优先,国际 ~/.qoder)。
+ *  真源是 settings.json 顶层 mcpServers(官方 settings-reference 缺省 {};connectors 也写这个键)。
+ *  宿主从未加过自定义 MCP 时该键不存在,首次注册补建;mcp-router.json 是运行时路由状态,不写。
+ *  其余键与既有他牌 MCP 条目原样保留。settings.json 是宿主活跃文件,
+ *  照 virtualProvider 惯例写前备份 .bak-tokensaver + 原子写。已存在不覆盖;宿主未装/CLI 探不到跳过(fail-open)。 */
+export function ensureQoderMemorixMcp({ home = os.homedir(), cli = null } = {}) {
+  const file = path.join(qoderUserDir(home), 'settings.json');
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return { registered: false, note: '无 Qoder settings.json(宿主未装)' }; }
+  let cfg;
+  try { cfg = JSON.parse(raw); } catch { return { registered: false, note: 'Qoder settings.json 非合法 JSON,不动' }; }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return { registered: false, note: 'Qoder settings.json 非对象,不动' };
+  const resolved = cli || resolveMemorixCliForInit();
+  const existing = cfg.mcpServers?.memorix;
+  if (existing && !memorixMcpEntryStale(existing, resolved)) return { registered: true, note: '已注册,不覆盖' };
+  if (!resolved) return { registered: false, note: 'memorix CLI 未探到,跳过 MCP 注册' };
+  cfg.mcpServers = cfg.mcpServers && typeof cfg.mcpServers === 'object' && !Array.isArray(cfg.mcpServers) ? cfg.mcpServers : {};
+  cfg.mcpServers.memorix = memorixMcpServerEntry(resolved);
+  try {
+    fs.copyFileSync(file, file + '.bak-tokensaver');
+    atomicWriteFileSync(file, JSON.stringify(cfg, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+    return { registered: true, note: existing ? '入口漂移已刷新 mcpServers.memorix' : '已注册 mcpServers.memorix' };
+  } catch (e) { return { registered: false, note: `写失败:${e.message}` }; }
+}
+
+/** 摘除 Qoder 端 Memorix MCP 注册(B2 对称清理,uninit 消费):删 mcpServers.memorix,其余键与他牌条目不动。 */
+export function removeQoderMemorixMcp({ home = os.homedir() } = {}) {
+  const file = path.join(qoderUserDir(home), 'settings.json');
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return { removed: false }; }
+  let cfg;
+  try { cfg = JSON.parse(raw); } catch { return { removed: false }; }
+  if (!cfg?.mcpServers?.memorix) return { removed: false };
+  delete cfg.mcpServers.memorix;
+  try {
+    fs.copyFileSync(file, file + '.bak-tokensaver');
+    atomicWriteFileSync(file, JSON.stringify(cfg, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+    return { removed: true };
+  } catch { return { removed: false }; }
+}
+
+/** 注册 Memorix MCP 到 Cursor(B2,2026-11-25):写用户级 ~/.cursor/mcp.json 的 mcpServers.memorix
+ *  (标准形态 {mcpServers:{<name>:{command,args,env}}},与 ZCode 的 mcp.servers 不同)。
+ *  宿主装了但从没配过 MCP 时文件不存在——~/.cursor 目录在则新建;目录都不在则当宿主未装跳过。
+ *  已有文件:他牌条目与其余顶层键保留,写前备份 .bak-tokensaver + 原子写;非法 JSON 不动。
+ *  已存在不覆盖;CLI 探不到跳过(fail-open)。 */
+export function ensureCursorMemorixMcp({ home = os.homedir(), cli = null } = {}) {
+  const dir = path.join(home, '.cursor');
+  if (!fs.existsSync(dir)) return { registered: false, note: '无 ~/.cursor(宿主未装)' };
+  const file = path.join(dir, 'mcp.json');
+  let raw = null;
+  let cfg = {};
+  if (fs.existsSync(file)) {
+    try { raw = fs.readFileSync(file, 'utf8'); } catch (e) { return { registered: false, note: `读失败:${e.message}` }; }
+    try { cfg = JSON.parse(raw); } catch { return { registered: false, note: 'Cursor mcp.json 非合法 JSON,不动' }; }
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return { registered: false, note: 'Cursor mcp.json 非对象,不动' };
+  }
+  const resolved = cli || resolveMemorixCliForInit();
+  const existing = cfg.mcpServers?.memorix;
+  if (existing && !memorixMcpEntryStale(existing, resolved)) return { registered: true, note: '已注册,不覆盖' };
+  if (!resolved) return { registered: false, note: 'memorix CLI 未探到,跳过 MCP 注册' };
+  cfg.mcpServers = cfg.mcpServers && typeof cfg.mcpServers === 'object' && !Array.isArray(cfg.mcpServers) ? cfg.mcpServers : {};
+  cfg.mcpServers.memorix = memorixMcpServerEntry(resolved);
+  try {
+    if (raw != null) fs.copyFileSync(file, file + '.bak-tokensaver');
+    const eol = raw == null || raw.endsWith('\n') ? '\n' : '';
+    atomicWriteFileSync(file, JSON.stringify(cfg, null, 2) + eol);
+    return { registered: true, note: raw == null ? '已新建 mcp.json 并注册 mcpServers.memorix' : (existing ? '入口漂移已刷新 mcpServers.memorix' : '已注册 mcpServers.memorix') };
+  } catch (e) { return { registered: false, note: `写失败:${e.message}` }; }
+}
+
+/** 摘除 Cursor 端 Memorix MCP 注册(B2 对称清理,uninit 消费):删 mcpServers.memorix。
+ *  他牌条目保留;摘完若文件不再有任何键则删文件(注册时新建的空壳不留)。 */
+export function removeCursorMemorixMcp({ home = os.homedir() } = {}) {
+  const file = path.join(home, '.cursor', 'mcp.json');
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return { removed: false }; }
+  let cfg;
+  try { cfg = JSON.parse(raw); } catch { return { removed: false }; }
+  if (!cfg?.mcpServers?.memorix) return { removed: false };
+  delete cfg.mcpServers.memorix;
+  if (cfg.mcpServers && typeof cfg.mcpServers === 'object' && !Array.isArray(cfg.mcpServers) && Object.keys(cfg.mcpServers).length === 0) {
+    delete cfg.mcpServers;
+  }
+  try {
+    fs.copyFileSync(file, file + '.bak-tokensaver');
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg) || Object.keys(cfg).length === 0) {
+      fs.rmSync(file, { force: true });
+    } else {
+      atomicWriteFileSync(file, JSON.stringify(cfg, null, 2) + (raw.endsWith('\n') ? '\n' : ''));
+    }
+    return { removed: true };
+  } catch { return { removed: false }; }
+}
+
+/** 卸载 Memorix(阶段A 对称清理,uninit 消费;2026-11-25 本地化:删本地包目录,不碰全局 npm——
+ *  用户自装的全局 memorix 属用户环境,不代卸)+删 ~/.memorix/config.toml;数据目录
+ *  ~/.memorix/(SQLite 记忆)保留——与 data/「部署卸载≠数据卸载」同口径。fail-open 不阻卸载。 */
+export function uninstallMemorix({ home = os.homedir(), moduleDir = here } = {}) {
+  const cfgFile = path.join(home, '.memorix', 'config.toml');
+  let removedCfg = false;
+  try {
+    if (fs.existsSync(cfgFile)) { fs.rmSync(cfgFile, { force: true }); removedCfg = true; }
+  } catch { /* 尽力 */ }
+  let removedPkg = false;
+  const pkgDir = memorixVendorDir(moduleDir);
+  try {
+    if (fs.existsSync(pkgDir)) { fs.rmSync(pkgDir, { recursive: true, force: true }); removedPkg = true; }
+  } catch { /* 尽力 */ }
+  return { removedCfg, removedPkg };
 }
 
 function posixAbs(p) {
@@ -662,6 +1096,32 @@ log(`\n[3/5] 后台启动首版索引构建(不等待)`);
   ok(`auto.mjs 已分离后台运行(pid ${child.pid}):build → 增量 embed → 预热;进度看 data/auto.log 与 data/embed.log`);
   console.error('  [note] 所选嵌入路径拉起失败时检索保持 bm25,不自动改换另一条路径。CPU 全量嵌入可达十几分钟(后台进行,不阻塞)');
 }
+
+// Memorix 跨会话记忆(阶段A,2026-11-25 用户拍板:默认开,替代 OpenViking):本地安装+按 modelIn 写嵌入配置。
+// 安装失败/Node 过旧一律 fail-open 跳过(不阻索引/路由主流程);数据目录 ~/.memorix/ 归用户,uninit 不删数据。
+// 20261125 修复(0.2.26 测试机记忆 MCP 灯灰):原 !PACKED_INSTALL 门把装机态整块跳掉——随包 memorix 在
+// resources/node_modules/memorix(B1),装机态只免安装这一步,嵌入配置+三宿主 MCP 注册照做;
+// CLI 用 packed 入口(node 绝对路径+JS 入口,N102 口径),不探 PATH(测试机无全局 memorix)。
+// 20261125 二次拍板:CLI 模式也不占全局 npm——installMemorixLocal 装进 code-index/vendor/memorix(与随包同构)。
+{
+  const packedCli = PACKED_INSTALL ? resolvePackedMemorixCli({}) : null;
+  const mx = PACKED_INSTALL ? { installed: !!packedCli } : installMemorixLocal({});
+  if (mx.installed) {
+    let cfgModelIn = null;
+    try { cfgModelIn = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'code-index.config.json'), 'utf8'))?.modelIn; } catch { /* 无配置 */ }
+    const chosen = (modelInArg || cfgModelIn) || 'local';
+    const cfg = ensureMemorixConfig({ modelIn: chosen });
+    console.error(`  [ok] Memorix 嵌入配置(${chosen === 'local' ? 'CPU/8118 jina 768d' : 'GPU/11434 qwen 1024d'}):${cfg.note}(${cfg.file})`);
+    const inj = syncMemorixInject({});
+    if (inj.synced) console.error(`  [ok] Memorix 注入档:${inj.note}(${inj.file})`);
+    const mcp = ensureMemorixMcp({ cli: packedCli });
+    console.error(`  [${mcp.registered ? 'ok' : 'note'}] Memorix MCP(ZCode):${mcp.note}`);
+    const qmcp = ensureQoderMemorixMcp({ cli: packedCli });
+    console.error(`  [${qmcp.registered ? 'ok' : 'note'}] Memorix MCP(Qoder):${qmcp.note}`);
+    const cmcp = ensureCursorMemorixMcp({ cli: packedCli });
+    console.error(`  [${cmcp.registered ? 'ok' : 'note'}] Memorix MCP(Cursor):${cmcp.note}`);
+  }
+}
 }
 
 /** 仓库根到目标的 gitignore 路径(/scripts/code-index/)。目标在仓外则返回 null。 */
@@ -714,11 +1174,13 @@ export function isCodeIndexHookRef(value) {
   const s = String(value || '').replace(/\\/g, '/');
   // output-savings 已下线,仍匹配以便 rewrite 时卸掉旧钩子;尾部允许附加事件名参数(read-nudge 复用同一转发器)
   if (/(?:^|\/)(?:warm-code-index|output-savings|prompt-guard|read-guard|read-nudge|commit-refresh|snapshot-refresh|agent-usage-scan|agent-usage|turn-close)\.mjs(?:\s+\S+)?$/.test(s)) return true;
+  // 路A(2026-11-25):Memorix 记忆钩子。ZCode 直挂 memorix-hook.mjs;Qoder 每事件 memorix-hook-<event>.mjs;Cursor 单文件 memorix-hook-cursor.mjs(可带 --event=)
+  if (/(?:^|\/)memorix-hook(?:-[A-Za-z]+)?\.mjs(?:\s+\S+)?$/.test(s)) return true;
   // settings.json 里存的是整条命令(`node .qoder/hooks/...`),.qoder 前是空格而非 /,故前缀要含空白和引号
   if (/(?:^|[\s/"'])\.qoder(?:-cn)?\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard|read-nudge|turn-close)\.mjs(?:\s+\S+)?$/.test(s)) return true;
   if (/(?:^|[\s/"'])\.zcode\/hooks\/(?:session-start|prompt-guard|commit-refresh|read-guard)\.mjs$/.test(s)) return true;
   const dir = path.basename(here).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const names = 'agent-usage|agent-usage-scan|auto|commit-refresh|prompt-guard|read-guard|read-nudge|snapshot-refresh|warm|output-savings|turn-close';
+  const names = 'agent-usage|agent-usage-scan|auto|commit-refresh|prompt-guard|read-guard|read-nudge|snapshot-refresh|warm|output-savings|turn-close|memorix-hook';
   if (new RegExp(`(?:^|/)(?:code-index|tokensaver|${dir})/(?:${names})\\.mjs$`).test(s)) return true;
   const herePosix = here.replace(/\\/g, '/');
   return s.includes(herePosix + '/') || s.endsWith(herePosix);
@@ -773,6 +1235,26 @@ process.stdin.on('end', () => {
 })
 `;
   return hookScript(hooksDir, 'prompt-guard.mjs', 'Cursor beforeSubmitPrompt: 本进程读完 stdin 再写入子进程。Windows 上 inherit 接不到 Cursor 后写入的管道。', body);
+}
+
+// Cursor Memorix 单转发器(2026-11-26):stdin 读完再喂给 memorix-cursor-hook.mjs,事件名原样转发(--event=)。
+// 不走共享 memorix-hook.mjs,避免和 ZCode/Qoder 的 claude 通道缠在一起。
+function cursorMemorixHookSource(hooksDir) {
+  const body = `let raw = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (c) => { raw += c })
+process.stdin.on('end', () => {
+  const child = spawn(process.execPath, [entry, ...process.argv.slice(2)], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true })
+  let out = ''
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (c) => { out += c })
+  child.on('error', () => { process.stdout.write('{}'); process.exit(0) })
+  child.on('exit', () => { process.stdout.write(out.trim() || '{}'); process.exit(0) })
+  child.stdin.write(raw)
+  child.stdin.end()
+})
+`;
+  return hookScript(hooksDir, 'memorix-cursor-hook.mjs', 'Cursor Memorix: 单转发器,事件由 --event= 传入(注入/捕获)。', body);
 }
 
 function cursorReadGuardSource(hooksDir) {
@@ -879,25 +1361,60 @@ export function cleanCursorWorkspaceHooks(root) {
 
 /** GUI 子系统中继 exe(闪窗方案 C' 本地等效,2026-11-13):ZCode 每条钩子入口经它启动 node,
  *  入口(GUI 子系统,永不分配控制台)与子进程(CREATE_NO_WINDOW)双双零闪,stdout 契约不变,
- *  超时由 Job Object 级联回收。缺 exe 且为 Windows 时用系统 csc 现编;编不出的环境回退 node 直启(仅剩入口闪)。 */
+ *  超时由 Job Object 级联回收。缺 exe 且为 Windows 时用系统 csc 现编;exe 过期(源码改过没重编)仅 init 主流程重编替换;
+ *  编不出:无 exe 回退 node 直启(仅剩入口闪),有过期 exe 则沿用(缺新能力但不闪窗)。 */
 export const HOOK_RELAY_EXE = path.join(here, 'bin', 'hook-relay.exe');
 export const HOOK_RELAY_CS = path.join(here, 'hook-relay.cs');
 
-export function ensureHookRelay() {
-  if (process.platform !== 'win32') return { relay: null, note: '非 Windows,回退 node 直启' };
-  if (fs.existsSync(HOOK_RELAY_EXE)) return { relay: HOOK_RELAY_EXE, note: '已有中继' };
-  const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
-  if (!fs.existsSync(csc)) return { relay: null, note: '无 .NET Framework csc,回退 node 直启' };
-  if (!fs.existsSync(HOOK_RELAY_CS)) return { relay: null, note: '缺 hook-relay.cs,回退 node 直启' };
+/** 中继是否过期(2026-11-26):构建标识的唯一真源是 hook-relay.cs 里的字面量 TOKENSAVER_RELAY_BUILD="…",
+ *  编译后以 UTF-16 字面量存在 exe 里(.NET #US 堆)。exe 里找不到当前标识 = 源码改过而 exe 没重编。
+ *  不用 mtime 比:复制/打包不保 mtime 时,「新源码+旧 exe」同批落盘会被判成同步(initSetRoots 夹具的 cpSync 即如此)。
+ *  任一读不到(无 exe/无源码/源码无标识)→ 不过期:宁用旧 exe,不退化成 node 直启闪窗。路径可注入供单测。 */
+export function hookRelayStale({ exe = HOOK_RELAY_EXE, cs = HOOK_RELAY_CS } = {}) {
   try {
-    fs.mkdirSync(path.dirname(HOOK_RELAY_EXE), { recursive: true });
-    const r = spawnSync(csc, ['-nologo', '-target:winexe', `-out:${HOOK_RELAY_EXE}`, HOOK_RELAY_CS], { timeout: 60000, windowsHide: true });
-    if (r.status !== 0 || !fs.existsSync(HOOK_RELAY_EXE)) throw new Error(String(r.stderr || '未知编译错误').slice(0, 200));
-    ok('[user] 钩子 GUI 中继已编译:bin/hook-relay.exe(入口+子进程零闪,stdout 契约不变)');
-    return { relay: HOOK_RELAY_EXE, note: '现编译成功' };
+    const id = /TOKENSAVER_RELAY_BUILD"\]\s*=\s*"([^"]+)"/.exec(fs.readFileSync(cs, 'utf8'))?.[1];
+    if (!id) return false;
+    return !fs.readFileSync(exe).includes(Buffer.from(id, 'utf16le'));
+  } catch { return false; }
+}
+
+const cscPath = () => path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+
+/** 确保 GUI 中继在位。默认只做「缺则首编」;rebuild=true(仅 init 主流程经 rewriteZcodeUserHooks 传入)时,
+ *  源码改过而 exe 没重编(hookRelayStale)才重编替换——测试走 auto 实况时不得改动线上 bin/。
+ *  exe/cs/csc 可注入供单测。 */
+export function ensureHookRelay({ rebuild = false, exe = HOOK_RELAY_EXE, cs = HOOK_RELAY_CS, csc = cscPath() } = {}) {
+  if (process.platform !== 'win32') return { relay: null, note: '非 Windows,回退 node 直启' };
+  const have = fs.existsSync(exe);
+  if (have && !(rebuild && hookRelayStale({ exe, cs }))) return { relay: exe, note: '已有中继' };
+  // 过期重编不成时沿用旧 exe:只是缺新能力(钩子脚本据 TOKENSAVER_RELAY_DETACH_SAFE 回落慢而正确的路径),不该退化成闪窗
+  const keepOld = (why) => (have ? { relay: exe, note: `${why},沿用旧中继` } : { relay: null, note: `${why},回退 node 直启` });
+  if (!fs.existsSync(csc)) return keepOld('无 .NET Framework csc');
+  if (!fs.existsSync(cs)) return keepOld('缺 hook-relay.cs');
+  const binDir = path.dirname(exe);
+  const name = path.basename(exe);
+  const tmp = `${exe}.${process.pid}.new`;
+  const old = `${exe}.${process.pid}.old`;
+  try {
+    fs.mkdirSync(binDir, { recursive: true });
+    // 上次替换时旧 exe 仍被别的会话的钩子占用而没删掉的,现在再清
+    for (const f of fs.readdirSync(binDir)) {
+      if (!f.startsWith(`${name}.`) || !/^\.\d+\.old$/.test(f.slice(name.length))) continue;
+      try { fs.rmSync(path.join(binDir, f), { force: true }); } catch { /* 仍被占用,下次再清 */ }
+    }
+    // 运行中的 exe 覆盖不了、删不掉,但改得了名(Windows 映像文件语义):先编到旁路文件,旧 exe 挪开让位,新 exe 换名上位
+    const r = spawnSync(csc, ['-nologo', '-target:winexe', `-out:${tmp}`, cs], { timeout: 60000, windowsHide: true });
+    if (r.status !== 0 || !fs.existsSync(tmp)) throw new Error(String(r.stderr || '未知编译错误').slice(0, 200));
+    if (have) fs.renameSync(exe, old);
+    try { fs.renameSync(tmp, exe); }
+    catch (e) { if (have) { try { fs.renameSync(old, exe); } catch { /* 旧 exe 挪不回来,下次 init 再补 */ } } throw e; }
+    if (have) { try { fs.rmSync(old, { force: true }); } catch { /* 旧中继仍被占用,下次 init 再清 */ } }
+    ok(`[user] 钩子 GUI 中继已编译:bin/${name}${have ? '(源码更新,已替换旧中继)' : ''}(入口+子进程零闪,stdout 契约不变)`);
+    return { relay: exe, note: have ? '源码更新,已重编替换' : '现编译成功' };
   } catch (e) {
-    console.error(`[warn] 中继编译失败,回退 node 直启:${e.message}`);
-    return { relay: null, note: `编译失败:${e.message}` };
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 没产出 */ }
+    console.error(`[warn] 中继编译失败,${have ? '沿用旧中继' : '回退 node 直启'}:${e.message}`);
+    return keepOld(`编译失败:${e.message}`);
   }
 }
 
@@ -1045,9 +1562,11 @@ function qoderAgentUsageScanSource(hooksDir) {
  * ZCode 用户级接线:~/.zcode/cli/config.json 的 hooks 键,绝对路径直指本模块脚本。
  * 该文件还存插件开关等其他状态,只动 hooks 键;同文件其他钩子保留。无 workspace 信任门控。
  */
-export function rewriteZcodeUserHooks({ home = os.homedir(), relayExe = 'auto' } = {}) {
-  // C'(2026-11-13):relayExe='auto'=按 ensureHookRelay 实况(生产);测试可显式传路径(断言中继形)或 null(断言回退形)
-  const relay = relayExe === 'auto' ? ensureHookRelay().relay : relayExe;
+export function rewriteZcodeUserHooks({ home = os.homedir(), relayExe = null, rebuildRelay = false } = {}) {
+  // 2026-11-26 relay 退役:ZCode 3.18.2 已修闪窗(钩子 spawn 带 windowsHide)且不用 KILL_ON_JOB_CLOSE
+  // (JobObject 仅 SILENT_BREAKAWAY_OK),node 直启既不闪窗也不杀后台——relay 的两个存在理由都消失。
+  // 默认 null=node 直启;显式传路径=回退 relay 形(新版 ZCode 若回归闪窗/级联杀时用);'auto'=ensureHookRelay 实况(历史兼容)。
+  const relay = relayExe === 'auto' ? ensureHookRelay({ rebuild: rebuildRelay }).relay : relayExe;
   const cfgPath = path.join(home, '.zcode', 'cli', 'config.json');
   let cfg = {};
   if (fs.existsSync(cfgPath)) {
@@ -1078,6 +1597,15 @@ export function rewriteZcodeUserHooks({ home = os.homedir(), relayExe = 'auto' }
   ] });
   push('PreToolUse', { matcher: '^Read$|^Bash$|^Grep$', hooks: [zcodeProcess(path.join(here, 'read-guard.mjs'), 10000, '超限 Read 改写为语义区间,选不出再拒绝;Grep 补 head_limit', [], relay)] });
   push('Stop', { hooks: [zcodeProcess(path.join(here, 'turn-close.mjs'), 15000, '回合末结算+真实模型按回合落账', ['--host', 'zcode'], relay)] });
+  // 路A(2026-11-25):Memorix 记忆钩子追加挂载(与现有钩子并列,不覆盖)——session_start/user_prompt 注入记忆,
+  // post_edit/post_command/session_end 自动捕获。memorix 未装时转发器 fail-open {} 不阻断。--agent claude(ZCode stdin 兼容)。
+  const mxHook = path.join(here, 'memorix-hook.mjs');
+  // SessionStart 预算 15s(2026-11-26,与 memorix-hook.mjs MEMORIX_SESSION_START_TIMEOUT_MS 单源同步):
+  // inject=full 时同步构建整份简报(冷启动 ~2s+简报数秒),8s 不够;其余事件维持 8s。
+  push('SessionStart', { matcher: 'startup|resume', hooks: [zcodeProcess(mxHook, 15000, 'Memorix 记忆注入(会话开始)', ['--agent', 'claude', '--event', 'SessionStart', '--host', 'zcode'], relay)] });
+  push('UserPromptSubmit', { hooks: [zcodeProcess(mxHook, 15000, 'Memorix 记忆注入(用户输入)', ['--agent', 'claude', '--event', 'UserPromptSubmit', '--host', 'zcode'], relay)] });
+  push('PostToolUse', { hooks: [zcodeProcess(mxHook, 8000, 'Memorix 记忆捕获(工具调用)', ['--agent', 'claude', '--event', 'PostToolUse', '--host', 'zcode'], relay)] });
+  push('Stop', { hooks: [zcodeProcess(mxHook, 8000, 'Memorix 记忆捕获(会话结束)', ['--agent', 'claude', '--event', 'Stop', '--host', 'zcode'], relay)] });
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] ZCode 用户级钩子已写入 ${cfgPath}(绝对路径直指本模块)`);
@@ -1093,11 +1621,13 @@ export { mirroredModelUnion, virtualProviderStaleness, ensureVirtualProviderEntr
  *  CURRENT=现装文件名;LEGACY=历史版本装过、卸载/清理仍要扫的文件名。 */
 export const USER_FORWARDER_FILES = {
   cursor: {
-    current: ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'agent-usage.mjs'],
-    legacy: ['output-savings.mjs'],
+    current: ['warm-code-index.mjs', 'prompt-guard.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'commit-refresh.mjs', 'agent-usage.mjs',
+      'memorix-hook-cursor.mjs'],
+    legacy: ['output-savings.mjs', 'memorix-hook-sessionStart.mjs', 'memorix-hook-beforeSubmitPrompt.mjs', 'memorix-hook-afterFileEdit.mjs', 'memorix-hook-beforeShellExecution.mjs', 'memorix-hook-stop.mjs'],
   },
   qoder: {
-    current: ['session-start.mjs', 'snapshot-refresh.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'agent-usage-scan.mjs', 'turn-close.mjs'],
+    current: ['session-start.mjs', 'snapshot-refresh.mjs', 'prompt-guard.mjs', 'commit-refresh.mjs', 'read-guard.mjs', 'read-nudge.mjs', 'agent-usage-scan.mjs', 'turn-close.mjs',
+      'memorix-hook-SessionStart.mjs', 'memorix-hook-UserPromptSubmit.mjs', 'memorix-hook-PostToolUse.mjs', 'memorix-hook-Stop.mjs'],
     legacy: ['output-savings.mjs'],
   },
 };
@@ -1115,7 +1645,10 @@ export function rewriteCursorUserHooks({ home = os.homedir() } = {}) {
   fs.writeFileSync(path.join(hooksDir, 'read-nudge.mjs'), cursorReadNudgeSource(hooksDir));
   fs.writeFileSync(path.join(hooksDir, 'commit-refresh.mjs'), cursorCommitRefreshSource(hooksDir));
   fs.writeFileSync(path.join(hooksDir, 'agent-usage.mjs'), cursorAgentUsageSource(hooksDir));
-  try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
+  fs.writeFileSync(path.join(hooksDir, 'memorix-hook-cursor.mjs'), cursorMemorixHookSource(hooksDir));
+  for (const old of USER_FORWARDER_FILES.cursor.legacy) {
+    try { fs.rmSync(path.join(hooksDir, old), { force: true }); } catch { /* 旧转发器 */ }
+  }
   const cfgPath = path.join(home, '.cursor', 'hooks.json');
   let cfg = { version: 1, hooks: {} };
   if (fs.existsSync(cfgPath)) {
@@ -1155,6 +1688,10 @@ export function rewriteCursorUserHooks({ home = os.homedir() } = {}) {
   cfg.hooks.postToolUse = [nudgeHook, refreshHook, ...(cfg.hooks.postToolUse || [])];
   cfg.hooks.postToolUseFailure = [failHook, ...(cfg.hooks.postToolUseFailure || [])];
   cfg.hooks.afterAgentResponse = [usageHook, ...(cfg.hooks.afterAgentResponse || [])];
+  // Cursor Memorix 单转发器追加(与 ZCode/Qoder 的 claude 通道无关)。
+  // 注入 15s / 捕获 8s,与 memorixHookTimeoutMs 单源;事件名单单源 CURSOR_MEMORIX_EVENTS(不挂 stop/preCompact,见 memorix-cursor-hook.mjs 文件头)。
+  const mxCmd = (ev) => ({ command: `node ${win(path.join(hooksDir, 'memorix-hook-cursor.mjs'))} --event=${ev}`, timeout: cursorMemorixTimeoutSec(ev) });
+  for (const ev of CURSOR_MEMORIX_EVENTS) cfg.hooks[ev] = [...(cfg.hooks[ev] || []), mxCmd(ev)];
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] Cursor 用户级钩子已写入 ${cfgPath}`);
 }
@@ -1175,6 +1712,10 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   fs.writeFileSync(path.join(hooksDir, 'read-nudge.mjs'), qoderWrapSource(hooksDir, 'read-nudge.mjs', 'PostToolUse'));
   fs.writeFileSync(path.join(hooksDir, 'agent-usage-scan.mjs'), qoderAgentUsageScanSource(hooksDir));
   fs.writeFileSync(path.join(hooksDir, 'turn-close.mjs'), qoderWrapSource(hooksDir, 'turn-close.mjs', 'Stop', ['--host', 'qoder']));
+  // 路A(2026-11-25):Memorix 记忆钩子转发器(每事件独立文件,entry 恒指 memorix-hook.mjs;--agent claude,Qoder stdin 兼容)
+  for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop']) {
+    fs.writeFileSync(path.join(hooksDir, `memorix-hook-${ev}.mjs`), qoderWrapSource(hooksDir, 'memorix-hook.mjs', ev, ['--agent', 'claude', '--event', ev, '--host', 'qoder']));
+  }
   try { fs.rmSync(path.join(hooksDir, 'output-savings.mjs'), { force: true }); } catch { /* 旧输出端统计钩子 */ }
   const settingsPath = path.join(userDir, 'settings.json');
   let cfg = { hooks: {} };
@@ -1206,6 +1747,13 @@ export function rewriteQoderUserHooks({ home = os.homedir() } = {}) {
   prepend('UserPromptSubmit', { hooks: [qoderCmd(fwd('prompt-guard.mjs'), 10, '模型变更检测')] });
   prepend('PreToolUse', { matcher: '^Read$|^Bash$|^Grep$', hooks: [qoderCmd(fwd('read-guard.mjs'), 10, '超限 Read 改写为语义区间,选不出再拒绝;Grep 补 head_limit')] });
   prepend('Stop', { hooks: [qoderCmd(fwd('turn-close.mjs'), 15, '回合末结算+真实模型按回合落账')] });
+  // 路A(2026-11-25):Memorix 记忆钩子追加(与现有钩子并列)——SessionStart/UserPromptSubmit 注入,PostToolUse/Stop 捕获
+  // SessionStart/UserPromptSubmit 预算 15s(2026-11-26,与 memorix-hook.mjs memorixHookTimeoutMs 单源同步):
+  // full 简报与续接 brief 都是检索路径(实测 6.5-7.6s),8s 有负载即超时被静默丢弃;捕获类 8s
+  prepend('SessionStart', { hooks: [qoderCmd(fwd('memorix-hook-SessionStart.mjs'), 15, 'Memorix 记忆注入(会话开始)')] });
+  prepend('UserPromptSubmit', { hooks: [qoderCmd(fwd('memorix-hook-UserPromptSubmit.mjs'), 15, 'Memorix 记忆注入(用户输入)')] });
+  prepend('PostToolUse', { hooks: [qoderCmd(fwd('memorix-hook-PostToolUse.mjs'), 8, 'Memorix 记忆捕获(工具调用)')] });
+  prepend('Stop', { hooks: [qoderCmd(fwd('memorix-hook-Stop.mjs'), 8, 'Memorix 记忆捕获(会话结束)')] });
   fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
   ok(`[user] Qoder 用户级钩子已写入 ${settingsPath}`);
 }
@@ -1264,7 +1812,10 @@ const hookArg = parseInitArgs(args).hooks;
 const hookTools = resolveHookTargets(hookArg);
 {
   const detected = detectAgent();
-  if (hookArg) ok(`hooks = ${hookTools.join(',')} (--hooks)`);
+  if (hookArg === 'detected') {
+    if (hookTools.length) ok(`hooks = ${hookTools.join(',')} (检测到已安装的 agent,只接这些;未装的后续用面板修复按钮补接)`);
+    else ok('未检测到任何已安装的 agent(~/.zcode、~/.cursor、~/.qoder 均不存在),本次不接钩子;装了后用面板修复按钮接线');
+  } else if (hookArg) ok(`hooks = ${hookTools.join(',')} (--hooks)`);
   else if (detected) ok(`检测到当前为 ${detected},只接线该工具 hooks(其余可用 --hooks all 或 --hooks <名>)`);
   else ok('未识别当前 agent,接线 Cursor/ZCode/Qoder(可用 --hooks 指定)');
 }
@@ -1353,7 +1904,7 @@ currentStep = 'user-hooks(用户级钩子接线)';
 log(`\n[user] 用户级钩子接线(${hookTools.join(', ')})`);
 if (hookTools.includes('zcode')) {
   currentStep = 'zcode-virtual-entry(ZCode auto 档播种)';
-  rewriteZcodeUserHooks();
+  rewriteZcodeUserHooks({ rebuildRelay: true });
   // autoName 不传(2026-11-07 定影语义):现有 auto 系名原样保持,改名权只在会话开启钩子
   const vp = ensureVirtualProviderEntry();
   // 播种/同步时函数内已打过日志,这里只补"无事发生"的说明,避免重复两行

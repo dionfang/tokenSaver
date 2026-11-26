@@ -16,6 +16,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(DATA_DIR, '.local-resident.json');
 const LOCK_PATH = path.join(DATA_DIR, '.local-resident.lock');
 const LOG_PATH = path.join(DATA_DIR, 'local-resident.log');
+// 固定端口(方向 B,2026-11-24 拍板):常驻嵌入对外的稳定门牌,外部记忆工具(Memorix 等)直连
+// http://127.0.0.1:8118/v1/embeddings;被占回落 listen(0)(见服务尾部 listenFallbackTried 链)。
+// 8117=路由代理专用,勿混用;对内消费方走状态文件发现,固定/随机均兼容。
+export const RESIDENT_FIXED_PORT = 8118;
 const directRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 function keepAliveMs(text) {
@@ -25,6 +29,22 @@ function keepAliveMs(text) {
   if (m[2] === 'h') return n * 60 * 60 * 1000;
   if (m[2] === 'm') return n * 60 * 1000;
   return n * 1000;
+}
+
+/**
+ * OpenAI 嵌入方言响应体(方向 B,2026-11-24 拍板):/v1/embeddings 的纯函数核心,导出供单测直测真代码。
+ * 入参 body=已解析的请求体(OpenAI 形),pipe=嵌入管线(与 /embed 同一个);返回 {status, payload}。
+ * 契约:input 收 string 或 string[];1..64 条(与 /embed 同上限);embedding 顺序=输入顺序;model 原样回显;
+ * encoding_format 非 float 宽容忽略(只回 float)。刻意不实现 /api/version(见路由注释)。
+ */
+export async function openaiEmbeddingsResponse(body, pipe) {
+  const input = body?.input;
+  // 空字符串=无内容,与空数组同判 400(空串不该产生一条"向量全由 padding 决定"的嵌入)
+  const texts = typeof input === 'string' ? (input.trim() ? [input] : null) : Array.isArray(input) ? input.map(t => String(t)) : null;
+  if (!texts?.length || texts.length > 64) return { status: 400, payload: { error: 'input 须为字符串或 1..64 条数组' } };
+  const out = await pipe(texts, { pooling: 'mean', normalize: true });
+  const data = out.tolist().map((embedding, index) => ({ object: 'embedding', index, embedding }));
+  return { status: 200, payload: { object: 'list', model: String(body?.model || ''), data, usage: { prompt_tokens: 0, total_tokens: 0 } } };
 }
 
 function readStateFile() {
@@ -325,6 +345,16 @@ if (directRun) {
         send(res, 200, { embeddings: out.tolist() });
         return;
       }
+      // OpenAI 嵌入方言:外部记忆工具直连。Memorix 实测契约:路径 = ${baseUrl}/embeddings(单层,非 /v1),
+      // 请求体 {model, input(单文本 string), dimensions?} → 读 response.data[0].embedding 且硬校验维度。
+      // 故两条路由都挂:标准 OpenAI 形态 /v1/embeddings 与 Memorix 的 /embeddings(同一纯函数)。
+      if (req.method === 'POST' && (url === '/v1/embeddings' || url === '/embeddings')) {
+        if (!pipe) { send(res, 503, { error: '嵌入模型未就绪' }); return; }
+        const body = await readBody(req);
+        const { status, payload } = await openaiEmbeddingsResponse(body, pipe); // async 必须 await(实弹 bug)
+        send(res, status, payload);
+        return;
+      }
       if (req.method === 'POST' && url === '/rerank') {
         if (!reranker) { send(res, 503, { error: '精排模型未就绪' }); return; }
         const body = await readBody(req);
@@ -356,11 +386,16 @@ if (directRun) {
     }
   });
 
-  server.listen(0, '127.0.0.1', async () => {
-    const port = server.address().port;
+  // 固定端口(方向 B,2026-11-24 拍板):首选 8118,外部记忆工具(Memorix)可直连 http://127.0.0.1:8118/v1/embeddings。
+  // 被占(旧实例没死透/TIME_WAIT/他程序)时重试一次 → 仍 EADDRINUSE 则回落 listen(0) 随机端口:
+  // 对内消费方(embed/search/warm/auto/托盘)全部现读状态文件取端口,固定或随机都照常工作——
+  // 回落只影响写死地址的外部工具,最坏情况=回到本改动前的现状,不为更糟。
+  let listenFallbackTried = false;
+  async function onListening(port, fallback) {
+    const port2 = port;
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(STATE_PATH, JSON.stringify({ pid: process.pid, port, embedding: embeddingId, reranker: rerankerId, decision: decisionId }));
-    console.error(`[info] local 常驻进程监听 127.0.0.1:${port}`);
+    fs.writeFileSync(STATE_PATH, JSON.stringify({ pid: process.pid, port: port2, ...(fallback ? { fixedPortFallback: true } : {}), embedding: embeddingId, reranker: rerankerId, decision: decisionId }));
+    console.error(fallback ? `[warn] 固定端口 ${RESIDENT_FIXED_PORT} 被占,本次随机端口 ${port2}(外部直连工具需重启后重试)` : `[info] local 常驻进程监听 127.0.0.1:${port2}`);
     try {
       pipe = await loadEmbedder(embeddingId);
       await pipe(['warm'], { pooling: 'mean', normalize: true });
@@ -406,5 +441,12 @@ if (directRun) {
       process.exit(0);
     }, keepAliveMs(OLLAMA_KEEP_ALIVE));
     console.error('[done] local 常驻进程可接受检索与嵌入');
+  }
+  // 固定端口监听 + EADDRINUSE 回落链(onListening 收编原 listen 回调体)
+  server.listen(RESIDENT_FIXED_PORT, '127.0.0.1', async () => onListening(RESIDENT_FIXED_PORT, false));
+  server.on('error', (err) => {
+    if (err.code !== 'EADDRINUSE' || listenFallbackTried) return;
+    listenFallbackTried = true;
+    server.close(() => server.listen(0, '127.0.0.1', async () => onListening(server.address().port, true)));
   });
 }

@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { DATA_DIR, findGitRoot } from './config.mjs';
 import {
   isCodeIndexHookRef,
@@ -31,6 +32,10 @@ import {
   cleanQoderWorkspaceHooks,
   cleanZcodeWorkspaceHooks,
   USER_FORWARDER_FILES,
+  uninstallMemorix,
+  removeMemorixMcp,
+  removeQoderMemorixMcp,
+  removeCursorMemorixMcp,
 } from './init.mjs';
 import { resolveZcodeV2Dir } from './virtualProvider.mjs';
 
@@ -318,6 +323,12 @@ function main() {
   const pf = path.join(DATA_DIR, '.prefetch-last.json');
   if (rmIfExists(pf)) say('  [ok] data/.prefetch-last.json 已删除');
   else say('  [skip] 无预取状态');
+
+  const mx = uninstallMemorix();
+  const mxMcp = removeMemorixMcp();
+  const qxMcp = removeQoderMemorixMcp();
+  const cxMcp = removeCursorMemorixMcp();
+  say(`  [${mx.removedPkg || mx.removedCfg ? 'ok' : 'skip'}] Memorix:${mx.removedPkg ? '已删本地包(code-index/vendor/memorix)' : '未装/卸载跳过'}${mx.removedCfg ? ',config.toml 已删' : ''}${mxMcp.removed ? ',ZCode MCP 注册已摘' : ''}${qxMcp.removed ? ',Qoder MCP 注册已摘' : ''}${cxMcp.removed ? ',Cursor MCP 注册已摘' : ''};数据目录 ~/.memorix/ 保留(手动可删);全局 npm 环境不动(自装的全局 memorix 不代卸)`);
 
   say('============ 卸载完成 ============');
   say('未动:data/(索引、节约账、read-guard 记录)、code-index/ 本体、CODE_MAP.md、.gitignore、用户自己的 skills 与其他工具的钩子');

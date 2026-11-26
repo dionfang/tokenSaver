@@ -50,12 +50,25 @@ export function releaseJsonLock(lockPath, ownerPid = process.pid) {
   try { fs.unlinkSync(lockPath); return true; } catch { return false; }
 }
 
+/** 解析 Windows WMI CreationDate → 毫秒时间戳。
+ *  实弹坑(2026-11-25):ConvertTo-Json 把 CreationDate 序列化成 "/Date(1794790424141)/"
+ *  (WMI DMTF 形态),不是 ISO 串 → Date.parse 直接 NaN。三形态都认,认不出返 null。 */
+export function parseWinCreationDate(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const s = String(v);
+  const m = s.match(/\/Date\((-?\d+)\)\//);
+  if (m) return Number(m[1]);
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+
 /**
  * 找本模块脚本的运行中进程(孤儿清扫/看护去重用)。
  * 返回 [{pid, cmd}]。Windows 走 WQL 一把取全 node 进程再在 JS 里过滤;
  * moduleDir 用来只认"本模块目录下的同名脚本"(别的项目同名脚本不算)。
  */
-export function findNodeScriptProcesses({ scriptNames = [], moduleDir = '', platform = process.platform } = {}) {
+export function findNodeScriptProcesses({ scriptNames = [], moduleDir = '', platform = process.platform, withStartedAt = false }) {
   const out = [];
   const dir = String(moduleDir || '').split(/[\\/]/).join('/');
   const want = scriptNames.map(String).filter(Boolean);
@@ -63,7 +76,8 @@ export function findNodeScriptProcesses({ scriptNames = [], moduleDir = '', plat
   try {
     if (platform === 'win32') {
       const filters = want.map((s) => `CommandLine LIKE '%${s}%'`).join(' OR ');
-      const q = `Get-CimInstance Win32_Process -Filter "Name='node.exe' AND (${filters})" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`;
+      const sel = withStartedAt ? 'ProcessId,CommandLine,CreationDate' : 'ProcessId,CommandLine';
+      const q = `Get-CimInstance Win32_Process -Filter "Name='node.exe' AND (${filters})" | Select-Object ${sel} | ConvertTo-Json -Compress`;
       const r = spawnSync('powershell', ['-NoProfile', '-Command', q], { encoding: 'utf8', windowsHide: true, timeout: 20000, maxBuffer: 1 << 24 });
       const parsed = JSON.parse(String(r.stdout || '[]').trim() || '[]');
       const list = Array.isArray(parsed) ? parsed : [parsed];
@@ -74,7 +88,11 @@ export function findNodeScriptProcesses({ scriptNames = [], moduleDir = '', plat
         const norm = cmd.split(/[\\/]/).join('/');
         if (dir && !norm.includes(dir)) continue;
         if (!want.some((s) => norm.includes(s))) continue;
-        out.push({ pid, cmd: norm });
+        const rec = { pid, cmd: norm };
+        if (withStartedAt) {
+          rec.startedAt = parseWinCreationDate(p && p.CreationDate);
+        }
+        out.push(rec);
       }
     } else {
       const r = spawnSync('pgrep', ['-f', want.join('|')], { encoding: 'utf8', timeout: 8000 });
@@ -86,7 +104,14 @@ export function findNodeScriptProcesses({ scriptNames = [], moduleDir = '', plat
         const norm = cmd.split(/[\\/]/).join('/');
         if (dir && !norm.includes(dir)) continue;
         if (!want.some((s) => norm.includes(s))) continue;
-        out.push({ pid, cmd: norm });
+        const rec = { pid, cmd: norm };
+        if (withStartedAt) {
+          try {
+            const st = fs.statSync(`/proc/${pid}`);
+            rec.startedAt = Math.floor(st.birthtimeMs || st.mtimeMs);
+          } catch { rec.startedAt = null; }
+        }
+        out.push(rec);
       }
     }
   } catch { /* 枚举失败:当没有(fail-open,下轮自愈) */ }

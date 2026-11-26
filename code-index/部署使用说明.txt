@@ -170,6 +170,53 @@ TokenSaver 部署使用说明
   tiers 段(每档 input/cacheRead/output 单价,元/M tokens;cacheWrite 可选,缺省按
   input 计;轮的档位由代理定档决定)。改价格直接编辑该 JSON,即时生效。
 
+跨工具会话记忆(Memorix,默认开;要点):
+  内置 Memorix 记忆层(替代 OpenViking),init 自动安装到 code-index/vendor/memorix/
+  (vendor 隔离区本地安装,不占全局 npm,主项目 npm install 不会剪掉;Node ≥22.18,
+  旧 Node 跳过不阻主流程)并注册三端 MCP
+  (ZCode/Qoder/Cursor),编辑器内即用记忆工具。
+  会话开始默认 full 档:整份记忆简报直接注入上下文(所有项目生效,2026-11-26 用户
+  拍板;播种模板即 full,存量机的 minimal 播种值由 init 自动升档,用户显式改过的
+  silent/自定义不动);续接/压缩恢复时用户输入再注前情。换档:改 ~/.memorix/config.toml
+  的 [memory] inject(full/minimal/silent),或项目根 memorix.toml 覆盖(仅该项目)。
+  工具调用/会话结束自动捕获沉淀(只读/检索类噪声在转发器前置过滤,不落库)——跨会话、
+  跨工具共享。钩子输出按宿主分形状(Cursor 顶层 additionalContext,ZCode/Qoder
+  hookSpecificOutput 包)。SessionStart 与提交提示钩子预算 15s(full 简报与续接简报
+  都走检索路径),其余 8s。
+
+  Cursor 端要点(2026-11-26):
+  - 挂 6 个事件:sessionStart / beforeSubmitPrompt(注入,15s)与
+    afterFileEdit / beforeShellExecution / afterMCPExecution / afterAgentResponse
+    (捕获,8s)。不挂 stop、preCompact——Cursor 的 stop 载荷只有状态/循环计数,
+    preCompact 只有计数没有摘要且无压缩后事件,上游都产不出记录,挂上只白等一次
+    CLI 启动。
+  - 只有含续接词(继续/恢复/延续/接手/交接/上次会话/continue/resume/handoff…)的
+    提示才注入续接简报;普通问句输出空属设计如此。
+  - 验证注入是否真到达模型:node tools/checkCursorMemorix.mjs(读 Cursor 钩子日志,
+    分接线/执行/产出三层判定;退出码 0 通过 / 1 有失败 / 2 样本不全)。不要靠询问
+    模型判断——模型说"没有"可能只是问法问题。
+
+  嵌入复用本仓模型,零新增下载:
+  - local(CPU):指本地常驻 8118 的 OpenAI 方言端点(jina 768d,与代码索引同管线);
+  - ollama(GPU):指 Ollama OpenAI 兼容层 http://127.0.0.1:11434/v1
+    (qwen3-embedding 1024d)。
+  配置落 ~/.memorix/config.toml [embedding] 段;切换运行模式时预热(warm.mjs)
+  自动同步该段到当前模式——仅重写工具生成的受管段,用户自定义不覆盖。
+  Memorix 无配置热重载(上游 provider 缓存无失效入口),故同步真改写时一并结束
+  「持有旧配置」的常驻记忆 MCP 进程(memorix serve);宿主随即按注册条目重拉,
+  无需手动重启会话。只动指向旧安装路径/旧配置的进程,用户自装实例不碰。
+  记忆数据本体存 SQLite(~/.memorix/data/),与嵌入模型无关,切换不丢数据;
+  维度不同的向量索引分表共存,切回即恢复。端点暂不可达时写入照常、检索降级
+  词法,恢复后自动回血;托盘记忆灯对端点真探活,连不上判红(维度缓存假绿防线)。
+  记忆灯不含「图谱新鲜度」一项(2026-11-26 用户裁定):那一项是内容新鲜度而非运行
+  状态,代码一改旧符号必然失效、恒大于零,做灯只会长期误报;现改为文字显示,而语义
+  解析失败(parserErrors>0)仍作为真故障判红。维护灯按失败新鲜度分级:24h 内有失败
+  判红,更早的历史失败判黄(上游对非 vector-backfill 的失败无重跑入口、记录留 30 天)。
+
+  数据归用户:卸载(uninit)只摘钩子/MCP/删 config.toml,~/.memorix/ 数据保留
+  (手动可删)。历史知识一次性导入:node tools/memorix-import-docs.mjs
+  [--dry] [--source docs|memory|all](台账去重,幂等可重跑)。
+
 ======================================================================
 四、本地模型清理策略
 ======================================================================
@@ -416,6 +463,72 @@ existing config is never overwritten):
   tier, CNY per M tokens;cacheWrite optional, defaults to input; a turn's tier comes
   from the
   proxy's tiering decision). Edit the JSON to change prices — effective immediately.
+
+Cross-tool session memory (Memorix, on by default; key points):
+  Built-in Memorix memory layer (replacing OpenViking). init installs it locally into
+  code-index/vendor/memorix/ (an isolated vendor directory — no global npm footprint,
+  and the main project's npm install never prunes it; Node >=22.18; older Node
+  skips without blocking the main flow) and registers MCP
+  on all three hosts (ZCode/Qoder/Cursor) — memory tools right inside the editor.
+  Session start defaults to the full tier: a complete memory brief is injected into
+  context for every project (user decision 2026-11-26; seeding templates ship full,
+  and init upgrades legacy minimal seed values on existing machines — explicit
+  user choices like silent are left untouched); continuation / post-compaction
+  prompts inject prior-work context on demand. Switch tiers via [memory] inject
+  (full/minimal/silent) in ~/.memorix/config.toml, or a project-root memorix.toml
+  override (that project only). Tool calls / session end auto-capture new memories
+  (read-only / search noise pre-filtered in the forwarder, never stored) — shared
+  across sessions and across tools. Hook output is shaped per host (Cursor
+  top-level additionalContext; ZCode/Qoder hookSpecificOutput envelope).
+  SessionStart and prompt-submit hooks have a 15s budget (the full brief and the
+  continuation brief both take the retrieval path); others 8s.
+
+  Cursor specifics (2026-11-26):
+  - Six events are wired: sessionStart / beforeSubmitPrompt (injection, 15s) and
+    afterFileEdit / beforeShellExecution / afterMCPExecution / afterAgentResponse
+    (capture, 8s). stop and preCompact are deliberately NOT wired — Cursor's stop
+    payload carries only status/loop_count, and preCompact carries counts but no
+    summary and has no post-compact event, so upstream can never produce a record
+    for either; wiring them only wastes one CLI startup per turn.
+  - Only prompts containing a continuation keyword (继续/恢复/延续/接手/交接/
+    上次会话/continue/resume/handoff…) trigger the continuation brief; a plain
+    question returning nothing is by design.
+  - To verify an injection really reaches the model: `node tools/checkCursorMemorix.mjs`
+    (reads Cursor's hook log and judges wiring / execution / payload; exit codes
+    0 = pass, 1 = failures, 2 = insufficient samples). Do not judge by asking the
+    model — a "no" may just be a badly phrased question.
+
+  Embedding reuses this repo's models, zero extra downloads:
+  - local (CPU): the local resident OpenAI-dialect endpoint on 8118 (jina 768d,
+    same pipeline as the code index);
+  - ollama (GPU): the Ollama OpenAI-compatible layer http://127.0.0.1:11434/v1
+    (qwen3-embedding 1024d).
+  Config lives in ~/.memorix/config.toml [embedding]; warm-up (warm.mjs) syncs that
+  section to the current mode on every switch — only tool-generated managed sections
+  are rewritten, user customizations are never overwritten. Memorix has no config hot
+  reload (upstream provider cache has no invalidation hook), so a real rewrite also
+  ends resident memory-MCP processes (`memorix serve`) that still hold the old config;
+  the host then re-pulls them from their registered entry, so no manual session
+  restart is needed. Only processes pointing at the old install path or the old config
+  are touched; user-installed instances are left alone. Memory records live in
+  SQLite (~/.memorix/data/) independently of the embedding model, so switching loses
+  no data; vector indexes of different dimensions coexist in separate tables and
+  resume on switch-back. While the endpoint is down, writes continue and retrieval
+  degrades to lexical search, recovering automatically once it is back; the tray
+  memory lamp genuinely probes the endpoint and turns red when unreachable (guard
+  against dims-cache false green).
+  The memory lamp has no "graph freshness" item (user decision 2026-11-26): that is
+  content freshness, not health — editing code necessarily invalidates old symbols,
+  so it stays above zero and as a lamp it would only misfire; it is now shown as
+  text, while semantic parser errors (parserErrors>0) still turn the lamp red. The
+  maintenance lamp grades by failure freshness: a failure within 24h is red, older
+  ones are yellow (upstream has no re-run entry for non vector-backfill failures and
+  keeps the record for 30 days).
+
+  Data belongs to the user: uninit only removes hooks/MCP and deletes config.toml;
+  ~/.memorix/ data is kept (delete manually if desired). One-off historical import:
+  node tools/memorix-import-docs.mjs [--dry] [--source docs|memory|all]
+  (ledger dedup, idempotent re-runs).
 
 ======================================================================
 4. Local model cleanup
